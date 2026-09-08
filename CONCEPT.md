@@ -1,0 +1,16 @@
+# CONCEPT 10 - WILD CARD: Agent-Native Rate-Limiting & "Denial-of-Wallet" Metering Kernel
+
+**The Angle:** 
+WILD CARD spans Micro-Arbitrage/High-Frequency Autonomy and Agent Security (OWASP ASI "Denial of Wallet").[cite: 2] This replaces a second pure micro-arbitrage idea because the fused security-plus-economics failure mode is more foundational and less crowded.[cite: 2]
+
+**The Failure State:** 
+When agents transact and consume at machine speed and micro-scale, two failure modes fuse into one: (1) OWASP identifies "Denial of Wallet" - unbounded agent loops causing runaway API/compute cost as a distinct agentic risk; and (2) high-frequency agent micro-transactions ($0.01-scale) get destroyed by fixed per-call card fees and lack any real-time budget-enforcement primitive.[cite: 2] Nevermined explicitly flags that for "$0.01 agent interactions, fixed card fees can overwhelm the transaction value unless builders use aggregation, credits, or settlement models designed for low-value agent usage".[cite: 2] Existing rate limiters are built for human-scale request patterns and per-account quotas; they have no concept of a hierarchical spending budget delegated down a chain of sub-agents, nor of settling millions of sub-cent interactions economically.[cite: 2] An agent that spawns sub-agents that spawn tools can blow a budget in seconds with no kernel-level backstop.[cite: 2]
+
+**The Product Architecture:** 
+A metering-and-budget-enforcement kernel that sits below the payment layer as a real-time economic control plane.[cite: 2] It implements hierarchical capability-scoped budgets: a root agent is issued a spend envelope that it can sub-delegate to child agents with cryptographically-enforced sub-limits (the scoped-credential model Visa/Mastercard tokens and AP2 mandates gesture at but do not enforce at runtime across a delegation tree), and every tool call decrements the tree atomically.[cite: 2] It aggregates sub-cent interactions into economically-settleable batches (solving the fixed-fee problem via credit/aggregation models) and exposes a hard, kernel-level circuit breaker that halts a runaway loop before settlement, not after.[cite: 2] Think of it as a cgroups/scheduler for money an OS-level resource governor where the resource is spend, integrated with x402/AP2 as the enforcement point they lack.[cite: 2] The engineering is the distributed budget-consensus (preventing double-spend across concurrent sub-agents) and the micro-batch settlement economics.[cite: 2]
+
+**Validation Step:** 
+Instrument a real multi-agent framework and deliberately trigger denial-of-wallet: measure how fast an unbounded sub-agent tree can run up cost with today's tooling, and how far past the intended budget it overshoots before anything stops it.[cite: 2] A reproducible "we burned $X in Y seconds with no backstop" demo against a popular framework is visceral, contrarian proof that the metering kernel is missing.[cite: 2]
+
+**Strategic Positioning:**
+When pitching to evaluators, this allows you to move to a compliance/security budget framing (a denial-of-wallet backstop) where budgets are larger and less discretionary.[cite: 2]

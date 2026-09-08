@@ -1,0 +1,55 @@
+[project]
+name = "agentgov"
+version = "0.1.0"
+description = "AgentGov: a runtime spend-governance kernel for AI agents — hierarchical, atomic, auditable budget enforcement."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "N",   # pep8-naming
+    "S",   # flake8-bandit (financial-code hygiene: no asserts/eval/etc. in prod paths)
+    "RUF", # ruff-specific rules
+]
+ignore = ["S101"]  # allow assert in tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["agentgov"]
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+show_error_codes = true
