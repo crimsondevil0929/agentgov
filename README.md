@@ -2,8 +2,8 @@
 
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
-[![tests](https://img.shields.io/badge/tests-113%2F113%20passing-brightgreen)](#code-quality--packaging)
-[![coverage](https://img.shields.io/badge/coverage-98%25-brightgreen)](#code-quality--packaging)
+[![tests](https://img.shields.io/badge/tests-133%2F133%20passing-brightgreen)](#code-quality--packaging)
+[![coverage](https://img.shields.io/badge/coverage-99%25-brightgreen)](#code-quality--packaging)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
 [![license](https://img.shields.io/badge/license-Apache%202.0-lightgrey)](LICENSE)
@@ -15,9 +15,11 @@ a fan-out of 50 sub-agents each making a handful of "reasonable" calls that, tog
 burn a budget in seconds. AgentGov sits below the payment layer as that missing control
 plane: a hierarchical, capability-scoped spend envelope over an immutable, hash-chained
 ledger, with a circuit breaker that halts a runaway branch before settlement — not after.
+The ledger, topology, and any in-flight authorization survive a process crash, backed by
+SQLite via the standard library.
 
 Zero runtime dependencies. Pure standard library (`decimal`, `hashlib`, `threading`,
-`asyncio`-compatible). `mypy --strict` clean.
+`sqlite3`, `asyncio`-compatible). `mypy --strict` clean.
 
 ---
 
@@ -119,6 +121,56 @@ See [`src/agentgov/core.py`](src/agentgov/core.py) for the ledger and budget DAG
 and [`tests/test_runaway.py`](tests/test_runaway.py) for the recursive-spawn scenario
 the design exists to stop.
 
+## Durability
+
+An in-memory ledger that calls itself an auditable financial record is a contradiction —
+restart the process and the audit trail is gone. Swap `BudgetManager()` for
+`BudgetManager.open_sqlite(path)` and every write goes through to disk first, in the same
+atomic transaction, before it ever touches memory:
+
+```python
+with BudgetManager.open_sqlite("governor.db") as gov:
+    gov.open_root("orchestrator", money("5.00"))
+    ...  # identical API — every write is durable before it's visible in memory
+```
+
+Reopen that file in a brand new process and the ledger, the delegation tree, every
+circuit-breaker trip, and any authorization left mid-call are restored exactly —
+[`examples/persistence_demo.py`](examples/persistence_demo.py) proves this with two
+genuinely separate `python` subprocesses, not just a discarded object:
+
+```bash
+uv run python examples/persistence_demo.py
+```
+
+```
+--- process 1: writes state, then exits completely ---
+WRITER  balance(researcher)=0.65000000
+WRITER  halted(scraper)=True
+WRITER  chain_length=15
+WRITER  open_authorization_id=24b1af62-e7ac-4b54-b2fb-2475f6c40006
+
+--- process 2: independent interpreter, same file ---
+READER  verify_integrity() = PASS
+READER  balance(researcher)=0.65000000
+READER  halted(scraper)=True
+READER  chain_length=15
+READER  open_authorizations=1
+READER  scraper still refuses calls: Scope 'scraper' is halted by its own breaker: ...
+```
+
+A database that has been tampered with — or merely corrupted by a crash mid-write — is
+refused at open time, not served with a wrong balance: `open_sqlite()` re-runs
+`verify_chain()` and `verify_integrity()` before handing back a governor at all. This
+uses only `sqlite3` from the standard library, so durability adds zero runtime
+dependencies. Honest limitation: a hold still open when a process dies (an agent that
+crashed between `authorize()` and `capture()`) comes back on restart as an *open*
+authorization for an operator — or the caller, if it kept the id — to void or capture by
+hand; automatically resolving it would mean guessing whether the call it was reserving
+funds for actually happened, which this library will not do silently. See
+[`tests/test_persistence.py`](tests/test_persistence.py) for the full restart, corruption,
+and durable-write-failure test matrix.
+
 ## Core primitives
 
 - **Authorize → Hold → Settle.** `BudgetManager.authorize()` places an encumbering hold
@@ -136,16 +188,22 @@ the design exists to stop.
   hash-chained with SHA-256 and never mutated — corrections are compensating entries,
   never edits — so `verify_chain()` can prove the entire history is exactly what it
   claims to be, and `verify_conservation()` can prove no money was invented along the way.
+- **Write-through durability.** `BudgetManager.open_sqlite()` writes every ledger entry,
+  topology change, breaker trip, and open authorization to disk *before* committing it to
+  memory, so a store failure aborts the operation instead of leaving memory ahead of disk.
+  A corrupted or tampered file refuses to load rather than being trusted. See
+  [Durability](#durability) above.
 
 ## Roadmap — Phase 2
 
-Phase 1 is a correct, single-process governor: one ledger, one mutex, in-memory state.
-The evolution beyond that:
+Phase 1 is a correct, single-process governor: one ledger, one mutex, durable to a local
+SQLite file. The evolution beyond that:
 
-- **Distributed multi-node consensus.** Move the ledger off a single process's memory
-  onto a replicated store, so a fleet spanning multiple hosts shares one authoritative
-  view of every scope's balance without reintroducing the double-spend race this design
-  eliminates locally.
+- **Distributed multi-node consensus.** `agentgov.storage.PersistenceStore` is already the
+  seam a replicated backend would implement — move the ledger off one host's disk onto a
+  store shared across a fleet, so multiple machines share one authoritative view of every
+  scope's balance without reintroducing the double-spend race this design eliminates
+  locally.
 - **x402 / AP2 settlement integration.** Use AgentGov's authorize/capture holds as the
   enforcement point those protocols gesture at but don't enforce at runtime — settling
   real sub-cent agent transactions through a payment rail instead of a simulated ledger.
@@ -157,11 +215,12 @@ The evolution beyond that:
 
 ```bash
 uv sync                              # install (zero runtime dependencies)
-uv run pytest -v                     # 113 passed
-uv run pytest --cov=agentgov         # 98% coverage
+uv run pytest -v                     # 133 passed
+uv run pytest --cov=agentgov         # 99% coverage
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/                     # strict, zero errors
 uv run python examples/denial_of_wallet_benchmark.py
+uv run python examples/persistence_demo.py
 ```
 
 Packaged with [uv](https://docs.astral.sh/uv/); metadata, license, and classifiers live

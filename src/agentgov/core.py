@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from enum import Enum, unique
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from agentgov.exceptions import (
     BudgetExceededError,
@@ -69,6 +69,12 @@ from agentgov.exceptions import (
     SubBudgetAllocationError,
     UnknownScopeError,
 )
+
+if TYPE_CHECKING:
+    # Storage imports core (LedgerEntry, ControlEvent, ...) for its Protocol
+    # methods; guarding this import under TYPE_CHECKING avoids the cycle
+    # while still giving mypy the real type for the `store=` parameters.
+    from agentgov.storage import PersistenceStore
 
 __all__ = [
     "GENESIS_HASH",
@@ -350,6 +356,18 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
+def _parse_iso(text: str) -> datetime:
+    """Inverse of :func:`_iso`.
+
+    Exact round-trip precision matters here: a persisted entry's hash was
+    computed over ``_iso(timestamp)``, so reloading it from storage and
+    reformatting a *different* datetime representation would make
+    :meth:`LedgerEntry.recompute_hash` disagree with the stored hash even
+    though nothing was tampered with.
+    """
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+
+
 def _hash_entry(
     *,
     prev_hash: str,
@@ -455,12 +473,27 @@ class Ledger:
     :class:`BudgetManager` shares rather than nesting its own beneath.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, store: PersistenceStore | None = None) -> None:
         self._entries: list[LedgerEntry] = []
         self._balances: dict[str, Decimal] = {}
         self._totals = _Totals()
         self._head_hash: str = GENESIS_HASH
         self._lock = threading.RLock()
+        self._store: PersistenceStore | None = store
+
+        if store is not None:
+            loaded = store.load_entries()
+            self._entries = list(loaded)
+            for entry in self._entries:
+                self._balances[entry.scope_id] = (
+                    self._balances.get(entry.scope_id, ZERO) + entry.signed_amount
+                )
+            self._totals = _apply_totals(_Totals(), self._entries)
+            self._head_hash = self._entries[-1].entry_hash if self._entries else GENESIS_HASH
+            # Fail closed: a database that has been tampered with, or that
+            # was corrupted by a crash mid-write, must never be trusted
+            # silently. Refuse to start rather than serve a wrong balance.
+            self.verify_chain()
 
     # -- introspection ----------------------------------------------------
 
@@ -473,6 +506,19 @@ class Ledger:
         lock-ordering hazard).
         """
         return self._lock
+
+    @property
+    def store(self) -> PersistenceStore | None:
+        """The durable backend this ledger writes through to, if any."""
+        return self._store
+
+    def close(self) -> None:
+        """Close the underlying store's connection, if this ledger has one.
+
+        A no-op when this ledger has no store. Safe to call more than once.
+        """
+        if self._store is not None:
+            self._store.close()
 
     @property
     def head_hash(self) -> str:
@@ -619,7 +665,14 @@ class Ledger:
                     f"transfer transaction does not balance: net {transfer_net}"
                 )
 
-            # -- phase 2: commit. Pure appends; cannot fail.
+            # -- phase 2: durable write, then commit to memory. Writing
+            #    through to the store *before* mutating in-memory state means
+            #    a store failure (disk full, I/O error) leaves the ledger
+            #    exactly as it was — the same all-or-nothing guarantee as an
+            #    in-memory-only rejection, just extended across the disk.
+            if self._store is not None:
+                self._store.append_entries(built)
+
             self._entries.extend(built)
             self._balances.update(working_balances)
             self._head_hash = prev_hash
@@ -881,9 +934,17 @@ class BudgetManager:
         response = call_the_model()          # no lock held across I/O
         manager.capture(auth, actual_cost)
 
+    For a durable governor whose ledger and topology survive a process
+    restart, use :meth:`open_sqlite` instead of constructing this directly.
+
     :param ledger: The ledger to record against; a fresh one is created when
         omitted. Its mutex becomes this manager's mutex.
     :param policy: Governance limits; defaults to :class:`GovernancePolicy`.
+    :param store: A durable backend for topology, control events, and open
+        authorizations. Pass the *same* store given to ``ledger`` (or omit
+        ``ledger`` and let this constructor build one) — mismatched stores
+        leave the ledger and the topology recovering from different
+        histories. :meth:`open_sqlite` sets this up correctly in one call.
     """
 
     def __init__(
@@ -891,18 +952,147 @@ class BudgetManager:
         *,
         ledger: Ledger | None = None,
         policy: GovernancePolicy | None = None,
+        store: PersistenceStore | None = None,
     ) -> None:
-        self._ledger = ledger if ledger is not None else Ledger()
+        self._ledger = ledger if ledger is not None else Ledger(store=store)
         self._policy = policy if policy is not None else GovernancePolicy()
         # One mutex for the whole control plane. Sharing the ledger's lock
         # (rather than nesting a second one under it) removes any possibility
         # of a lock-ordering deadlock.
         self._lock = self._ledger.lock
+        self._store: PersistenceStore | None = store
         self._nodes: dict[str, BudgetNode] = {}
         self._roots: list[str] = []
         self._breakers: dict[str, _BreakerState] = {}
         self._open_auths: dict[uuid.UUID, Authorization] = {}
         self._control_events: list[ControlEvent] = []
+
+        if store is not None:
+            self._restore_from_store(store)
+
+    @classmethod
+    def open_sqlite(
+        cls,
+        path: str,
+        *,
+        policy: GovernancePolicy | None = None,
+        synchronous: str = "FULL",
+    ) -> BudgetManager:
+        """Open (or create) a durable, SQLite-backed governor in one call.
+
+        The ledger, topology, control events, and any open authorizations
+        are restored from ``path`` if it already contains a governor's
+        state, and freshly created otherwise. The returned manager owns the
+        underlying connection — call :meth:`close` (or use it as a context
+        manager) when you are done with it.
+
+        :param path: Filesystem path to the SQLite database file. Use
+            ``":memory:"`` for a store that never touches disk (tests only —
+            it does not survive a restart).
+        :param policy: Governance limits; defaults to :class:`GovernancePolicy`.
+        :param synchronous: SQLite's ``synchronous`` pragma. ``"FULL"``
+            (the default) fsyncs on every commit and survives a power loss,
+            not just a process crash, at the cost of write latency.
+            ``"NORMAL"`` is safe against a process crash but can lose the
+            most recent commits on a full power loss; pass it only when a
+            slower write path is the actual bottleneck.
+        :returns: A restored or freshly created :class:`BudgetManager`.
+        :raises agentgov.exceptions.LedgerIntegrityError: If the database's
+            chain, balances, or topology are inconsistent — a corrupted or
+            tampered file is refused rather than trusted.
+        """
+        from agentgov.storage import SqliteStore
+
+        store = SqliteStore(path, synchronous=synchronous)
+        return cls(policy=policy, store=store)
+
+    def __enter__(self) -> BudgetManager:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the underlying durable store, if this manager has one.
+
+        A no-op for a manager with no store. Safe to call more than once.
+        """
+        self._ledger.close()
+
+    def _restore_from_store(self, store: PersistenceStore) -> None:
+        """Rebuild topology, breaker state, and open holds from ``store``.
+
+        Called once, from the constructor, before this manager is visible to
+        any other code — no lock is needed yet.
+
+        :raises LedgerIntegrityError: If the persisted topology references a
+            scope or ledger entry that does not exist. A corrupted or
+            partially written database is refused, never trusted.
+        """
+        for pnode in store.load_nodes():
+            self._nodes[pnode.scope_id] = BudgetNode(
+                scope_id=pnode.scope_id,
+                parent_id=pnode.parent_id,
+                depth=pnode.depth,
+                allocated=pnode.allocated,
+                created_at=pnode.created_at,
+            )
+            self._breakers[pnode.scope_id] = _BreakerState()
+
+        for scope_id, node in self._nodes.items():
+            if node.parent_id is None:
+                self._roots.append(scope_id)
+                continue
+            parent = self._nodes.get(node.parent_id)
+            if parent is None:
+                raise LedgerIntegrityError(f"parent {node.parent_id!r} is not registered", scope_id)
+            parent.child_ids.append(scope_id)
+
+        # Control events are appended in chronological order, and each one
+        # represents a genuine trip/reset transition (agentgov never records
+        # a no-op trip or reset) — so replaying them in that order and simply
+        # applying each one is sufficient to reconstruct final breaker state.
+        self._control_events = list(store.load_control_events())
+        for event in self._control_events:
+            state = self._breakers.get(event.scope_id)
+            if state is None:
+                raise LedgerIntegrityError(
+                    f"control event references unregistered scope {event.scope_id!r}"
+                )
+            if event.event_type == "circuit_tripped":
+                state.tripped_at = event.timestamp
+                state.reason = event.reason
+            elif event.event_type == "circuit_reset":
+                state.tripped_at = None
+                state.reason = ""
+
+        for pauth in store.load_open_authorizations():
+            hold_entry = next(
+                (
+                    e
+                    for e in self._ledger.entries_for_scope(pauth.scope_id)
+                    if e.entry_id == pauth.entry_id
+                ),
+                None,
+            )
+            if hold_entry is None:
+                raise LedgerIntegrityError(
+                    f"open authorization {pauth.authorization_id} references "
+                    f"missing hold entry {pauth.entry_id}",
+                    pauth.scope_id,
+                )
+            self._open_auths[pauth.authorization_id] = Authorization(
+                authorization_id=pauth.authorization_id,
+                scope_id=pauth.scope_id,
+                amount=pauth.amount,
+                opened_at=pauth.opened_at,
+                entry=hold_entry,
+            )
+
+        # Fail closed: the same standard the ledger's own chain check holds
+        # itself to. A restored governor that does not check out is refused,
+        # not served with degraded confidence.
+        self.verify_integrity()
 
     # -- accessors --------------------------------------------------------
 
@@ -915,6 +1105,11 @@ class BudgetManager:
     def policy(self) -> GovernancePolicy:
         """The governance limits in force."""
         return self._policy
+
+    @property
+    def store(self) -> PersistenceStore | None:
+        """The durable backend this manager writes through to, if any."""
+        return self._store
 
     @property
     def control_events(self) -> tuple[ControlEvent, ...]:
@@ -1017,11 +1212,9 @@ class BudgetManager:
         with self._lock:
             if scope_id in self._nodes:
                 raise DuplicateScopeError(scope_id)
-            node = BudgetNode(scope_id=scope_id, parent_id=None, depth=0, allocated=amount)
-            self._nodes[scope_id] = node
-            self._roots.append(scope_id)
-            self._breakers[scope_id] = _BreakerState()
-            self._ledger.post(
+            # Ledger truth before topology: if the durable write fails, no
+            # node is registered for money that was never actually funded.
+            entries = self._ledger.post(
                 [
                     LedgerLine(
                         entry_type=EntryType.FUNDING,
@@ -1033,6 +1226,18 @@ class BudgetManager:
                     )
                 ]
             )
+            node = BudgetNode(
+                scope_id=scope_id,
+                parent_id=None,
+                depth=0,
+                allocated=amount,
+                created_at=entries[0].timestamp,
+            )
+            self._nodes[scope_id] = node
+            self._roots.append(scope_id)
+            self._breakers[scope_id] = _BreakerState()
+            if self._store is not None:
+                self._store.upsert_node(scope_id, None, 0, amount, node.created_at)
             return node
 
     def fund(
@@ -1064,7 +1269,8 @@ class BudgetManager:
             node = self._require_node(scope_id)
             if node.parent_id is not None:
                 raise ValueError(f"scope {scope_id!r} is not a root; use delegate() to fund it")
-            node.allocated += credited
+            # Ledger truth before the provenance field: a failed durable
+            # write must not leave `allocated` overstating what was funded.
             entries = self._ledger.post(
                 [
                     LedgerLine(
@@ -1077,6 +1283,11 @@ class BudgetManager:
                     )
                 ]
             )
+            node.allocated += credited
+            if self._store is not None:
+                self._store.upsert_node(
+                    scope_id, node.parent_id, node.depth, node.allocated, node.created_at
+                )
             return entries[0]
 
     def delegate(
@@ -1128,13 +1339,8 @@ class BudgetManager:
             if granted > available:
                 raise SubBudgetAllocationError(granted, available, parent_id)
 
-            child = BudgetNode(
-                scope_id=child_id, parent_id=parent_id, depth=depth, allocated=granted
-            )
-            self._nodes[child_id] = child
-            self._breakers[child_id] = _BreakerState()
-            parent.child_ids.append(child_id)
-
+            # Ledger truth before topology: a failed durable write must not
+            # leave a child scope registered for money that never moved.
             note = memo or f"sub-budget delegated to {child_id}"
             self._ledger.post(
                 [
@@ -1156,6 +1362,14 @@ class BudgetManager:
                     ),
                 ]
             )
+            child = BudgetNode(
+                scope_id=child_id, parent_id=parent_id, depth=depth, allocated=granted
+            )
+            self._nodes[child_id] = child
+            self._breakers[child_id] = _BreakerState()
+            parent.child_ids.append(child_id)
+            if self._store is not None:
+                self._store.upsert_node(child_id, parent_id, depth, granted, child.created_at)
             return child
 
     def release(
@@ -1288,6 +1502,14 @@ class BudgetManager:
                 entry=entries[0],
             )
             self._open_auths[auth.authorization_id] = auth
+            if self._store is not None:
+                self._store.put_authorization(
+                    auth.authorization_id,
+                    scope_id,
+                    held,
+                    auth.opened_at,
+                    entries[0].entry_id,
+                )
             return auth
 
     def capture(
@@ -1322,7 +1544,7 @@ class BudgetManager:
             raise ValueError(f"actual cost must not be negative, got {settled}")
 
         with self._lock:
-            self._consume_authorization(authorization, "was already settled")
+            self._require_open_authorization(authorization, "was already settled")
 
             if settled == ZERO:
                 # Nothing was billed; the hold is simply lifted.
@@ -1350,6 +1572,10 @@ class BudgetManager:
                 ]
             )
             spend_entry = entries[1]
+            # Only remove the hold from the open set once its settlement is
+            # actually durable: a failed post() above leaves it open for a
+            # retry or an operator to reconcile, instead of orphaning it.
+            self._finalize_authorization(authorization)
 
             if spend_entry.balance_after < ZERO:
                 overdraft = -spend_entry.balance_after
@@ -1377,7 +1603,7 @@ class BudgetManager:
         :raises DoubleSpendError: If this authorization was already settled.
         """
         with self._lock:
-            self._consume_authorization(authorization, "was already settled")
+            self._require_open_authorization(authorization, "was already settled")
             return self._void_locked(authorization, memo or "authorization voided")
 
     def spend(
@@ -1592,7 +1818,7 @@ class BudgetManager:
         self._record_control_event("circuit_tripped", scope_id, reason)
 
     def _record_control_event(self, event_type: str, scope_id: str, reason: str) -> None:
-        """Append and log a control event. Caller holds the lock."""
+        """Persist, append, and log a control event. Caller holds the lock."""
         event = ControlEvent(
             event_id=uuid.uuid4(),
             timestamp=datetime.now(UTC),
@@ -1601,6 +1827,8 @@ class BudgetManager:
             reason=reason,
             ledger_head_hash=self._ledger.head_hash,
         )
+        if self._store is not None:
+            self._store.append_control_event(event)
         self._control_events.append(event)
         audit_log.warning(
             f"{_AUDIT_VERSION}|ctrl={event_type}|ts={_iso(event.timestamp)}"
@@ -1617,15 +1845,29 @@ class BudgetManager:
             },
         )
 
-    def _consume_authorization(self, authorization: Authorization, detail: str) -> None:
-        """Remove an open authorization or reject the settlement. Lock held."""
-        if self._open_auths.pop(authorization.authorization_id, None) is None:
+    def _require_open_authorization(self, authorization: Authorization, detail: str) -> None:
+        """Raise if this authorization was already settled. Lock held.
+
+        Deliberately does *not* remove it yet — that happens only once the
+        settling transaction has actually committed
+        (:meth:`_finalize_authorization`), so a durable-write failure during
+        settlement leaves the hold open rather than orphaned. Nothing can
+        race between this check and that commit: both run under the same
+        lock acquisition in :meth:`capture`/:meth:`void`.
+        """
+        if authorization.authorization_id not in self._open_auths:
             raise DoubleSpendError(
                 authorization.scope_id, str(authorization.authorization_id), detail
             )
 
+    def _finalize_authorization(self, authorization: Authorization) -> None:
+        """Remove a settled authorization from memory and the store. Lock held."""
+        del self._open_auths[authorization.authorization_id]
+        if self._store is not None:
+            self._store.delete_authorization(authorization.authorization_id)
+
     def _void_locked(self, authorization: Authorization, memo: str) -> LedgerEntry:
-        """Post a hold release. Caller holds the lock and has consumed the auth."""
+        """Post a hold release and finalize the authorization. Lock held."""
         entries = self._ledger.post(
             [
                 LedgerLine(
@@ -1638,6 +1880,7 @@ class BudgetManager:
                 )
             ]
         )
+        self._finalize_authorization(authorization)
         return entries[0]
 
     def _maybe_trip_on_exhaustion(self, scope_id: str) -> None:

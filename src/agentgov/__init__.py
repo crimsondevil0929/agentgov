@@ -18,9 +18,16 @@ Quick start::
 
     print(result.cost, gov.available("researcher"))
 
+For a governor whose ledger and topology survive a process restart, open a
+SQLite-backed one instead::
+
+    with BudgetManager.open_sqlite("governor.db") as gov:
+        ...  # same API; state above is durable across restarts
+
 See :mod:`agentgov.core` for the ledger and budget DAG,
-:mod:`agentgov.exceptions` for the error hierarchy, and
-:mod:`agentgov.interceptor` for the call-site enforcement wrappers.
+:mod:`agentgov.exceptions` for the error hierarchy,
+:mod:`agentgov.interceptor` for the call-site enforcement wrappers, and
+:mod:`agentgov.storage` for the durable-store interface.
 """
 
 from __future__ import annotations
@@ -66,6 +73,7 @@ from agentgov.interceptor import (
     default_usage_extractor,
     pricing_for,
 )
+from agentgov.storage import PersistedAuthorization, PersistedNode, PersistenceStore, SqliteStore
 
 __all__ = [
     "PRICING",
@@ -93,9 +101,13 @@ __all__ = [
     "LedgerLine",
     "MeteredCall",
     "ModelPricing",
+    "PersistedAuthorization",
+    "PersistedNode",
+    "PersistenceStore",
     "RunawayLoopDetectedError",
     "ScopeError",
     "SpendGuard",
+    "SqliteStore",
     "SubBudgetAllocationError",
     "TokenUsage",
     "UnknownScopeError",
