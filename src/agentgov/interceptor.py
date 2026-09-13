@@ -28,12 +28,13 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
 from types import MappingProxyType, TracebackType
 from typing import Any, Generic, Self, TypeVar
 
+from agentgov.cognitive import CognitiveBreaker
 from agentgov.core import QUANTUM, Authorization, BudgetManager, LedgerEntry, money
 
 __all__ = [
@@ -466,11 +467,22 @@ class Interceptor:
         :func:`default_usage_extractor` handles Anthropic SDK responses,
         mappings, and :class:`TokenUsage` directly.
     :param hold: Fixed hold amount, overriding the estimate entirely.
+    :param cognitive: An optional
+        :class:`~agentgov.cognitive.CognitiveBreaker`. When given, every call
+        is checked for thrashing *before* its hold is placed, so a looping
+        agent is halted without spending anything on the call that trips it,
+        and each result is fed back so the breaker can tell a real loop from
+        legitimate iteration.
+    :param trajectory: The logical unit of work this interceptor's calls
+        belong to, for the cognitive breaker. Defaults to ``scope_id``. Share
+        one across scopes when an orchestrator retries a task via fresh
+        sub-agents — that is one trajectory, not several.
     :raises KeyError: If ``model`` has no published pricing and ``pricing``
         was not supplied.
     """
 
     __slots__ = (
+        "_cognitive",
         "_estimated_input_tokens",
         "_extract_usage",
         "_hold",
@@ -478,6 +490,7 @@ class Interceptor:
         "_max_output_tokens",
         "_pricing",
         "_scope_id",
+        "_trajectory",
     )
 
     def __init__(
@@ -491,6 +504,8 @@ class Interceptor:
         estimated_input_tokens: int = 2000,
         extract_usage: UsageExtractor = default_usage_extractor,
         hold: Decimal | None = None,
+        cognitive: CognitiveBreaker | None = None,
+        trajectory: str | None = None,
     ) -> None:
         if max_output_tokens < 0 or estimated_input_tokens < 0:
             raise ValueError("token estimates must not be negative")
@@ -501,6 +516,8 @@ class Interceptor:
         self._estimated_input_tokens = estimated_input_tokens
         self._extract_usage = extract_usage
         self._hold = hold
+        self._cognitive = cognitive
+        self._trajectory = trajectory
 
     # -- accessors --------------------------------------------------------
 
@@ -518,6 +535,16 @@ class Interceptor:
     def pricing(self) -> ModelPricing:
         """The rates applied to metered calls."""
         return self._pricing
+
+    @property
+    def cognitive(self) -> CognitiveBreaker | None:
+        """The cognitive breaker guarding these calls, if any."""
+        return self._cognitive
+
+    @property
+    def trajectory(self) -> str:
+        """The cognitive trajectory these calls belong to."""
+        return self._trajectory if self._trajectory is not None else self._scope_id
 
     @property
     def hold_amount(self) -> Decimal:
@@ -593,7 +620,23 @@ class Interceptor:
             ),
             extract_usage=self._extract_usage,
             hold=hold if hold is not None else self._hold,
+            cognitive=self._cognitive,
+            trajectory=self._trajectory,
         )
+
+    def with_trajectory(self, trajectory: str | None) -> Interceptor:
+        """Return a copy whose cognitive trajectory is ``trajectory``.
+
+        Use it to keep several sub-agent scopes on one trajectory, so an
+        orchestrator that retries by spawning a replacement worker does not
+        hand the loop a clean slate each time.
+
+        :param trajectory: The trajectory id, or ``None`` to fall back to the
+            scope id.
+        """
+        clone = self._clone()
+        clone._trajectory = trajectory
+        return clone
 
     # -- enforcement ------------------------------------------------------
 
@@ -621,11 +664,15 @@ class Interceptor:
         :param kwargs: Keyword arguments forwarded to ``fn``.
         :returns: The response together with its usage, settled cost, and
             ledger entry.
+        :raises ~agentgov.exceptions.AgentThrashingError: If a cognitive
+            breaker is attached and this trajectory is looping. Raised before
+            the hold is placed, so the tripping call costs nothing.
         :raises ~agentgov.exceptions.CircuitOpenError: If the scope is halted.
         :raises ~agentgov.exceptions.DenialOfWalletError: If the hold exceeds
             the available balance, or the settled cost overdrew the scope.
         :raises TypeError: If token usage cannot be read from the response.
         """
+        self._observe_cognitive(fn, args, kwargs)
         hold = self.hold_amount
         guard = SpendGuard(self._manager, self._scope_id, hold)
         with guard:
@@ -634,6 +681,7 @@ class Interceptor:
             latency = time.perf_counter() - started
             usage, cost = self._price(response)
             guard.settle(cost)
+        self._record_cognitive_result(response)
         return self._result(response, usage, cost, hold, guard, latency)
 
     async def ainvoke(
@@ -655,6 +703,7 @@ class Interceptor:
         :returns: The response together with its usage, settled cost, and
             ledger entry.
         """
+        self._observe_cognitive(fn, args, kwargs)
         hold = self.hold_amount
         guard = SpendGuard(self._manager, self._scope_id, hold)
         with guard:
@@ -663,7 +712,39 @@ class Interceptor:
             latency = time.perf_counter() - started
             usage, cost = self._price(response)
             guard.settle(cost)
+        self._record_cognitive_result(response)
         return self._result(response, usage, cost, hold, guard, latency)
+
+    def _observe_cognitive(
+        self,
+        fn: Callable[..., object],
+        args: Sequence[object],
+        kwargs: Mapping[str, object],
+    ) -> None:
+        """Run the thrashing check before any money is committed.
+
+        Deliberately ahead of the authorization hold: a call that trips the
+        cognitive breaker should cost nothing at all, not a voided hold.
+        """
+        if self._cognitive is None:
+            return
+        self._cognitive.observe_call(
+            self._scope_id,
+            getattr(fn, "__name__", type(fn).__name__),
+            args,
+            kwargs,
+            trajectory=self._trajectory,
+        )
+
+    def _record_cognitive_result(self, response: object) -> None:
+        """Feed the result back so the breaker can see whether it changed.
+
+        This is what separates a real loop (same input, same output) from
+        legitimate iteration (same input, different output).
+        """
+        if self._cognitive is None:
+            return
+        self._cognitive.record_result(self._scope_id, response, trajectory=self._trajectory)
 
     def _price(self, response: object) -> tuple[TokenUsage, Decimal]:
         """Extract usage from a response and price it."""

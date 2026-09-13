@@ -23,6 +23,8 @@ from decimal import Decimal
 
 __all__ = [
     "AgentGovError",
+    "AgentThrashingError",
+    "AgentThrashingException",
     "BudgetError",
     "BudgetExceededError",
     "CircuitBreakerError",
@@ -221,6 +223,69 @@ class CircuitOpenError(CircuitBreakerError):
             "its own breaker" if scope_id == tripped_scope_id else f"ancestor {tripped_scope_id!r}"
         )
         super().__init__(f"Scope {scope_id!r} is halted by {where}: {reason}")
+
+
+class AgentThrashingError(CircuitBreakerError):
+    """Raised when the cognitive breaker finds an agent looping without progress.
+
+    Where :class:`DenialOfWalletError` is reactive — it fires once the money
+    is gone — this is the *causal* control: it halts the open-loop execution
+    cycle that would have burned the envelope, typically for a fraction of a
+    cent. An agent re-issuing the same tool call, nudging a query without
+    advancing, or oscillating between two tools is thrashing, and no amount
+    of remaining budget makes continuing worthwhile.
+
+    Like every other breaker trip this latches: the trajectory stays halted
+    until :meth:`~agentgov.cognitive.CognitiveBreaker.reset` is called, so a
+    retry storm cannot wear it down.
+
+    :param scope_id: The budget scope that made the offending call.
+    :param trajectory: The logical unit of work that was found to be looping.
+        May span several scopes when an orchestrator retries via fresh
+        sub-agents.
+    :param detector: Name of the heuristic that fired.
+    :param reason: Human-readable explanation of the loop.
+    :param observations: Calls seen in this trajectory when it tripped.
+    :param confidence: The detector's confidence, ``0..1``.
+    :param tier: ``"deterministic"`` for an inline detector, ``"semantic"``
+        for one reached on the background lane.
+    :param evidence: Detector-specific detail, for debugging and audit.
+    """
+
+    def __init__(
+        self,
+        scope_id: str,
+        trajectory: str,
+        detector: str,
+        reason: str,
+        *,
+        observations: int = 0,
+        confidence: float = 1.0,
+        tier: str = "deterministic",
+        evidence: dict[str, str] | None = None,
+    ) -> None:
+        self.scope_id = scope_id
+        self.trajectory = trajectory
+        self.detector = detector
+        self.reason = reason
+        self.observations = observations
+        self.confidence = confidence
+        self.tier = tier
+        self.evidence = evidence if evidence is not None else {}
+        where = (
+            f"scope {scope_id!r}"
+            if trajectory == scope_id
+            else f"scope {scope_id!r} (trajectory {trajectory!r})"
+        )
+        super().__init__(
+            f"Agent thrashing halted for {where} after {observations} calls "
+            f"[{tier}/{detector}, confidence {confidence:.2f}]: {reason}"
+        )
+
+
+AgentThrashingException = AgentThrashingError
+"""Alias for :class:`AgentThrashingError`, for callers who prefer the
+``Exception`` suffix. Both names refer to the same class."""
 
 
 class RunawayLoopDetectedError(CircuitBreakerError):

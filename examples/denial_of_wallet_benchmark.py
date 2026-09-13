@@ -2,23 +2,30 @@
 """Denial-of-wallet benchmark: the same runaway agent, with and without a backstop.
 
 This is the validation step from CONCEPT.md, made reproducible. It runs one
-agent workload twice:
+agent workload three times:
 
   Scenario A - Ungoverned.  A runaway orchestrator spawns sub-agents and calls
     a model in an unbounded loop. Nothing can stop it. We record what it would
     have cost.
 
-  Scenario B - AgentGov protected.  Byte-for-byte the same agent logic, but
+  Scenario B - Financial governance.  Byte-for-byte the same agent logic, but
     issued a strict spend envelope that it sub-delegates to its workers. Every
-    call is authorized against the ledger before it is made.
+    call is authorized against the ledger before it is made. This bounds the
+    damage — but only after the envelope has actually been spent.
 
-Both scenarios run the *identical* workload function; only the harness behind
+  Scenario C - Cognitive + financial.  Scenario B plus a
+    :class:`~agentgov.cognitive.CognitiveBreaker`, which detects that the
+    agent is re-asking one question with cosmetic edits and halts it for a
+    fraction of a cent, long before the money runs out. The two governed
+    scenarios differ by exactly one constructor argument.
+
+All three run the *identical* workload function; only the harness behind
 ``attempt()`` and ``spawn()`` differs, so the comparison is apples-to-apples.
 
-Scenario B deliberately keeps hammering after it is refused, modelling an
-agent that ignores the error entirely. That is the adversarial case a backstop
-has to survive: no matter how many times it retries, it cannot spend another
-cent.
+The governed scenarios deliberately keep hammering after being refused,
+modelling an agent that ignores the error entirely. That is the adversarial
+case a backstop has to survive: no matter how many times it retries, it
+cannot spend another cent.
 
 Costs are computed from the published per-token rates in ``agentgov.interceptor``
 against a deterministic offline model stub, so the run is reproducible and
@@ -37,11 +44,12 @@ import argparse
 import logging
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Protocol
 
-from agentgov import BudgetManager, Interceptor, money
+from agentgov import BudgetManager, CognitiveBreaker, Interceptor, money
 from agentgov.core import EntryType, GovernancePolicy, format_audit_line
 from agentgov.dummy import DummyLLM
 from agentgov.exceptions import (
@@ -53,6 +61,12 @@ from agentgov.exceptions import (
 from agentgov.interceptor import ModelPricing, TokenUsage, pricing_for
 
 ROOT = "orchestrator"
+TRAJECTORY = "quarterly-revenue-lookup"
+"""The one logical task every worker in this benchmark is retrying.
+
+Shared across scopes on purpose: respawning a worker to attempt the same
+degenerate task is a continuation of one loop, not a fresh start.
+"""
 SPAWN_EVERY = 10_000
 """Calls a worker makes before the orchestrator rotates it out anyway.
 
@@ -88,6 +102,7 @@ class Outcome:
     cost: Decimal = Decimal("0")
     breached_after: float | None = None
     breaker: str = "n/a - no backstop exists"
+    cognitive: str = "n/a - not enabled"
     integrity: str = "n/a - no ledger exists"
     conservation: str = "n/a - no ledger exists"
     notes: list[str] = field(default_factory=list)
@@ -162,11 +177,15 @@ class GovernedHarness:
         llm: DummyLLM,
         interceptor: Interceptor,
         outcome: Outcome,
+        cognitive: CognitiveBreaker | None = None,
+        trajectory: str = TRAJECTORY,
     ) -> None:
         self._gov = gov
         self._llm = llm
         self._interceptor = interceptor
         self._outcome = outcome
+        self._cognitive = cognitive
+        self._trajectory = trajectory
         # A worker that cannot cover a single worst-case call is not worth
         # spawning; without this floor the orchestrator thrashes, minting
         # thousands of stillborn sub-agents that are refused on their first
@@ -188,6 +207,13 @@ class GovernedHarness:
         return True
 
     def spawn(self, index: int, retiring: str | None) -> str | None:
+        # A cognitive halt is a verdict on the *task*, not on the worker.
+        # Spawning a replacement to retry a task already judged degenerate is
+        # itself the retry storm the breaker exists to stop, so an orchestrator
+        # that respects the halt stops spawning.
+        if self._cognitive is not None and self._cognitive.is_tripped(self._trajectory):
+            return None
+
         # Reclaim whatever the outgoing worker never spent, so an abandoned
         # sub-agent cannot strand budget its siblings could have used.
         if retiring is not None and retiring != ROOT:
@@ -212,6 +238,29 @@ class GovernedHarness:
 # --------------------------------------------------------------------------
 
 
+_MUTATIONS = (
+    "{q}",
+    "{q} please",
+    "the {q}",
+    "{q} 2026",
+    "{q}, detailed",
+    "{q} (retry)",
+)
+_BASE_TASK = "find the quarterly revenue report for the northwest region"
+
+
+def thrashing_prompt(attempt: int) -> str:
+    """The prompt an agent stuck in an open loop actually emits.
+
+    Not a strawman: this is the classic failure shape — the agent cannot
+    find what it is looking for, so it re-asks the same question with
+    cosmetic mutations, convinced the next phrasing will work. Each prompt
+    differs from the last, so nothing an exact-match cache or a
+    deduplicating rate limiter would catch, yet no attempt advances the task.
+    """
+    return _MUTATIONS[attempt % len(_MUTATIONS)].format(q=_BASE_TASK)
+
+
 def run_runaway(harness: Harness, outcome: Outcome, deadline: float) -> None:
     """An orchestrator that spawns workers and calls a model, without bound.
 
@@ -223,7 +272,7 @@ def run_runaway(harness: Harness, outcome: Outcome, deadline: float) -> None:
 
     while time.perf_counter() < deadline:
         outcome.attempted += 1
-        executed = harness.attempt(scope, f"process record {outcome.attempted}")
+        executed = harness.attempt(scope, thrashing_prompt(outcome.attempted))
         since_spawn += 1
 
         # Rotate workers when the current one stops making progress, or simply
@@ -260,16 +309,38 @@ def scenario_ungoverned(seconds: float, budget: Decimal, model: str, latency: fl
 
 
 def scenario_governed(
-    seconds: float, budget: Decimal, model: str, latency: float
+    seconds: float,
+    budget: Decimal,
+    model: str,
+    latency: float,
+    *,
+    cognitive: bool = False,
+    label: str | None = None,
 ) -> tuple[Outcome, BudgetManager]:
-    """Scenario B: the same runaway agent under a strict spend envelope."""
-    outcome = Outcome(label="Scenario B - AgentGov", governed=True, budget=budget)
+    """Scenario B (financial) or C (cognitive + financial).
+
+    The two differ by exactly one constructor argument — the cognitive
+    breaker handed to the interceptor — so the third column isolates what
+    loop detection buys on top of the spend envelope, and nothing else.
+    """
+    default_label = (
+        "Scenario C - AgentGov (Cognitive + Financial)"
+        if cognitive
+        else "Scenario B - AgentGov (Financial)"
+    )
+    outcome = Outcome(
+        label=label if label is not None else default_label, governed=True, budget=budget
+    )
 
     # Velocity detection is disabled so the benchmark measures the *budget*
     # backstop in isolation; otherwise the loop trips on call rate in
     # milliseconds and never reaches the spend limit at all.
     gov = BudgetManager(policy=GovernancePolicy(max_calls_per_window=0, max_depth=8))
     gov.open_root(ROOT, budget)
+
+    breaker: CognitiveBreaker | None = None
+    if cognitive:
+        breaker = CognitiveBreaker(manager=gov)
 
     llm = DummyLLM(model, latency_seconds=latency)
     interceptor = Interceptor(
@@ -278,8 +349,13 @@ def scenario_governed(
         model=model,
         estimated_input_tokens=64,
         max_output_tokens=576,
+        cognitive=breaker,
+        # One shared trajectory across every worker: an orchestrator that
+        # answers a halt by spawning a replacement to retry the same
+        # degenerate task is one loop, not a fresh start each time.
+        trajectory=TRAJECTORY if cognitive else None,
     )
-    harness = GovernedHarness(gov, llm, interceptor, outcome)
+    harness = GovernedHarness(gov, llm, interceptor, outcome, breaker, TRAJECTORY)
 
     started = time.perf_counter()
     run_runaway(harness, outcome, started + seconds)
@@ -291,6 +367,18 @@ def scenario_governed(
         if halted
         else "closed (never tripped)"
     )
+
+    if breaker is not None:
+        verdict = breaker.verdict(TRAJECTORY)
+        stats = breaker.stats
+        outcome.cognitive = (
+            f"TRIPPED [{verdict.tier}/{verdict.detector}] after {verdict.observations} calls"
+            if verdict is not None
+            else f"closed after {stats.observed} calls"
+        )
+        if verdict is not None:
+            outcome.notes.append(f"Cognitive halt: {verdict.reason}")
+        breaker.close()
 
     try:
         gov.verify_integrity()
@@ -311,7 +399,8 @@ def scenario_governed(
     assert settled == outcome.cost, f"tally {outcome.cost} != ledger {settled}"
     assert settled <= budget, f"envelope breached: {settled} > {budget}"
 
-    outcome.notes.append(f"Refused {outcome.refused:,} attempts after the envelope was spent.")
+    exhausted = "the envelope was spent" if breaker is None else "the loop was cut short"
+    outcome.notes.append(f"Refused {outcome.refused:,} attempts after {exhausted}.")
     outcome.notes.append(
         f"Ledger and caller tally agree exactly: ${settled} settled, "
         f"${gov.subtree_available(ROOT)} unspent."
@@ -330,47 +419,53 @@ def usd(amount: Decimal) -> str:
     return f"${quantized:,.6f}"
 
 
-def render_table(a: Outcome, b: Outcome) -> str:
-    """Build the side-by-side comparison table."""
-    rows: list[tuple[str, str, str]] = [
-        ("Wall clock", f"{a.elapsed:.2f}s", f"{b.elapsed:.2f}s"),
-        ("Sub-agents spawned", f"{a.spawned:,}", f"{b.spawned:,}"),
-        ("Calls attempted", f"{a.attempted:,}", f"{b.attempted:,}"),
-        ("Calls executed", f"{a.executed:,}", f"{b.executed:,}"),
-        ("Calls refused", f"{a.refused:,}", f"{b.refused:,}"),
-        ("Tokens consumed", f"{a.tokens:,}", f"{b.tokens:,}"),
-        ("", "", ""),
-        ("Intended budget", usd(a.budget), usd(b.budget)),
-        ("Actual cost realized", usd(a.cost), usd(b.cost)),
-        ("Cost vs budget", f"{a.overshoot:,.1f}%", f"{b.overshoot:,.1f}%"),
+def render_table(*outcomes: Outcome) -> str:
+    """Build the side-by-side comparison table for any number of scenarios."""
+
+    def per(render: Callable[[Outcome], str]) -> tuple[str, ...]:
+        return tuple(render(o) for o in outcomes)
+
+    blank = ("",) * len(outcomes)
+    rows: list[tuple[str, ...]] = [
+        ("Wall clock", *per(lambda o: f"{o.elapsed:.2f}s")),
+        ("Sub-agents spawned", *per(lambda o: f"{o.spawned:,}")),
+        ("Calls attempted", *per(lambda o: f"{o.attempted:,}")),
+        ("Calls executed", *per(lambda o: f"{o.executed:,}")),
+        ("Calls refused", *per(lambda o: f"{o.refused:,}")),
+        ("Tokens consumed", *per(lambda o: f"{o.tokens:,}")),
+        ("", *blank),
+        ("Intended budget", *per(lambda o: usd(o.budget))),
+        ("Actual cost realized", *per(lambda o: usd(o.cost))),
+        ("Cost vs budget", *per(lambda o: f"{o.overshoot:,.1f}%")),
         (
             "Budget breached after",
-            f"{a.breached_after:.3f}s" if a.breached_after else "never",
-            f"{b.breached_after:.3f}s" if b.breached_after else "never",
+            *per(lambda o: f"{o.breached_after:.3f}s" if o.breached_after else "never"),
         ),
-        ("", "", ""),
-        ("Circuit breaker", a.breaker, b.breaker),
-        ("verify_integrity()", a.integrity, b.integrity),
-        ("verify_conservation()", a.conservation, b.conservation),
+        ("", *blank),
+        ("Cognitive breaker", *per(lambda o: o.cognitive)),
+        ("Financial breaker", *per(lambda o: o.breaker)),
+        ("verify_integrity()", *per(lambda o: o.integrity)),
+        ("verify_conservation()", *per(lambda o: o.conservation)),
     ]
 
     label_w = max(len(r[0]) for r in rows)
-    col_a = max([len(r[1]) for r in rows] + [len(a.label)])
-    col_b = max([len(r[2]) for r in rows] + [len(b.label)])
+    widths = [
+        max([len(r[index + 1]) for r in rows] + [len(outcome.label)])
+        for index, outcome in enumerate(outcomes)
+    ]
 
     def line(char: str = "-") -> str:
-        return f"+-{char * label_w}-+-{char * col_a}-+-{char * col_b}-+".replace(
-            "-", char if char != "-" else "-"
-        )
+        return "+" + "+".join(char * (width + 2) for width in [label_w, *widths]) + "+"
 
-    def row(label: str, left: str, right: str) -> str:
-        if not label and not left and not right:
+    def row(label: str, *cells: str) -> str:
+        if not label and not any(cells):
             return line()
-        return f"| {label:<{label_w}} | {left:>{col_a}} | {right:>{col_b}} |"
+        rendered = " | ".join(cell.rjust(width) for cell, width in zip(cells, widths, strict=True))
+        return f"| {label:<{label_w}} | {rendered} |"
 
     out = [
         line("="),
-        row("METRIC", a.label.center(col_a), b.label.center(col_b)),
+        row("METRIC", *(o.label.center(w) for o, w in zip(outcomes, widths, strict=True))),
         line("="),
     ]
     out.extend(row(*r) for r in rows)
@@ -403,9 +498,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # The audit logger writes a line per ledger entry. Streaming a million of
     # them would bury the comparison, so it is quiet unless asked for.
-    logging.getLogger("agentgov.audit").setLevel(
-        logging.INFO if args.audit else logging.CRITICAL + 1
-    )
+    quiet = logging.CRITICAL + 1
+    logging.getLogger("agentgov.audit").setLevel(logging.INFO if args.audit else quiet)
+    logging.getLogger("agentgov.cognitive").setLevel(logging.WARNING if args.audit else quiet)
     if args.audit:
         logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 
@@ -419,19 +514,25 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  running Scenario A (ungoverned) for {args.seconds}s ...", flush=True)
     ungoverned = scenario_ungoverned(args.seconds, budget, args.model, args.latency)
 
-    print(f"  running Scenario B (AgentGov) for {args.seconds}s ...\n", flush=True)
-    governed, gov = scenario_governed(args.seconds, budget, args.model, args.latency)
+    print(f"  running Scenario B (financial only) for {args.seconds}s ...", flush=True)
+    governed, _ = scenario_governed(args.seconds, budget, args.model, args.latency)
 
-    print(render_table(ungoverned, governed))
+    print(f"  running Scenario C (cognitive + financial) for {args.seconds}s ...\n", flush=True)
+    cognitive, cognitive_gov = scenario_governed(
+        args.seconds, budget, args.model, args.latency, cognitive=True
+    )
+
+    print(render_table(ungoverned, governed, cognitive))
 
     if not args.audit:
-        print(
-            "\nAUDIT TRAIL (last 5 of "
-            f"{len(gov.audit_trail()):,} hash-chained entries; --audit for all)"
-        )
-        for entry in gov.audit_trail()[-5:]:
+        # Scenario C's trail, because it carries the novel part: a *cognitive*
+        # verdict recorded as a hash-anchored control event on the same
+        # financial ledger as every other governance action.
+        trail = cognitive_gov.audit_trail()
+        print(f"\nSCENARIO C AUDIT TRAIL (last 5 of {len(trail):,} hash-chained entries)")
+        for entry in trail[-5:]:
             print(f"  {format_audit_line(entry)}")
-        for event in gov.control_events[-1:]:
+        for event in cognitive_gov.control_events[-1:]:
             print(
                 f"  CIRCUIT  {event.event_type} scope={event.scope_id} "
                 f"anchored_at={event.ledger_head_hash[:16]} reason={event.reason}"
@@ -452,14 +553,24 @@ def main(argv: list[str] | None = None) -> int:
             f"(try --seconds or a pricier --model)."
         )
     print(
-        f"  AgentGov settled {usd(governed.cost)} of a {usd(budget)} envelope "
-        f"and refused {governed.refused:,} further attempts."
+        f"  Financial only settled {usd(governed.cost)} of a {usd(budget)} envelope "
+        f"and refused {governed.refused:,} further attempts — correct, but only "
+        f"after the envelope was actually spent."
     )
-    for note in governed.notes:
+    print(
+        f"  Cognitive + financial halted the loop at {usd(cognitive.cost)} after "
+        f"{cognitive.executed} executed calls: "
+        f"{(cognitive.cost / budget * 100):.2f}% of the envelope, "
+        f"{(governed.cost / cognitive.cost):,.0f}x cheaper than waiting for the "
+        f"money to run out."
+    )
+    for note in cognitive.notes:
         print(f"  {note}")
 
-    # A demonstrable backstop, or the benchmark has failed to demonstrate it.
-    assert governed.cost <= budget
+    # Demonstrable backstops, or the benchmark has failed to demonstrate them.
+    assert governed.cost <= budget, "financial envelope was breached"
+    assert cognitive.cost <= budget, "cognitive run breached the envelope"
+    assert cognitive.cost < governed.cost, "the cognitive breaker saved nothing"
     return 0
 
 
