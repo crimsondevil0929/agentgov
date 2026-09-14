@@ -26,8 +26,11 @@ SQLite-backed one instead::
 
 See :mod:`agentgov.core` for the ledger and budget DAG,
 :mod:`agentgov.exceptions` for the error hierarchy,
-:mod:`agentgov.interceptor` for the call-site enforcement wrappers, and
-:mod:`agentgov.storage` for the durable-store interface.
+:mod:`agentgov.interceptor` for the call-site enforcement wrappers,
+:mod:`agentgov.storage` for the durable-store interface,
+:mod:`agentgov.adapters` for the LangChain and CrewAI drop-ins, and
+:mod:`agentgov.reconciliation` for matching a provider invoice against the
+ledger.
 """
 
 from __future__ import annotations
@@ -96,6 +99,14 @@ from agentgov.interceptor import (
     pricing_for,
 )
 from agentgov.proxy import GovernedClient, GovernorHandle, govern
+from agentgov.reconciliation import (
+    MeteringJournal,
+    ProviderUsageRecord,
+    ReconciliationPolicy,
+    ReconciliationReport,
+    load_provider_export,
+    reconcile,
+)
 from agentgov.storage import PersistedAuthorization, PersistedNode, PersistenceStore, SqliteStore
 from agentgov.streaming import AsyncMeteredStream, MeteredStream
 
@@ -137,12 +148,16 @@ __all__ = [
     "LoopDetector",
     "MeteredCall",
     "MeteredStream",
+    "MeteringJournal",
     "ModelPricing",
     "NearDuplicateDetector",
     "PersistedAuthorization",
     "PersistedNode",
     "PersistenceStore",
+    "ProviderUsageRecord",
     "ReadOnlyLedgerError",
+    "ReconciliationPolicy",
+    "ReconciliationReport",
     "Redactor",
     "RunawayLoopDetectedError",
     "ScopeError",
@@ -162,8 +177,10 @@ __all__ = [
     "extract_prompt_text",
     "format_audit_line",
     "govern",
+    "load_provider_export",
     "money",
     "pricing_for",
+    "reconcile",
 ]
 
 __version__ = "0.1.0"

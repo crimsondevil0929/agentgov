@@ -732,3 +732,65 @@ def test_a_final_message_accessor_that_raises_is_tolerated(gov: BudgetManager) -
         list(stream)
     # Falls back to the usage reconstructed from the events themselves.
     assert stream.usage == TokenUsage(input_tokens=1000, output_tokens=500)
+
+
+# --------------------------------------------------------------------------
+# The live demo
+# --------------------------------------------------------------------------
+
+
+def test_the_live_demo_runs_and_produces_its_artifacts(tmp_path: Path) -> None:
+    """Smoke-test examples/live_demo.py so the investor demo cannot rot.
+
+    Asserts the claims the runbook makes on stage: the breaker halts, it halts
+    for less than a cent, and every artifact the CLI steps need exists.
+    """
+    script = Path(__file__).resolve().parent.parent / "examples" / "live_demo.py"
+    out = tmp_path / "demo"
+
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--out", str(out), "--no-color"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "HALTED after" in result.stdout
+    assert "the breaker latches" in result.stdout
+    assert "PASS (SHA-256 chain re-derived)" in result.stdout
+
+    for artifact in ("governor.db", "tokens.jsonl", "provider_invoice.json"):
+        assert (out / artifact).is_file(), f"the demo did not write {artifact}"
+
+    # Step 3 and step 4, exactly as the runbook runs them.
+    code, inspected = run_cli("inspect", str(out / "governor.db"))
+    assert code == 0
+    assert "HALTED by runaway" in inspected
+
+    code, reconciled = run_cli(
+        "reconcile",
+        str(out / "governor.db"),
+        str(out / "provider_invoice.json"),
+        "--journal",
+        str(out / "tokens.jsonl"),
+    )
+    assert code == 1, "the planted phantom call must fail the audit"
+    assert "AUDIT FAILED" in reconciled
+    assert "req_LEAKED_KEY" in reconciled
+
+
+def test_the_demo_halt_is_genuinely_sub_cent(tmp_path: Path) -> None:
+    """The runbook says 'sub-cent' on stage; hold the demo to it."""
+    script = Path(__file__).resolve().parent.parent / "examples" / "live_demo.py"
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--out", str(tmp_path / "demo"), "--no-color"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=True,
+    )
+    burned = next(line for line in result.stdout.splitlines() if line.strip().startswith("burned"))
+    amount = Decimal(burned.split("$")[1].split()[0])
+    assert amount < Decimal("0.01"), f"the demo burned {amount}, which is not sub-cent"

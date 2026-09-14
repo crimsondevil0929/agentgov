@@ -2,8 +2,8 @@
 
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
-[![tests](https://img.shields.io/badge/tests-246%2F246%20passing-brightgreen)](#code-quality--packaging)
-[![coverage](https://img.shields.io/badge/coverage-97%25-brightgreen)](#code-quality--packaging)
+[![tests](https://img.shields.io/badge/tests-316%2F316%20passing-brightgreen)](#code-quality--packaging)
+[![coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)](#code-quality--packaging)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
 [![license](https://img.shields.io/badge/license-Apache%202.0-lightgrey)](LICENSE)
@@ -246,6 +246,85 @@ own `max_tokens`, and a configurable `safety_buffer` (1.5x by default)
 absorbs the heuristic's error. Unrecognised payloads fall back to the static
 ceiling rather than under-reserving.
 
+## Framework adapters
+
+Two lines on an agent you have already written. Neither adapter imports its
+framework — every object is duck-typed, so they load without LangChain or
+CrewAI installed and keep working when those libraries reshuffle internals.
+
+```python
+from agentgov.adapters.langchain import GovernedChatModel
+
+model = GovernedChatModel(ChatAnthropic(model="claude-opus-5"), gov, "researcher")
+answer = model.invoke(messages)  # unchanged call site, now metered
+```
+
+For **LangGraph** — or any chain deep enough that you never touch the model
+object — use the callback handler instead. Callbacks propagate down the whole
+run tree, so one handler governs every model call in a graph, keyed by
+`run_id` so concurrent branches settle independently:
+
+```python
+from agentgov.adapters.langchain import GovernedCallbackHandler
+
+graph.invoke(state, config={"callbacks": [GovernedCallbackHandler(gov, "researcher")]})
+```
+
+**CrewAI** settles per run, because CrewAI reports usage per run:
+
+```python
+from agentgov.adapters.crewai import GovernedCrew
+
+crew = GovernedCrew(Crew(agents=[...], tasks=[...]), gov, "research-crew")
+result = crew.kickoff()
+```
+
+Two details these get right that are easy to get wrong. LangChain **swallows
+exceptions raised inside callbacks** unless the handler sets
+`raise_error = True` — without it a denial-of-wallet halt would be logged and
+the graph would keep spending. And CrewAI's `usage_metrics` are **cumulative
+across kickoffs**, so settling the reported total each run would bill run one
+again on run two; `GovernedCrew` charges only the delta.
+
+For a framework with no adapter, `govern_agent` wraps any function that runs a
+unit of agent work, given a callable that reads usage off its return value.
+
+## Reconciling the invoice
+
+The question a finance or security team actually asks is not "what did we
+budget?" but *"the provider billed us $40,000 — which agent caused it, and is
+there anything on there we never authorized?"*
+
+```bash
+$ agentgov reconcile governor.db provider_invoice.json --journal tokens.jsonl
+
+  CATEGORY                             COUNT             SPEND
+  ------------------------------------------------------------
+  Matched (billed and metered)             6         $0.034423
+  Discrepant (cost mismatch)               0         $0.000000
+  Phantom (billed, NOT metered)            1         $2.470000
+  Unsettled (metered, not billed)          0         $0.000000
+
+  PHANTOM CALLS - billed with no local authorization
+    2026-09-14 06:42:29  claude-opus-5   $2.470000  req_LEAKED_KEY_7f3a
+
+  AUDIT FAILED  1 phantom call(s) worth $2.470000
+```
+
+A **phantom** is the finding that matters: spend the provider billed that
+AgentGov never authorized — a leaked key, or a service calling the model
+outside the governor. Any phantom line exits `1`, so this belongs in a
+pipeline.
+
+Matching is fuzzy on purpose. Timestamps drift by network latency and token
+counts drift because pre-flight sizing is a `chars/4` heuristic; exact matching
+would report a healthy ledger as entirely broken. Both windows are configurable
+(`--time-tolerance`, `--token-tolerance`, `--cost-tolerance`).
+
+Token counts come from a `MeteringJournal`, an additive sidecar — the ledger
+records money and structure and deliberately not token metadata. Without a
+journal reconciliation still runs on cost and time, and says so.
+
 ## Reading a ledger
 
 ```
@@ -388,8 +467,8 @@ SQLite file, with financial and cognitive breakers on the same actuator. Beyond 
 
 ```bash
 uv sync                              # install (zero runtime dependencies)
-uv run pytest -v                     # 246 passed
-uv run pytest --cov=agentgov         # 97% coverage
+uv run pytest -v                     # 316 passed
+uv run pytest --cov=agentgov         # 96% coverage
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/                     # strict, zero errors
 uv run python examples/denial_of_wallet_benchmark.py
@@ -400,6 +479,10 @@ Every gate above runs in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.y
 Python 3.11 and 3.12, on Linux and macOS, with a 95% coverage floor and a build that
 fails on packaging warnings. Both example scripts are executed end to end so a broken
 demo cannot merge.
+
+For a three-minute live walkthrough — adopt, halt a runaway, verify the chain,
+catch unmetered spend — see [`docs/DEMO_RUNBOOK.md`](docs/DEMO_RUNBOOK.md) and
+run `uv run python examples/live_demo.py`.
 
 Packaged with [uv](https://docs.astral.sh/uv/); metadata, license, and classifiers live
 in [`pyproject.toml`](pyproject.toml). Security policy and data map:

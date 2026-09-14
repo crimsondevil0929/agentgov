@@ -11,6 +11,12 @@ Two commands, aimed at two different readers:
     conservation identity, and the delegation topology, then exits ``0`` or
     ``1``. Drop it in CI to assert an archived ledger is intact.
 
+``agentgov reconcile <db> <provider-export>``
+    For finance and security: matches a provider's invoice against the ledger
+    and reports matched, discrepant, phantom, and unsettled spend. Exits ``1``
+    on any phantom line — billed spend with no local authorization — so it too
+    belongs in a pipeline.
+
 Both open the database **read-only**, so they are safe to run against a
 governor that is live and holding the write claim.
 
@@ -28,6 +34,14 @@ from typing import TextIO
 
 from agentgov.core import BudgetManager, BudgetNode, EntryType, format_audit_line
 from agentgov.exceptions import AgentGovError, LedgerError
+from agentgov.reconciliation import (
+    MeteringJournal,
+    ReconciliationPolicy,
+    format_report,
+    load_provider_export,
+    metered_records,
+    reconcile,
+)
 
 __all__ = ["main"]
 
@@ -188,6 +202,41 @@ def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
         manager.close()
 
 
+def _command_reconcile(args: argparse.Namespace, out: TextIO) -> int:
+    """Match a provider invoice against the ledger and report the variance."""
+    try:
+        provider = load_provider_export(args.export, fmt=args.format)
+    except AgentGovError as exc:
+        out.write(f"FAIL  could not read {args.export}\n  {exc}\n")
+        return 1
+
+    journal: MeteringJournal | None = None
+    if args.journal:
+        try:
+            journal = MeteringJournal.load(args.journal)
+        except (AgentGovError, OSError) as exc:
+            out.write(f"FAIL  could not read journal {args.journal}\n  {exc}\n")
+            return 1
+
+    manager = _open(args.path)
+    try:
+        report = reconcile(
+            metered_records(manager, journal),
+            provider,
+            ReconciliationPolicy(
+                time_tolerance_seconds=args.time_tolerance,
+                token_tolerance_percent=args.token_tolerance,
+                cost_tolerance_percent=args.cost_tolerance,
+            ),
+        )
+    finally:
+        manager.close()
+
+    out.write(format_report(report, path=args.path, export=args.export))
+    out.write("\n")
+    return 0 if report.passed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser."""
     parser = argparse.ArgumentParser(
@@ -217,6 +266,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("path", help="path to the SQLite ledger")
     verify.set_defaults(handler=_command_verify)
+
+    reconcile_cmd = subcommands.add_parser(
+        "reconcile",
+        help="match a provider invoice against the ledger; exit 1 on unmetered spend",
+    )
+    reconcile_cmd.add_argument("path", help="path to the SQLite ledger")
+    reconcile_cmd.add_argument("export", help="provider usage export (JSON or CSV)")
+    reconcile_cmd.add_argument(
+        "--journal",
+        default="",
+        help="metering journal with token counts, for token-level matching",
+    )
+    reconcile_cmd.add_argument(
+        "--format",
+        default="auto",
+        choices=("auto", "openai-json", "anthropic-csv"),
+        help="export format (default: auto-detect by extension)",
+    )
+    reconcile_cmd.add_argument(
+        "--time-tolerance",
+        type=float,
+        default=5.0,
+        help="seconds of timestamp drift allowed when matching (default: 5.0)",
+    )
+    reconcile_cmd.add_argument(
+        "--token-tolerance",
+        type=float,
+        default=2.0,
+        help="percent of token drift allowed when matching (default: 2.0)",
+    )
+    reconcile_cmd.add_argument(
+        "--cost-tolerance",
+        type=float,
+        default=1.0,
+        help="percent of cost drift before a match is a discrepancy (default: 1.0)",
+    )
+    reconcile_cmd.set_defaults(handler=_command_reconcile)
 
     return parser
 

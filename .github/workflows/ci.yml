@@ -64,6 +64,8 @@ jobs:
         run: |
           uv run python examples/denial_of_wallet_benchmark.py --seconds 1
           uv run python examples/persistence_demo.py
+          uv run python examples/live_demo.py --out /tmp/agentgov-demo --no-color
+          uv run agentgov verify /tmp/agentgov-demo/governor.db
 
   build:
     name: build (wheel + sdist)
