@@ -60,7 +60,9 @@ import hashlib
 import json
 import logging
 import queue
+import secrets
 import threading
+import weakref
 from collections import OrderedDict, deque
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -81,6 +83,7 @@ __all__ = [
     "ExactRepeatDetector",
     "LoopDetector",
     "NearDuplicateDetector",
+    "Redactor",
     "SemanticObserver",
     "ToolCall",
     "TrajectoryEntropyObserver",
@@ -132,15 +135,49 @@ def shingles(text: str, *, size: int = 3, max_chars: int = 1024) -> frozenset[st
     passing a megabyte of context must not turn a similarity check into a
     latency spike.
 
+    Oversized text is sampled from **both ends** rather than truncated to the
+    head. Agent prompts routinely carry a long stable prefix — a system
+    prompt, a tool schema, retrieved context — with the part that actually
+    varies at the very end. Head-only truncation would make every such call
+    look identical and turn the near-duplicate detector into a constant.
+
     :param text: The text to shingle.
     :param size: n-gram width.
-    :param max_chars: Truncate the input to this many characters first.
+    :param max_chars: Sample budget. Text longer than this contributes its
+        first and last ``max_chars // 2`` characters.
     :returns: The set of n-grams.
     """
-    clipped = text[:max_chars]
-    if len(clipped) <= size:
-        return frozenset({clipped})
-    return frozenset(clipped[i : i + size] for i in range(len(clipped) - size + 1))
+    if len(text) > max_chars:
+        half = max_chars // 2
+        # The separator keeps the junction deterministic: without it the
+        # splice would mint n-grams that appear in neither end of the text.
+        text = text[:half] + _UNIT_SEPARATOR + text[-half:]
+    if len(text) <= size:
+        return frozenset({text})
+    return frozenset(text[i : i + size] for i in range(len(text) - size + 1))
+
+
+class Redactor(Protocol):
+    """Removes sensitive material before AgentGov ever sees it.
+
+    Applied at canonicalisation — the single ingress through which every
+    observed argument and result passes — so redacted text is what gets
+    fingerprinted, shingled, and (only if explicitly retained) stored. Raw
+    prompt content never reaches the breaker's memory or the audit log.
+
+    Implementations must be pure and fast: this runs inline, on the agent's
+    own thread, before the tool call is allowed to proceed.
+    """
+
+    def redact(self, tool: str, text: str) -> str:
+        """Return ``text`` with sensitive material removed or masked.
+
+        :param tool: The tool being called, so a redactor can apply
+            per-tool rules.
+        :param text: Canonicalised arguments, or a canonicalised result.
+        :returns: The text safe to fingerprint and retain.
+        """
+        ...
 
 
 def jaccard(left: frozenset[str], right: frozenset[str], *, floor: float = 0.0) -> float:
@@ -178,9 +215,13 @@ class ToolCall:
     :ivar sequence: Position within the trajectory, starting at 1.
     :ivar scope_id: The budget scope that made the call.
     :ivar tool: The tool or function name.
-    :ivar arguments: Canonicalised arguments.
-    :ivar fingerprint: Digest of ``tool`` and ``arguments`` — the exact-repeat
-        identity.
+    :ivar arguments: Canonicalised arguments, redacted and truncated to
+        :attr:`CognitivePolicy.max_argument_chars` — and empty unless
+        :attr:`CognitivePolicy.retain_arguments` was explicitly enabled.
+        Never the raw prompt, and never unbounded.
+    :ivar fingerprint: Salted digest over the *full* redacted text, so
+        exact-repeat identity survives truncation while the digest itself
+        reveals nothing and cannot be matched against a precomputed table.
     :ivar shingles: Shingle set over tool *and* arguments, so calls to
         different tools are never mistaken for near-duplicates.
     :ivar timestamp: UTC instant the call was observed.
@@ -259,6 +300,12 @@ class CognitivePolicy:
     :ivar max_argument_chars: Arguments are truncated to this before shingling.
     :ivar exempt_tools: Tools never judged — the escape hatch for legitimately
         repetitive calls (polling a status endpoint, paginating a cursor).
+    :ivar retain_arguments: Whether to keep readable (redacted, truncated)
+        argument text on each :class:`ToolCall`. **Off by default**: a
+        governor should not become an unlogged copy of every prompt an agent
+        sends. Enable it for local debugging, or when a redactor guarantees
+        the text is safe. Detection is unaffected either way — the detectors
+        read fingerprints and shingles, never this field.
     :ivar entropy_window: Calls the semantic observer averages novelty over.
     :ivar min_novelty_ratio: Mean novel-shingle fraction below which the
         semantic observer calls a trajectory stagnant.
@@ -279,6 +326,7 @@ class CognitivePolicy:
     shingle_size: int = 3
     max_argument_chars: int = 1024
     exempt_tools: frozenset[str] = frozenset()
+    retain_arguments: bool = False
     entropy_window: int = 12
     min_novelty_ratio: float = 0.02
     async_queue_size: int = 256
@@ -540,9 +588,21 @@ class TrajectoryEntropyObserver:
     :param include_results: Fold result shingles into the novelty measure
         when they are available, which sharply distinguishes real iteration
         (new outputs) from thrashing (same outputs).
+    :param max_trajectories: Independent LRU bound on retained state. The
+        breaker also evicts this observer's state when it evicts a
+        trajectory of its own; this bound is the backstop for trajectories
+        the observer sees that the breaker has already forgotten, so a
+        long-lived process cannot accumulate novelty sets without limit.
     """
 
-    __slots__ = ("_include_results", "_lock", "_min_ratio", "_states", "_window")
+    __slots__ = (
+        "_include_results",
+        "_lock",
+        "_max_trajectories",
+        "_min_ratio",
+        "_states",
+        "_window",
+    )
 
     def __init__(
         self,
@@ -550,12 +610,20 @@ class TrajectoryEntropyObserver:
         window: int = 12,
         min_novelty_ratio: float = 0.02,
         include_results: bool = True,
+        max_trajectories: int = 256,
     ) -> None:
         self._window = max(2, window)
         self._min_ratio = min_novelty_ratio
         self._include_results = include_results
-        self._states: dict[str, _EntropyState] = {}
+        self._max_trajectories = max(1, max_trajectories)
+        self._states: OrderedDict[str, _EntropyState] = OrderedDict()
         self._lock = threading.Lock()
+
+    @property
+    def tracked(self) -> int:
+        """How many trajectories currently hold novelty state."""
+        with self._lock:
+            return len(self._states)
 
     @property
     def name(self) -> str:
@@ -574,6 +642,10 @@ class TrajectoryEntropyObserver:
             if state is None:
                 state = _EntropyState(ratios=deque(maxlen=self._window))
                 self._states[trajectory] = state
+                while len(self._states) > self._max_trajectories:
+                    self._states.popitem(last=False)
+            else:
+                self._states.move_to_end(trajectory)
 
             novel = len(material - state.seen)
             total = len(material) or 1
@@ -654,6 +726,8 @@ class _DefaultObserver:
 _DEFAULT_OBSERVER: Final = _DefaultObserver()
 
 _QueueItem = tuple[str, tuple["ToolCall", ...]]
+if TYPE_CHECKING:
+    _LaneFinalizer = weakref.finalize[[queue.Queue[_QueueItem | None]], "CognitiveBreaker"]
 """A trajectory id and the window handed to the semantic lane.
 
 ``None`` on the queue is the shutdown sentinel, which keeps the queue
@@ -696,13 +770,19 @@ class CognitiveBreaker:
     """
 
     __slots__ = (
+        # Weak references are what let an un-closed breaker's worker thread
+        # be reaped instead of leaking; a slotted class needs this explicitly.
+        "__weakref__",
         "_closed",
         "_detectors",
+        "_finalizer",
         "_lock",
         "_manager",
         "_observer",
         "_policy",
         "_queue",
+        "_redactor",
+        "_salt",
         "_stats_dropped",
         "_stats_evaluated",
         "_stats_observed",
@@ -718,6 +798,8 @@ class CognitiveBreaker:
         detectors: Sequence[LoopDetector] | None = None,
         observer: SemanticObserver | _DefaultObserver | None = _DEFAULT_OBSERVER,
         manager: BudgetManager | None = None,
+        redactor: Redactor | None = None,
+        salt: bytes | None = None,
     ) -> None:
         self._policy = policy if policy is not None else CognitivePolicy()
         self._detectors: tuple[LoopDetector, ...] = (
@@ -728,11 +810,17 @@ class CognitiveBreaker:
             resolved = TrajectoryEntropyObserver(
                 window=self._policy.entropy_window,
                 min_novelty_ratio=self._policy.min_novelty_ratio,
+                max_trajectories=self._policy.max_trajectories,
             )
         else:
             resolved = observer
         self._observer: SemanticObserver | None = resolved
         self._manager = manager
+        self._redactor = redactor
+        # Per-instance random salt: fingerprints stay comparable for the life
+        # of this breaker, which is all detection needs, while the digests
+        # themselves cannot be matched against a table of known prompts.
+        self._salt = salt if salt is not None else secrets.token_bytes(16)
 
         self._lock = threading.RLock()
         self._trajectories: OrderedDict[str, _Trajectory] = OrderedDict()
@@ -742,14 +830,14 @@ class CognitiveBreaker:
         self._stats_dropped = 0
         self._stats_evaluated = 0
 
-        self._queue: queue.Queue[_QueueItem | None] | None = None
+        # The worker starts on first use and is reaped by a finalizer, so a
+        # breaker that is constructed and dropped — the shape of an accidental
+        # per-request instantiation — never leaves a thread behind.
+        self._queue: queue.Queue[_QueueItem | None] | None = (
+            queue.Queue(maxsize=self._policy.async_queue_size) if resolved is not None else None
+        )
         self._worker: threading.Thread | None = None
-        if resolved is not None:
-            self._queue = queue.Queue(maxsize=self._policy.async_queue_size)
-            self._worker = threading.Thread(
-                target=self._drain, name="agentgov-cognitive", daemon=True
-            )
-            self._worker.start()
+        self._finalizer: _LaneFinalizer | None = None
 
     @staticmethod
     def _default_detectors(policy: CognitivePolicy) -> tuple[LoopDetector, ...]:
@@ -839,15 +927,23 @@ class CognitiveBreaker:
         if tool in self._policy.exempt_tools:
             return
 
-        # Hashing and shingling are pure; keep them outside the lock so
-        # concurrent sub-agents contend only for the bookkeeping itself.
+        # Redaction, hashing and shingling are pure; keep them outside the
+        # lock so concurrent sub-agents contend only for the bookkeeping.
+        arguments = self._redact(tool, arguments)
         text = f"{tool}{_UNIT_SEPARATOR}{arguments}"
         call = ToolCall(
             sequence=0,
             scope_id=scope_id,
             tool=tool,
-            arguments=arguments,
-            fingerprint=hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest(),
+            # Bounded, and empty unless retention was explicitly enabled: the
+            # fingerprint below already covers the *full* text, so dropping
+            # this costs nothing in detection and everything in exposure.
+            arguments=(
+                arguments[: self._policy.max_argument_chars]
+                if self._policy.retain_arguments
+                else ""
+            ),
+            fingerprint=self._digest(text),
             shingles=shingles(
                 text,
                 size=self._policy.shingle_size,
@@ -857,9 +953,10 @@ class CognitiveBreaker:
         )
 
         snapshot: tuple[ToolCall, ...] | None = None
+        evicted: list[str] = []
         with self._lock:
             self._stats_observed += 1
-            state = self._touch(key)
+            state = self._touch(key, evicted)
             verdict: Verdict | None
 
             # A latched trajectory stays latched: the loop that caused it has
@@ -884,6 +981,13 @@ class CognitiveBreaker:
                     state.verdict = verdict
                 elif self._queue is not None:
                     snapshot = tuple(state.calls)
+
+        # Outside the lock, for the same reason the halt below is: the
+        # observer takes its own mutex, and the worker thread acquires them
+        # in the opposite order. Never hold both.
+        if evicted and self._observer is not None:
+            for stale in evicted:
+                self._observer.reset(stale)
 
         if snapshot is not None:
             self._enqueue(key, snapshot)
@@ -938,7 +1042,10 @@ class CognitiveBreaker:
         :param trajectory: Logical unit of work; defaults to ``scope_id``.
         """
         key = trajectory if trajectory is not None else scope_id
-        rendered = canonical_arguments((result,))
+        with self._lock:
+            state_calls = self._trajectories.get(key)
+            tool = state_calls.calls[-1].tool if state_calls and state_calls.calls else ""
+        rendered = self._redact(tool, canonical_arguments((result,)))
         digest = shingles(
             rendered, size=self._policy.shingle_size, max_chars=self._policy.max_argument_chars
         )
@@ -969,15 +1076,14 @@ class CognitiveBreaker:
             if self._closed:
                 return
             self._closed = True
+        if self._finalizer is not None:
+            self._finalizer.detach()
+            self._finalizer = None
         if self._queue is not None:
-            try:
-                self._queue.put_nowait(None)
-            except queue.Full:  # pragma: no cover - free a slot, then retry
-                with suppress(queue.Empty, queue.Full):
-                    self._queue.get_nowait()
-                    self._queue.put_nowait(None)
+            _stop_lane(self._queue)
         if self._worker is not None:
             self._worker.join(timeout=2.0)
+            self._worker = None
 
     def __enter__(self) -> CognitiveBreaker:
         return self
@@ -992,17 +1098,40 @@ class CognitiveBreaker:
 
     # -- internals --------------------------------------------------------
 
-    def _touch(self, key: str) -> _Trajectory:
-        """Fetch or create a trajectory, evicting the least recent. Lock held."""
+    def _touch(self, key: str, evicted: list[str]) -> _Trajectory:
+        """Fetch or create a trajectory, evicting the least recent. Lock held.
+
+        Evicted keys are reported rather than cleaned up here: the observer's
+        state has to be dropped alongside them, and that call must happen
+        outside this lock to keep the two mutexes from ever being nested.
+        """
         state = self._trajectories.get(key)
         if state is None:
             state = _Trajectory(calls=deque(maxlen=self._policy.history_limit))
             self._trajectories[key] = state
             while len(self._trajectories) > self._policy.max_trajectories:
-                self._trajectories.popitem(last=False)
+                stale, _ = self._trajectories.popitem(last=False)
+                evicted.append(stale)
         else:
             self._trajectories.move_to_end(key)
         return state
+
+    def _redact(self, tool: str, text: str) -> str:
+        """Apply the configured redactor. A failure must not break the call."""
+        if self._redactor is None:
+            return text
+        try:
+            return self._redactor.redact(tool, text)
+        except Exception:
+            # Fail closed on *content*: if the redactor cannot vouch for this
+            # text, none of it is retained or shingled. Detection degrades;
+            # unredacted material never leaks as a consequence of a bug here.
+            logger.exception("redactor %r raised; dropping this call's text", self._redactor)
+            return ""
+
+    def _digest(self, text: str) -> str:
+        """Salted digest of the full text — the exact-repeat identity."""
+        return hashlib.blake2b(text.encode("utf-8"), key=self._salt, digest_size=16).hexdigest()
 
     def _judge(self, call: ToolCall, history: Sequence[ToolCall]) -> Verdict | None:
         """Run every inline detector, first verdict wins. Lock held.
@@ -1026,6 +1155,8 @@ class CognitiveBreaker:
         """Hand a window to the semantic lane, dropping it if saturated."""
         if self._queue is None:
             return
+        with self._lock:
+            self._ensure_worker()
         try:
             self._queue.put_nowait((key, snapshot))
         except queue.Full:
@@ -1035,29 +1166,39 @@ class CognitiveBreaker:
         with self._lock:
             self._stats_queued += 1
 
-    def _drain(self) -> None:
-        """Worker loop for the semantic lane."""
-        assert self._queue is not None
-        while True:
-            item = self._queue.get()
-            if item is None:
+    def _evaluate_window(self, key: str, snapshot: tuple[ToolCall, ...]) -> None:
+        """Run the semantic observer over one window. Called on the worker."""
+        observer = self._observer
+        if observer is None:  # pragma: no cover - defensive
+            return
+        try:
+            verdict = observer.evaluate(key, snapshot)
+        except Exception:  # a bad observer must not kill the lane
+            logger.exception("semantic observer %r raised; skipping this window", observer)
+            return
+        with self._lock:
+            self._stats_evaluated += 1
+            if verdict is None:
                 return
-            key, snapshot = item
-            observer = self._observer
-            if observer is None:  # pragma: no cover - defensive
-                continue
-            try:
-                verdict = observer.evaluate(key, snapshot)
-            except Exception:  # a bad observer must not kill the lane
-                logger.exception("semantic observer %r raised; skipping this window", observer)
-                continue
-            with self._lock:
-                self._stats_evaluated += 1
-                if verdict is None:
-                    continue
-                state = self._trajectories.get(key)
-                if state is not None and state.verdict is None and state.pending is None:
-                    state.pending = verdict
+            state = self._trajectories.get(key)
+            if state is not None and state.verdict is None and state.pending is None:
+                state.pending = verdict
+
+    def _ensure_worker(self) -> None:
+        """Start the semantic lane on first use. Caller holds the lock."""
+        if self._worker is not None or self._queue is None or self._closed:
+            return
+        self._worker = threading.Thread(
+            target=_drain_lane,
+            args=(weakref.ref(self), self._queue),
+            name="agentgov-cognitive",
+            daemon=True,
+        )
+        self._worker.start()
+        # Reap the thread if the breaker is dropped without close(). The
+        # callback closes over the queue only — capturing `self` here would
+        # keep the breaker alive forever and the finalizer would never run.
+        self._finalizer = weakref.finalize(self, _stop_lane, self._queue)
 
     def _halt(self, scope_id: str, trajectory: str, verdict: Verdict) -> None:
         """Latch the financial breaker and raise. Called with no lock held."""
@@ -1080,3 +1221,41 @@ class CognitiveBreaker:
             tier=verdict.tier,
             evidence=dict(verdict.evidence),
         )
+
+
+def _stop_lane(work: queue.Queue[_QueueItem | None]) -> None:
+    """Signal the semantic worker to exit. Safe from a finalizer or close()."""
+    try:
+        work.put_nowait(None)
+    except queue.Full:  # pragma: no cover - free a slot, then retry
+        with suppress(queue.Empty, queue.Full):
+            work.get_nowait()
+            work.put_nowait(None)
+
+
+def _drain_lane(
+    breaker_ref: weakref.ReferenceType[CognitiveBreaker],
+    work: queue.Queue[_QueueItem | None],
+) -> None:
+    """Semantic-lane worker loop.
+
+    Deliberately a module-level function over a :mod:`weakref` rather than a
+    bound method: a thread running a bound method holds a strong reference to
+    its breaker, which would keep every dropped breaker — and its thread —
+    alive for the life of the process. Holding only a weak reference means a
+    breaker that goes out of scope is collected, its finalizer wakes this
+    loop, and the thread exits.
+    """
+    while True:
+        item = work.get()
+        if item is None:
+            return
+        breaker = breaker_ref()
+        if breaker is None:
+            # The breaker was collected while this item was queued.
+            return
+        try:
+            breaker._evaluate_window(*item)
+        finally:
+            # Do not hold the breaker alive across the next blocking get().
+            del breaker

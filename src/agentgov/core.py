@@ -53,7 +53,7 @@ import uuid
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from enum import Enum, unique
 from typing import TYPE_CHECKING, Final
@@ -884,6 +884,12 @@ class GovernancePolicy:
     :ivar max_calls_per_window: Authorizations a single scope may make within
         ``window_seconds`` before the runaway-loop detector trips it. This
         catches a tight loop *before* it converts into spend.
+
+        The default of 1000/s is deliberately far above any human-paced
+        workload: this is a backstop against a tight machine loop, not a rate
+        limiter. A legitimately high-throughput fleet should never meet it —
+        an earlier default of 200/s tripped on this project's own benchmarks,
+        which is exactly the false positive a safety control must not have.
     :ivar window_seconds: Length of the velocity detection window.
     :ivar max_depth: Maximum delegation depth below a root. Bounds recursive
         sub-agent spawning independently of the dollar budget.
@@ -900,7 +906,7 @@ class GovernancePolicy:
         instead of racing to the same conclusion.
     """
 
-    max_calls_per_window: int = 200
+    max_calls_per_window: int = 1000
     window_seconds: float = 1.0
     max_depth: int = 8
     trip_on_overdraft: bool = True
@@ -977,6 +983,7 @@ class BudgetManager:
         *,
         policy: GovernancePolicy | None = None,
         synchronous: str = "FULL",
+        read_only: bool = False,
     ) -> BudgetManager:
         """Open (or create) a durable, SQLite-backed governor in one call.
 
@@ -996,15 +1003,29 @@ class BudgetManager:
             ``"NORMAL"`` is safe against a process crash but can lose the
             most recent commits on a full power loss; pass it only when a
             slower write path is the actual bottleneck.
+        :param read_only: Open for audit without claiming the database, so
+            a ledger another process is actively governing can still be
+            inspected and verified. Every mutating call then raises
+            :class:`~agentgov.exceptions.ReadOnlyLedgerError`.
         :returns: A restored or freshly created :class:`BudgetManager`.
+        :raises agentgov.exceptions.ConcurrentGovernorError: If another
+            process already holds this database for writing. Two governors
+            would each cache authoritative balances in memory and diverge,
+            so the second is refused at open rather than on its first write.
         :raises agentgov.exceptions.LedgerIntegrityError: If the database's
             chain, balances, or topology are inconsistent — a corrupted or
             tampered file is refused rather than trusted.
         """
         from agentgov.storage import SqliteStore
 
-        store = SqliteStore(path, synchronous=synchronous)
-        return cls(policy=policy, store=store)
+        store = SqliteStore(path, synchronous=synchronous, read_only=read_only)
+        try:
+            return cls(policy=policy, store=store)
+        except BaseException:
+            # Never leak the advisory claim if restore-and-verify rejects the
+            # file: the next process to try must not be told it is contended.
+            store.close()
+            raise
 
     def __enter__(self) -> BudgetManager:
         return self
@@ -1667,6 +1688,78 @@ class BudgetManager:
                 ]
             )
             return entries[0]
+
+    # -- reconciliation ---------------------------------------------------
+
+    def stale_authorizations(
+        self, older_than: timedelta | float, *, scope_id: str | None = None
+    ) -> tuple[Authorization, ...]:
+        """Return holds that have been open longer than ``older_than``.
+
+        A hold encumbers funds from the moment a call is authorized until it
+        settles. A process that dies mid-call, or an HTTP request that hangs
+        forever, leaves that encumbrance in place with nothing left to settle
+        it — the money is neither spent nor available. This is how an operator
+        finds those.
+
+        Read-only and safe to call on a live governor; nothing is released.
+
+        :param older_than: Age threshold, as a :class:`~datetime.timedelta`
+            or a number of seconds.
+        :param scope_id: Restrict to one scope, or ``None`` for every scope.
+        :returns: Matching authorizations, oldest first.
+        :raises UnknownScopeError: If ``scope_id`` is given but not registered.
+        """
+        window = older_than if isinstance(older_than, timedelta) else timedelta(seconds=older_than)
+        cutoff = datetime.now(UTC) - window
+        with self._lock:
+            if scope_id is not None:
+                self._require_node(scope_id)
+            matching = [
+                auth
+                for auth in self._open_auths.values()
+                if auth.opened_at <= cutoff and (scope_id is None or auth.scope_id == scope_id)
+            ]
+        return tuple(sorted(matching, key=lambda auth: auth.opened_at))
+
+    def void_stale(
+        self,
+        older_than: timedelta | float,
+        *,
+        scope_id: str | None = None,
+        memo: str = "",
+    ) -> tuple[Authorization, ...]:
+        """Release holds older than ``older_than``, returning the funds.
+
+        Deliberately an explicit operator action rather than a background
+        timer. Voiding a hold asserts that the call it was reserving funds for
+        will never settle — and AgentGov cannot know that. If the call *is*
+        still in flight and later completes, its capture will find the
+        authorization already settled and raise
+        :class:`~agentgov.exceptions.DoubleSpendError`, which is the correct
+        outcome: the ledger refuses to book the same encumbrance twice.
+
+        Every release is an ordinary :attr:`EntryType.HOLD_VOID` entry, so the
+        reconciliation is as auditable as the spend would have been.
+
+        :param older_than: Age threshold, as a :class:`~datetime.timedelta`
+            or a number of seconds.
+        :param scope_id: Restrict to one scope, or ``None`` for every scope.
+        :param memo: Audit context for the releases.
+        :returns: The authorizations that were voided, oldest first.
+        :raises UnknownScopeError: If ``scope_id`` is given but not registered.
+        """
+        note = memo or "stale hold released by operator"
+        voided: list[Authorization] = []
+        for auth in self.stale_authorizations(older_than, scope_id=scope_id):
+            with self._lock:
+                # Re-check under the lock: a settlement may have landed
+                # between the survey above and this release.
+                if auth.authorization_id not in self._open_auths:
+                    continue
+                self._void_locked(auth, note)
+                voided.append(auth)
+        return tuple(voided)
 
     # -- circuit breaker --------------------------------------------------
 

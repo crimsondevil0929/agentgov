@@ -9,7 +9,11 @@ financial control plane:
 - :class:`CircuitBreakerError` — the scope is **halted**. A latching safety
   control has tripped; execution must stop until an operator resets it.
 - :class:`LedgerError` — the ledger itself is **compromised**. Never
-  expected; indicates a bug, a race, or tampering. Let it propagate.
+  expected; indicates a bug or tampering. Let it propagate.
+- :class:`StorageError` — the durable backend is **unavailable or
+  contended**. An operational condition with an operational fix, kept
+  strictly apart from :class:`LedgerError` so that a second process opening
+  the same database never masquerades as a corrupted audit chain.
 
 The single most important type here is :class:`DenialOfWalletError`: the
 hard backstop raised when an agent attempts to overdraw its envelope. It is
@@ -29,14 +33,17 @@ __all__ = [
     "BudgetExceededError",
     "CircuitBreakerError",
     "CircuitOpenError",
+    "ConcurrentGovernorError",
     "DenialOfWalletError",
     "DenialOfWalletException",
     "DoubleSpendError",
     "DuplicateScopeError",
     "LedgerError",
     "LedgerIntegrityError",
+    "ReadOnlyLedgerError",
     "RunawayLoopDetectedError",
     "ScopeError",
+    "StorageError",
     "SubBudgetAllocationError",
     "UnknownScopeError",
 ]
@@ -190,6 +197,87 @@ class SubBudgetAllocationError(BudgetError):
         if detail:
             message = f"{message} ({detail})"
         super().__init__(message)
+
+
+# --------------------------------------------------------------------------
+# Storage errors — the backend is unavailable, not the books untrustworthy
+# --------------------------------------------------------------------------
+
+
+class StorageError(AgentGovError):
+    """Base class for problems with the durable backend itself.
+
+    Deliberately *not* a :class:`LedgerError`. A ledger error means the books
+    cannot be trusted and someone should be paged; a storage error means the
+    process could not reach or claim its database, which has an operational
+    remedy. Conflating the two trains operators to ignore the alarm that
+    actually matters.
+    """
+
+
+class ConcurrentGovernorError(StorageError):
+    """Raised when another process already holds this database.
+
+    A :class:`~agentgov.core.BudgetManager` keeps authoritative balances in
+    memory and writes through to disk. Two processes doing that against one
+    file would each hold a private, diverging view of the same envelope, so
+    the second one is refused at open rather than allowed to start and then
+    fail on its first write.
+
+    The remedies, in the order most deployments want them:
+
+    - run a single governor process and let workers call into it;
+    - give each worker its own database file and its own delegated
+      sub-budget, so the envelopes are genuinely separate;
+    - open read-only (``read_only=True``) to inspect or audit a live ledger.
+
+    :param path: The database file that is already claimed.
+    :param holder_pid: PID recorded by the holding process, when it could be
+        read. ``None`` if the lock file was unreadable or held by a process
+        that never wrote its identity.
+    :param holder_host: Hostname recorded by the holding process, if known.
+    :param holder_since: ISO-8601 instant the holder claimed the lock.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        holder_pid: int | None = None,
+        holder_host: str | None = None,
+        holder_since: str | None = None,
+    ) -> None:
+        self.path = path
+        self.holder_pid = holder_pid
+        self.holder_host = holder_host
+        self.holder_since = holder_since
+        if holder_pid is None:
+            who = "another process"
+        else:
+            where = f"@{holder_host}" if holder_host else ""
+            since = f", since {holder_since}" if holder_since else ""
+            who = f"PID {holder_pid}{where}{since}"
+        super().__init__(
+            f"{path!r} is already governed by {who}. A second writer would keep a "
+            f"diverging in-memory view of the same envelope. Use one governor "
+            f"process, give each worker its own database and delegated sub-budget, "
+            f"or open with read_only=True for audit access."
+        )
+
+
+class ReadOnlyLedgerError(StorageError):
+    """Raised when a write is attempted against a read-only governor.
+
+    Read-only mode exists so an operator can inspect or verify a ledger that
+    another process is actively governing. Every mutating path is refused up
+    front, rather than surfacing as a backend error from somewhere deep in a
+    transaction.
+
+    :param operation: The write that was attempted.
+    """
+
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+        super().__init__(f"cannot {operation}: this governor was opened read-only for audit access")
 
 
 # --------------------------------------------------------------------------

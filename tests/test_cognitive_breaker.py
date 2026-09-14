@@ -525,7 +525,13 @@ def test_a_custom_detector_can_be_plugged_in() -> None:
                 observations=len(history) + 1,
             )
 
-    breaker = CognitiveBreaker(observer=None, detectors=[ForbidSelfQuery()])
+    # A detector that reads argument *text* needs retention opted in; the
+    # built-in detectors read fingerprints and shingles and do not.
+    breaker = CognitiveBreaker(
+        observer=None,
+        detectors=[ForbidSelfQuery()],
+        policy=CognitivePolicy(retain_arguments=True),
+    )
     breaker.observe("agent", "search", canonical_arguments(("something normal",)))
     with pytest.raises(AgentThrashingError) as excinfo:
         breaker.observe("agent", "search", canonical_arguments(("ask self",)))

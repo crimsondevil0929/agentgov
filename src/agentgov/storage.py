@@ -23,17 +23,27 @@ through a floating-point column type.
 
 from __future__ import annotations
 
+import json
+import os
+import socket
 import sqlite3
+import sys
 import uuid
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
 
 from agentgov.core import ControlEvent, Direction, EntryType, LedgerEntry, _iso, _parse_iso
-from agentgov.exceptions import LedgerIntegrityError
+from agentgov.exceptions import (
+    ConcurrentGovernorError,
+    LedgerIntegrityError,
+    ReadOnlyLedgerError,
+    StorageError,
+)
 
 __all__ = [
     "PersistedAuthorization",
@@ -152,6 +162,134 @@ class PersistenceStore(Protocol):
         ...
 
 
+class _AdvisoryLock:
+    """An OS-level exclusive claim on a governor's database file.
+
+    Uses a sidecar ``<db>.lock`` file rather than locking the database
+    itself, so the claim lives in a different lock space from the record
+    locks SQLite takes internally and the two can never be confused for one
+    another.
+
+    The lock is held by an open file descriptor, which means the kernel
+    releases it when the holding process exits — including on ``SIGKILL``.
+    A crashed governor therefore leaves a stale *file* but never a stale
+    *lock*, so no timeout heuristic or manual cleanup is needed.
+
+    The holder writes its identity into the file so the next process can say
+    who is holding it, not merely that someone is.
+
+    :param db_path: Path to the database being claimed.
+    """
+
+    __slots__ = ("_fd", "_path")
+
+    def __init__(self, db_path: str) -> None:
+        self._path = f"{db_path}.lock"
+        self._fd: int | None = None
+
+    def acquire(self) -> None:
+        """Claim the database, or raise naming the process that holds it.
+
+        :raises ConcurrentGovernorError: If another process holds the claim.
+        :raises StorageError: If the lock file cannot be created at all.
+        """
+        try:
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as exc:
+            raise StorageError(f"cannot create lock file {self._path!r}: {exc}") from exc
+
+        try:
+            _lock_exclusive_nonblocking(fd)
+        except BlockingIOError as exc:
+            holder = self._read_holder()
+            os.close(fd)
+            raise ConcurrentGovernorError(self._path[: -len(".lock")], *holder) from exc
+        except OSError as exc:
+            os.close(fd)
+            # A filesystem with no working lock support (some network mounts).
+            # Failing loudly beats pretending the claim succeeded.
+            raise StorageError(
+                f"cannot lock {self._path!r}: {exc}. This filesystem may not support "
+                f"advisory locking; run the governor on local storage."
+            ) from exc
+
+        self._fd = fd
+        self._write_identity(fd)
+
+    def _write_identity(self, fd: int) -> None:
+        """Record who holds the lock, for the next process's error message."""
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "since": datetime.now(UTC).isoformat(timespec="seconds"),
+            }
+        )
+        with suppress(OSError):
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, payload.encode("utf-8"))
+            os.fsync(fd)
+
+    def _read_holder(self) -> tuple[int | None, str | None, str | None]:
+        """Best-effort read of the holder's identity. Never raises."""
+        try:
+            raw = Path(self._path).read_text(encoding="utf-8")
+            record = json.loads(raw)
+            pid = record.get("pid")
+            return (
+                int(pid) if isinstance(pid, int) else None,
+                record.get("host"),
+                record.get("since"),
+            )
+        except (OSError, ValueError, TypeError, AttributeError):
+            # A holder that has not written yet, or a truncated file. Report
+            # the contention without the identity rather than not at all.
+            return (None, None, None)
+
+    def release(self) -> None:
+        """Drop the claim. Idempotent."""
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        with suppress(OSError):
+            _unlock(fd)
+        with suppress(OSError):
+            os.close(fd)
+
+
+if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
+
+    def _lock_exclusive_nonblocking(fd: int) -> None:
+        import msvcrt
+
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            # Windows reports contention as EACCES/EDEADLOCK rather than
+            # EWOULDBLOCK; normalise so the caller has one thing to catch.
+            raise BlockingIOError(str(exc)) from exc
+
+    def _unlock(fd: int) -> None:
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+
+    def _lock_exclusive_nonblocking(fd: int) -> None:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock(fd: int) -> None:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 class SqliteStore:
     """A :class:`PersistenceStore` backed by a local SQLite database file.
 
@@ -174,12 +312,71 @@ class SqliteStore:
         incompatible schema version.
     """
 
-    def __init__(self, path: str | Path, *, synchronous: str = "FULL") -> None:
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode = WAL")
-        self._conn.execute(f"PRAGMA synchronous = {synchronous}")
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        self._init_schema()
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        synchronous: str = "FULL",
+        read_only: bool = False,
+    ) -> None:
+        self._path = str(path)
+        self._read_only = read_only
+        self._lock: _AdvisoryLock | None = None
+
+        if read_only:
+            # No exclusive claim: read-only exists precisely so an operator can
+            # look at a database another process is actively governing.
+            self._conn = sqlite3.connect(
+                f"file:{self._path}?mode=ro", uri=True, check_same_thread=False
+            )
+            self._verify_schema_version()
+            return
+
+        # Claim the database before opening it for writing. Two governors on
+        # one file would each cache authoritative balances in memory and
+        # diverge; refusing the second at open turns that into an operational
+        # error with a remedy, rather than a UNIQUE-constraint failure on its
+        # first write that reads like a corrupted audit chain.
+        if self._path != ":memory:" and not self._path.startswith("file::memory:"):
+            self._lock = _AdvisoryLock(self._path)
+            self._lock.acquire()
+        try:
+            self._conn = sqlite3.connect(self._path, check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode = WAL")
+            self._conn.execute(f"PRAGMA synchronous = {synchronous}")
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._init_schema()
+        except BaseException:
+            if self._lock is not None:
+                self._lock.release()
+            raise
+
+    @property
+    def read_only(self) -> bool:
+        """Whether this store refuses writes."""
+        return self._read_only
+
+    def _require_writable(self, operation: str) -> None:
+        """Refuse a mutation up front rather than deep inside a transaction."""
+        if self._read_only:
+            raise ReadOnlyLedgerError(operation)
+
+    def _verify_schema_version(self) -> None:
+        """Check the schema version without creating anything (read-only path)."""
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise StorageError(
+                f"{self._path!r} is not an agentgov database (or is empty): {exc}"
+            ) from exc
+        if row is not None and row[0] != _SCHEMA_VERSION:
+            raise LedgerIntegrityError(
+                f"database schema version {row[0]!r} does not match "
+                f"this version of agentgov ({_SCHEMA_VERSION!r}); "
+                f"refusing to open a file this version cannot interpret"
+            )
 
     def _init_schema(self) -> None:
         with self._conn:
@@ -259,6 +456,7 @@ class SqliteStore:
     # -- ledger entries -----------------------------------------------------
 
     def append_entries(self, entries: Sequence[LedgerEntry]) -> None:
+        self._require_writable("append ledger entries")
         try:
             with self._conn:
                 self._conn.executemany(
@@ -332,6 +530,7 @@ class SqliteStore:
         allocated: Decimal,
         created_at: datetime,
     ) -> None:
+        self._require_writable("record a budget scope")
         with self._conn:
             self._conn.execute(
                 """
@@ -363,6 +562,7 @@ class SqliteStore:
     # -- control events -------------------------------------------------
 
     def append_control_event(self, event: ControlEvent) -> None:
+        self._require_writable("record a control event")
         with self._conn:
             self._conn.execute(
                 """
@@ -409,6 +609,7 @@ class SqliteStore:
         opened_at: datetime,
         entry_id: uuid.UUID,
     ) -> None:
+        self._require_writable("record an authorization")
         with self._conn:
             self._conn.execute(
                 """
@@ -420,6 +621,7 @@ class SqliteStore:
             )
 
     def delete_authorization(self, authorization_id: uuid.UUID) -> None:
+        self._require_writable("settle an authorization")
         with self._conn:
             self._conn.execute(
                 "DELETE FROM open_authorizations WHERE authorization_id = ?",
@@ -445,4 +647,9 @@ class SqliteStore:
     # -- lifecycle --------------------------------------------------------
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.close()
+        finally:
+            if self._lock is not None:
+                self._lock.release()
+                self._lock = None

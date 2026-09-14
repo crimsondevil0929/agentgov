@@ -2,7 +2,7 @@
 
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
-[![tests](https://img.shields.io/badge/tests-178%2F178%20passing-brightgreen)](#code-quality--packaging)
+[![tests](https://img.shields.io/badge/tests-206%2F206%20passing-brightgreen)](#code-quality--packaging)
 [![coverage](https://img.shields.io/badge/coverage-98%25-brightgreen)](#code-quality--packaging)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
@@ -182,6 +182,16 @@ knows your tool schema will beat any generic text heuristic. Pass `detectors=[..
 extend or replace the built-ins. A detector that raises is logged and skipped, so one bad
 custom heuristic degrades detection rather than breaking production traffic.
 
+**What it keeps.** Nothing readable, by default. Each observed call is reduced to a
+*salted* BLAKE2b digest (the salt is per-instance, so a digest is not a lookup key for a
+known prompt) plus a bounded set of character trigrams. Readable text is retained only
+under an explicit `CognitivePolicy(retain_arguments=True)`, and is truncated even then.
+For regulated data, install a `Redactor` — it runs at the single ingress every argument
+and result passes through, before anything is fingerprinted or stored, and a redactor
+that raises causes the text to be dropped entirely rather than retained unredacted.
+[`SECURITY.md`](SECURITY.md) is the full data map: what lands in SQLite, in memory, and
+in logs, and what encryption at rest AgentGov does *not* provide.
+
 **Where it does not reach — stated plainly.** Legitimate iteration (pagination,
 map-over-a-list) looks like a soft loop on *input* similarity alone. The discriminator is
 the result: near-identical inputs producing near-identical outputs is thrashing;
@@ -234,13 +244,32 @@ A database that has been tampered with — or merely corrupted by a crash mid-wr
 refused at open time, not served with a wrong balance: `open_sqlite()` re-runs
 `verify_chain()` and `verify_integrity()` before handing back a governor at all. This
 uses only `sqlite3` from the standard library, so durability adds zero runtime
-dependencies. Honest limitation: a hold still open when a process dies (an agent that
-crashed between `authorize()` and `capture()`) comes back on restart as an *open*
-authorization for an operator — or the caller, if it kept the id — to void or capture by
-hand; automatically resolving it would mean guessing whether the call it was reserving
-funds for actually happened, which this library will not do silently. See
-[`tests/test_persistence.py`](tests/test_persistence.py) for the full restart, corruption,
-and durable-write-failure test matrix.
+dependencies.
+
+**One writer, enforced.** A governor takes an exclusive advisory lock on its database.
+A second process — a second gunicorn worker, a second replica — is refused *at open*
+with a `ConcurrentGovernorError` naming the PID that holds it, because two writers would
+each cache authoritative balances in memory and diverge. The lock is an open file
+descriptor, so the kernel releases it even on `SIGKILL`: a crashed governor leaves a
+stale file but never a stale lock, and there is no timeout heuristic to get wrong. To
+inspect a ledger another process is governing, open it read-only:
+
+```python
+audit = BudgetManager.open_sqlite("governor.db", read_only=True)
+audit.verify_integrity()  # reads and verifies; every write is refused
+```
+
+**Dangling holds are findable.** A hold left open by a process that died between
+`authorize()` and `capture()` encumbers funds with nothing left to settle it.
+`stale_authorizations(older_than)` surveys them without touching anything, and
+`void_stale(older_than)` releases them. Deliberately an operator action rather than a
+background timer: voiding asserts the call will never settle, and AgentGov cannot know
+that. If such a call *does* complete later, its capture raises `DoubleSpendError` — the
+ledger refuses to book the same encumbrance twice.
+
+See [`tests/test_persistence.py`](tests/test_persistence.py) and
+[`tests/test_hardening.py`](tests/test_hardening.py) for the restart, corruption,
+lock-contention, and durable-write-failure matrices.
 
 ## Core primitives
 
@@ -293,7 +322,7 @@ SQLite file, with financial and cognitive breakers on the same actuator. Beyond 
 
 ```bash
 uv sync                              # install (zero runtime dependencies)
-uv run pytest -v                     # 178 passed
+uv run pytest -v                     # 206 passed
 uv run pytest --cov=agentgov         # 98% coverage
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/                     # strict, zero errors
@@ -301,5 +330,11 @@ uv run python examples/denial_of_wallet_benchmark.py
 uv run python examples/persistence_demo.py
 ```
 
+Every gate above runs in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on
+Python 3.11 and 3.12, on Linux and macOS, with a 95% coverage floor and a build that
+fails on packaging warnings. Both example scripts are executed end to end so a broken
+demo cannot merge.
+
 Packaged with [uv](https://docs.astral.sh/uv/); metadata, license, and classifiers live
-in [`pyproject.toml`](pyproject.toml). Licensed under [Apache 2.0](LICENSE).
+in [`pyproject.toml`](pyproject.toml). Security policy and data map:
+[`SECURITY.md`](SECURITY.md). Licensed under [Apache 2.0](LICENSE).
