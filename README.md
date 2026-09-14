@@ -2,6 +2,7 @@
 
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
+[![CI](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml/badge.svg)](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml)
 [![tests](https://img.shields.io/badge/tests-316%2F316%20passing-brightgreen)](#code-quality--packaging)
 [![coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)](#code-quality--packaging)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
@@ -482,8 +483,14 @@ demo cannot merge.
 
 For a three-minute live walkthrough — adopt, halt a runaway, verify the chain,
 catch unmetered spend — see [`docs/DEMO_RUNBOOK.md`](docs/DEMO_RUNBOOK.md) and
-run `uv run python examples/live_demo.py`.
+run `uv run python examples/live_demo.py`. [`demo.tape`](demo.tape) renders that
+same walkthrough as a terminal recording with [VHS](https://github.com/charmbracelet/vhs)
+(`vhs demo.tape`), and [`examples/streamlit_dashboard.py`](examples/streamlit_dashboard.py)
+gives the resulting ledger a web UI — balance tree, hash chain, and a
+reconciliation button — via `uv sync --extra ui && uv run streamlit run
+examples/streamlit_dashboard.py`.
 
 Packaged with [uv](https://docs.astral.sh/uv/); metadata, license, and classifiers live
 in [`pyproject.toml`](pyproject.toml). Security policy and data map:
-[`SECURITY.md`](SECURITY.md). Licensed under [Apache 2.0](LICENSE).
+[`SECURITY.md`](SECURITY.md). Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Release notes: [`CHANGELOG.md`](CHANGELOG.md). Licensed under [Apache 2.0](LICENSE).

@@ -19,3 +19,9 @@ htmlcov/
 
 # Live-demo artifacts
 demo/
+
+# macOS Finder metadata
+.DS_Store
+
+# VHS-rendered terminal recordings (regenerate with `vhs demo.tape`)
+demo.gif

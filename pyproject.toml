@@ -31,12 +31,20 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+# 1.63 is the version the dashboard was built and verified against (it uses
+# st.dataframe's `width="stretch"` sizing API); an older floor risked pinning
+# to a version where that parameter doesn't exist.
+ui = ["streamlit>=1.63"]
+
 [project.scripts]
 agentgov = "agentgov.cli:main"
 
-# [project.urls] intentionally omitted: no remote is configured for this
-# repository yet. Add Homepage/Repository/Issues once one exists rather than
-# publishing a guessed URL.
+[project.urls]
+Homepage = "https://github.com/crimsondevil0929/agentgov"
+Repository = "https://github.com/crimsondevil0929/agentgov"
+Issues = "https://github.com/crimsondevil0929/agentgov/issues"
+Changelog = "https://github.com/crimsondevil0929/agentgov/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
