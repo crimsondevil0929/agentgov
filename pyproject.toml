@@ -31,6 +31,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+agentgov = "agentgov.cli:main"
+
 # [project.urls] intentionally omitted: no remote is configured for this
 # repository yet. Add Homepage/Repository/Issues once one exists rather than
 # publishing a guessed URL.

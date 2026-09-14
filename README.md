@@ -2,8 +2,8 @@
 
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
-[![tests](https://img.shields.io/badge/tests-206%2F206%20passing-brightgreen)](#code-quality--packaging)
-[![coverage](https://img.shields.io/badge/coverage-98%25-brightgreen)](#code-quality--packaging)
+[![tests](https://img.shields.io/badge/tests-246%2F246%20passing-brightgreen)](#code-quality--packaging)
+[![coverage](https://img.shields.io/badge/coverage-97%25-brightgreen)](#code-quality--packaging)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
 [![license](https://img.shields.io/badge/license-Apache%202.0-lightgrey)](LICENSE)
@@ -202,6 +202,72 @@ are near-identical in trigram space even though the agent is advancing. That lim
 is [pinned by a test](tests/test_cognitive_breaker.py), along with its remedy:
 `CognitivePolicy(exempt_tools={"fetch"})`, a raised threshold, or a custom detector.
 
+## Dropping it in
+
+`invoke()` is the primitive, and it stays the contract. But adopting it in an
+existing codebase means editing every call site, so there is a wrapper that
+governs the calls already written:
+
+```python
+client = govern(anthropic.Anthropic(), gov, "researcher", model="claude-opus-5")
+
+response = client.messages.create(model="claude-opus-5", messages=[...])  # unchanged
+print(client.agentgov.last_call.cost)
+```
+
+The proxy returns exactly what the SDK returns — anything else would not be a
+drop-in — and forwards everything that is not a model call untouched. It is
+sugar over `client.agentgov.interceptor`, which hands the primitive back.
+
+**Streaming**, the shape most real agents use, is governed as a context manager:
+
+```python
+with client.messages.stream(model="claude-opus-5", messages=[...]) as events:
+    for event in events:
+        render(event)
+print(events.cost)
+```
+
+The hold is resolved on *every* path out of that block — clean exhaustion,
+`break`, an exception, or a timeout — so an abandoned stream never strands
+funds. On abandonment it settles at whatever usage was actually observed
+rather than voiding: those tokens were generated and billed, and a spend
+governor that forgot them would under-report. Only a stream that produced no
+usage at all is voided. `astream()` is the async equivalent.
+
+**Holds are sized from the payload.** A static worst-case hold is wrong in
+both directions, and the dangerous direction is *too small*: an
+under-reserved hold does not encumber, so concurrent callers all pass the
+pre-flight check and settle for more than they reserved. Measured on a
+150K-character prompt with ten concurrent callers, static holds **breached a
+$1.00 envelope by 2.3x**; payload-derived holds bounded it. Input tokens are
+estimated from character length, the output bound is taken from the call's
+own `max_tokens`, and a configurable `safety_buffer` (1.5x by default)
+absorbs the heuristic's error. Unrecognised payloads fall back to the static
+ceiling rather than under-reserving.
+
+## Reading a ledger
+
+```
+$ agentgov inspect governor.db
+BALANCE TREE
+  orchestrator  available $3.00000000  of $5.00000000
+  `- researcher  available $1.48349000  of $2.00000000
+     `- scraper  available $0.49248500  of $0.50000000   [HALTED by scraper]
+
+$ agentgov verify governor.db
+  ok    hash chain + balance cache
+  ok    conservation identity
+  ok    delegation topology
+
+PASS  governor.db  (14 entries verified; head 56d879d72557ec6e)
+```
+
+`verify` exits `0` on PASS and `1` on FAIL, so it drops straight into a
+pipeline to assert an archived ledger is intact. Both commands open the
+database **read-only**, so they are safe to run against a governor that is
+live and holding the write claim.
+
 ## Durability
 
 An in-memory ledger that calls itself an auditable financial record is a contradiction —
@@ -322,8 +388,8 @@ SQLite file, with financial and cognitive breakers on the same actuator. Beyond 
 
 ```bash
 uv sync                              # install (zero runtime dependencies)
-uv run pytest -v                     # 206 passed
-uv run pytest --cov=agentgov         # 98% coverage
+uv run pytest -v                     # 246 passed
+uv run pytest --cov=agentgov         # 97% coverage
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/                     # strict, zero errors
 uv run python examples/denial_of_wallet_benchmark.py

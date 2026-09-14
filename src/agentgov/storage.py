@@ -326,9 +326,15 @@ class SqliteStore:
         if read_only:
             # No exclusive claim: read-only exists precisely so an operator can
             # look at a database another process is actively governing.
-            self._conn = sqlite3.connect(
-                f"file:{self._path}?mode=ro", uri=True, check_same_thread=False
-            )
+            try:
+                self._conn = sqlite3.connect(
+                    f"file:{self._path}?mode=ro", uri=True, check_same_thread=False
+                )
+            except sqlite3.OperationalError as exc:
+                raise StorageError(
+                    f"cannot open {self._path!r} read-only: {exc}. The file may not "
+                    f"exist, or may not be readable by this user."
+                ) from exc
             self._verify_schema_version()
             return
 

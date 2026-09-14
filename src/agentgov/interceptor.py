@@ -32,10 +32,15 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
 from types import MappingProxyType, TracebackType
-from typing import Any, Generic, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Final, Generic, Self, TypeVar
 
 from agentgov.cognitive import CognitiveBreaker
 from agentgov.core import QUANTUM, Authorization, BudgetManager, LedgerEntry, money
+
+if TYPE_CHECKING:
+    # Imported lazily at call time in stream()/astream(): streaming
+    # imports this module, so a runtime import here would be a cycle.
+    from agentgov.streaming import AsyncMeteredStream, MeteredStream
 
 __all__ = [
     "PRICING",
@@ -46,6 +51,8 @@ __all__ = [
     "TokenUsage",
     "UsageExtractor",
     "default_usage_extractor",
+    "estimate_tokens",
+    "extract_prompt_text",
     "pricing_for",
 ]
 
@@ -90,6 +97,28 @@ class TokenUsage:
             if value < 0:
                 raise ValueError(f"{name} must not be negative, got {value}")
 
+    def merged(self, other: TokenUsage) -> TokenUsage:
+        """Combine two partial usage reports, taking the larger of each field.
+
+        Streaming APIs disclose usage in pieces — input counts arrive with the
+        first event, output counts accumulate and land with the last. Taking
+        the per-field maximum reconstructs the total from those fragments
+        without double-counting a field that was repeated.
+
+        :param other: A second, possibly partial, usage report.
+        :returns: The combined usage.
+        """
+        return TokenUsage(
+            input_tokens=max(self.input_tokens, other.input_tokens),
+            output_tokens=max(self.output_tokens, other.output_tokens),
+            cache_read_input_tokens=max(
+                self.cache_read_input_tokens, other.cache_read_input_tokens
+            ),
+            cache_creation_input_tokens=max(
+                self.cache_creation_input_tokens, other.cache_creation_input_tokens
+            ),
+        )
+
     @property
     def total_tokens(self) -> int:
         """Total tokens across every billed category."""
@@ -99,6 +128,68 @@ class TokenUsage:
             + self.cache_read_input_tokens
             + self.cache_creation_input_tokens
         )
+
+
+_TEXT_KEYS: Final = ("messages", "system", "prompt", "input", "text", "content", "instructions")
+_MAX_WALK_DEPTH: Final = 8
+CHARS_PER_TOKEN: Final = 4
+"""Characters per token, for pre-flight estimation only.
+
+A deliberately crude heuristic. Sizing a hold does not need an accurate token
+count — it needs a cheap, local, dependency-free number that is *proportional*
+to the payload, which a safety buffer then covers. Paying for a real tokenizer
+(a dependency) or ``count_tokens`` (a network round-trip on the hot path) to
+size a reservation that gets reconciled against real usage seconds later would
+be a poor trade.
+"""
+
+
+def extract_prompt_text(args: Sequence[object] = (), kwargs: Mapping[str, object] = {}) -> str:
+    """Collect the prompt text from a model call's arguments.
+
+    Understands the shapes the major SDKs actually use: ``messages`` with
+    string or content-block bodies, a top-level ``system``, a bare ``prompt``
+    or ``input``, and plain positional strings. Unknown shapes yield nothing
+    rather than a wrong guess, so the caller can fall back to a static
+    ceiling instead of under-reserving.
+
+    :param args: Positional arguments of the wrapped call.
+    :param kwargs: Keyword arguments of the wrapped call.
+    :returns: Every piece of text found, concatenated. Empty when the payload
+        holds no recognisable text.
+    """
+    found: list[str] = []
+    for value in args:
+        if isinstance(value, str):
+            found.append(value)
+    for key in _TEXT_KEYS:
+        if key in kwargs:
+            _walk_text(kwargs[key], found, _MAX_WALK_DEPTH)
+    return "".join(found)
+
+
+def _walk_text(value: object, found: list[str], depth: int) -> None:
+    """Accumulate strings from a nested message/content structure."""
+    if depth <= 0:
+        return
+    if isinstance(value, str):
+        found.append(value)
+    elif isinstance(value, Mapping):
+        for key in ("text", "content", "source", "input"):
+            if key in value:
+                _walk_text(value[key], found, depth - 1)
+    elif isinstance(value, Sequence) and not isinstance(value, bytes | bytearray):
+        for item in value:
+            _walk_text(item, found, depth - 1)
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate a token count from character length.
+
+    :param text: The text to size.
+    :returns: An approximate token count.
+    """
+    return len(text) // CHARS_PER_TOKEN
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,12 +574,14 @@ class Interceptor:
 
     __slots__ = (
         "_cognitive",
+        "_dynamic_holds",
         "_estimated_input_tokens",
         "_extract_usage",
         "_hold",
         "_manager",
         "_max_output_tokens",
         "_pricing",
+        "_safety_buffer",
         "_scope_id",
         "_trajectory",
     )
@@ -506,9 +599,16 @@ class Interceptor:
         hold: Decimal | None = None,
         cognitive: CognitiveBreaker | None = None,
         trajectory: str | None = None,
+        safety_buffer: Decimal | str = "1.5",
+        dynamic_holds: bool = True,
     ) -> None:
         if max_output_tokens < 0 or estimated_input_tokens < 0:
             raise ValueError("token estimates must not be negative")
+        buffer_ = (
+            Decimal(safety_buffer) if not isinstance(safety_buffer, Decimal) else safety_buffer
+        )
+        if buffer_ < 1:
+            raise ValueError(f"safety_buffer must be at least 1.0, got {buffer_}")
         self._manager = manager
         self._scope_id = scope_id
         self._pricing = pricing if pricing is not None else pricing_for(model)
@@ -518,6 +618,8 @@ class Interceptor:
         self._hold = hold
         self._cognitive = cognitive
         self._trajectory = trajectory
+        self._safety_buffer = buffer_
+        self._dynamic_holds = dynamic_holds
 
     # -- accessors --------------------------------------------------------
 
@@ -556,6 +658,57 @@ class Interceptor:
         if self._hold is not None:
             return self._hold
         return self._pricing.estimate(self._estimated_input_tokens, self._max_output_tokens)
+
+    @property
+    def safety_buffer(self) -> Decimal:
+        """Multiplier applied to a payload-derived hold estimate."""
+        return self._safety_buffer
+
+    def size_hold(self, args: Sequence[object] = (), kwargs: Mapping[str, object] = {}) -> Decimal:
+        """Size the authorization hold for one specific call.
+
+        A static worst-case hold is wrong in both directions: far too large
+        for a one-line prompt, and far too *small* for a long-context call,
+        where the capture then overruns its authorization, drives the balance
+        negative and trips the breaker on a perfectly legitimate request.
+        This reads the payload instead.
+
+        Input tokens are estimated from the prompt's character length; the
+        output ceiling is taken from the call's own ``max_tokens`` when it
+        passes one, since the caller has already stated that bound. The total
+        is multiplied by :attr:`safety_buffer` to absorb the heuristic's
+        error, and rounded up.
+
+        Falls back to the configured static ceiling when the payload holds no
+        recognisable text — an unfamiliar SDK shape must not silently produce
+        a hold of nearly zero.
+
+        :param args: Positional arguments of the call being sized.
+        :param kwargs: Keyword arguments of the call being sized.
+        :returns: The amount to authorize.
+        """
+        if self._hold is not None:
+            return self._hold
+        if not self._dynamic_holds:
+            return self.hold_amount
+
+        text = extract_prompt_text(args, kwargs)
+        if not text:
+            return self.hold_amount
+
+        requested = kwargs.get("max_tokens")
+        max_output = (
+            requested
+            if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0
+            else self._max_output_tokens
+        )
+        estimate = self._pricing.cost_of(
+            TokenUsage(input_tokens=estimate_tokens(text), output_tokens=max_output)
+        )
+        buffered = (estimate * self._safety_buffer).quantize(QUANTUM, rounding=ROUND_CEILING)
+        # Never reserve less than the static ceiling would have: the payload
+        # heuristic is allowed to raise a hold, not to quietly weaken one.
+        return max(buffered, self.hold_amount)
 
     # -- derivation -------------------------------------------------------
 
@@ -622,6 +775,8 @@ class Interceptor:
             hold=hold if hold is not None else self._hold,
             cognitive=self._cognitive,
             trajectory=self._trajectory,
+            safety_buffer=self._safety_buffer,
+            dynamic_holds=self._dynamic_holds,
         )
 
     def with_trajectory(self, trajectory: str | None) -> Interceptor:
@@ -673,7 +828,7 @@ class Interceptor:
         :raises TypeError: If token usage cannot be read from the response.
         """
         self._observe_cognitive(fn, args, kwargs)
-        hold = self.hold_amount
+        hold = self.size_hold(args, kwargs)
         guard = SpendGuard(self._manager, self._scope_id, hold)
         with guard:
             started = time.perf_counter()
@@ -704,7 +859,7 @@ class Interceptor:
             ledger entry.
         """
         self._observe_cognitive(fn, args, kwargs)
-        hold = self.hold_amount
+        hold = self.size_hold(args, kwargs)
         guard = SpendGuard(self._manager, self._scope_id, hold)
         with guard:
             started = time.perf_counter()
@@ -714,6 +869,71 @@ class Interceptor:
             guard.settle(cost)
         self._record_cognitive_result(response)
         return self._result(response, usage, cost, hold, guard, latency)
+
+    def stream(
+        self,
+        fn: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> MeteredStream[Any]:
+        """Govern a streaming call, returning a context manager.
+
+        The provider call is *deferred* until the returned stream is entered,
+        so the hold is always placed before any tokens are generated::
+
+            with metered.stream(client.messages.stream, model=…, messages=…) as events:
+                for event in events:
+                    render(event)
+            print(events.cost)
+
+        The hold is resolved on every path out of that block — clean
+        exhaustion, ``break``, exception, or timeout.
+
+        :param fn: The provider's streaming entry point.
+        :param args: Positional arguments forwarded to ``fn``.
+        :param kwargs: Keyword arguments forwarded to ``fn``.
+        :returns: An unentered :class:`~agentgov.streaming.MeteredStream`.
+        """
+        from agentgov.streaming import MeteredStream, build_call
+
+        return MeteredStream(
+            self._manager,
+            self._scope_id,
+            self.size_hold(args, kwargs),
+            self._pricing,
+            self._extract_usage,
+            build_call(fn, args, kwargs),
+            cognitive=self._cognitive,
+            trajectory=self._trajectory,
+        )
+
+    def astream(
+        self,
+        fn: Callable[..., object],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> AsyncMeteredStream[Any]:
+        """Govern an async streaming call. See :meth:`stream`.
+
+        :param fn: The provider's async streaming entry point.
+        :param args: Positional arguments forwarded to ``fn``.
+        :param kwargs: Keyword arguments forwarded to ``fn``.
+        :returns: An unentered :class:`~agentgov.streaming.AsyncMeteredStream`.
+        """
+        from agentgov.streaming import AsyncMeteredStream, build_call
+
+        return AsyncMeteredStream(
+            self._manager,
+            self._scope_id,
+            self.size_hold(args, kwargs),
+            self._pricing,
+            self._extract_usage,
+            build_call(fn, args, kwargs),
+            cognitive=self._cognitive,
+            trajectory=self._trajectory,
+        )
 
     def _observe_cognitive(
         self,

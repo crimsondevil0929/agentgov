@@ -83,6 +83,7 @@ from agentgov.exceptions import (
     UnknownScopeError,
 )
 from agentgov.interceptor import (
+    CHARS_PER_TOKEN,
     PRICING,
     Interceptor,
     MeteredCall,
@@ -90,15 +91,21 @@ from agentgov.interceptor import (
     SpendGuard,
     TokenUsage,
     default_usage_extractor,
+    estimate_tokens,
+    extract_prompt_text,
     pricing_for,
 )
+from agentgov.proxy import GovernedClient, GovernorHandle, govern
 from agentgov.storage import PersistedAuthorization, PersistedNode, PersistenceStore, SqliteStore
+from agentgov.streaming import AsyncMeteredStream, MeteredStream
 
 __all__ = [
+    "CHARS_PER_TOKEN",
     "PRICING",
     "AgentGovError",
     "AgentThrashingError",
     "AgentThrashingException",
+    "AsyncMeteredStream",
     "Authorization",
     "BudgetError",
     "BudgetExceededError",
@@ -119,6 +126,8 @@ __all__ = [
     "EntryType",
     "ExactRepeatDetector",
     "GovernancePolicy",
+    "GovernedClient",
+    "GovernorHandle",
     "Interceptor",
     "Ledger",
     "LedgerEntry",
@@ -127,6 +136,7 @@ __all__ = [
     "LedgerLine",
     "LoopDetector",
     "MeteredCall",
+    "MeteredStream",
     "ModelPricing",
     "NearDuplicateDetector",
     "PersistedAuthorization",
@@ -148,7 +158,10 @@ __all__ = [
     "Verdict",
     "canonical_arguments",
     "default_usage_extractor",
+    "estimate_tokens",
+    "extract_prompt_text",
     "format_audit_line",
+    "govern",
     "money",
     "pricing_for",
 ]
