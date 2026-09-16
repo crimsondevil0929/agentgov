@@ -1,5 +1,30 @@
-# Python-generated files
+# Secrets. Never commit an API key.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Live-API benchmark receipts: raw response payloads, cost summaries, SQLite
+# ledgers and metering journals. Regenerate with
+# `uv run python scripts/generate_real_usage.py`.
+benchmarks/live_data/
+
+# Live-demo artifacts (`uv run python examples/live_demo.py`)
+demo/
+
+# SQLite ledgers and their sidecars, wherever they land
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+*.sqlite
+*.sqlite3
+
+# Python build and bytecode
 __pycache__/
+*.pyc
+*.pyo
 *.py[oc]
 build/
 dist/
@@ -8,8 +33,9 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
 
-# Test / tooling caches
+# Test and tooling caches
 .coverage
 coverage.xml
 htmlcov/
@@ -17,15 +43,17 @@ htmlcov/
 .ruff_cache/
 .mypy_cache/
 
-# Live-demo artifacts
-demo/
-
-# macOS Finder metadata
-.DS_Store
-
 # VHS-rendered terminal recordings (regenerate with `vhs demo.tape`)
 demo.gif
 
-# Live-API benchmark receipts (real usage payloads; regenerate with
-# `uv run python scripts/generate_real_usage.py`)
-benchmarks/live_data/
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
