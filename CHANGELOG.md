@@ -77,6 +77,15 @@ caught, both in the cognitive breaker's result comparison.
   three-family corpus.
 - `agentgov.cognitive.extract_result_text()`, exported for callers implementing
   a custom `LoopDetector` or `Redactor`.
+- `ARCHITECTURE.md` — a technical note in two parts. Part A documents the
+  simulation gap: envelope dominance, prose entropy, the measured overlap
+  between thrashing and pagination, and why the calibration harness rather than
+  the constant is the durable asset. Part B is the v0.2 **State Recovery
+  Roadmap**: cryptographic state checkpointing over a Merkle prefix tree (whose
+  shared-prefix length answers both "is this resume legal?" and "will it hit the
+  provider's cache?"), an append-only intervention ladder ordered by cache- and
+  thinking-block-invalidation cost, and a budgeted stopping rule over the
+  breaker's existing novelty signal. Design only — no implementation.
 - README: **Known limitations & v0.1 scope**, stating the single-writer boundary
   and its measured ~1,600 calls/sec ceiling, the guardrail-not-sandbox
   enforcement model, the pricing snapshot, and the line between what is proven

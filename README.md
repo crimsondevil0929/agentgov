@@ -38,41 +38,46 @@ comparison reproducible. For the same machinery measured against the real Anthro
 see [Live API metering](#live-api-metering) below.
 
 ```
-+=======================+==========================+======================================+======================================================+
-| METRIC                | Scenario A - Ungoverned  |  Scenario B - AgentGov (Financial)   |    Scenario C - AgentGov (Cognitive + Financial)     |
-+=======================+==========================+======================================+======================================================+
-| Wall clock            |                    3.00s |                                3.00s |                                                3.00s |
-| Sub-agents spawned    |                      116 |                                   11 |                                                    1 |
-| Calls attempted       |                1,154,031 |                              656,393 |                                              239,340 |
-| Calls executed        |                1,154,031 |                                  636 |                                                    3 |
-| Calls refused         |                        0 |                              655,757 |                                              239,337 |
-| Tokens consumed       |              376,598,574 |                              207,756 |                                                  770 |
-+-----------------------+--------------------------+--------------------------------------+------------------------------------------------------+
-| Intended budget       |                $5.000000 |                            $5.000000 |                                            $5.000000 |
-| Actual cost realized  |            $9,057.214750 |                            $4.996920 |                                            $0.018330 |
-| Cost vs budget        |               181,144.3% |                                99.9% |                                                 0.4% |
-| Budget breached after |                   0.002s |                                never |                                                never |
-+-----------------------+--------------------------+--------------------------------------+------------------------------------------------------+
-| Cognitive breaker     |        n/a - not enabled |                    n/a - not enabled | TRIPPED [deterministic/near_duplicate] after 4 calls |
-| Financial breaker     | n/a - no backstop exists |   LATCHED OPEN - 11/12 scopes halted |                     LATCHED OPEN - 1/2 scopes halted |
-| verify_integrity()    |   n/a - no ledger exists |          PASS - 1953 entries chained |                            PASS - 12 entries chained |
-| verify_conservation() |   n/a - no ledger exists | PASS - no money created or destroyed |                 PASS - no money created or destroyed |
-+=======================+==========================+======================================+======================================================+
++=======================+==========================+==========================================+======================================================+
+| METRIC                | Scenario A - Ungoverned  |    Scenario B - AgentGov (Financial)     |    Scenario C - AgentGov (Cognitive + Financial)     |
++=======================+==========================+==========================================+======================================================+
+| Wall clock            |                    3.00s |                                    3.00s |                                                3.00s |
+| Sub-agents spawned    |                      118 |                                   30,383 |                                                    1 |
+| Calls attempted       |                1,175,392 |                                   31,017 |                                              245,666 |
+| Calls executed        |                1,175,392 |                                      635 |                                                    3 |
+| Calls refused         |                        0 |                                   30,382 |                                              245,663 |
+| Tokens consumed       |              383,569,559 |                                  207,251 |                                                  770 |
++-----------------------+--------------------------+------------------------------------------+------------------------------------------------------+
+| Intended budget       |                $5.000000 |                                $5.000000 |                                            $5.000000 |
+| Actual cost realized  |            $9,224.867435 |                                $4.984635 |                                            $0.018330 |
+| Cost vs budget        |               184,497.3% |                                    99.7% |                                                 0.4% |
+| Budget breached after |                   0.002s |                                    never |                                                never |
++-----------------------+--------------------------+------------------------------------------+------------------------------------------------------+
+| Cognitive breaker     |        n/a - not enabled |                        n/a - not enabled | TRIPPED [deterministic/near_duplicate] after 4 calls |
+| Financial breaker     | n/a - no backstop exists | LATCHED OPEN - 30382/30384 scopes halted |                     LATCHED OPEN - 1/2 scopes halted |
+| verify_integrity()    |   n/a - no ledger exists |            PASS - 123436 entries chained |                            PASS - 12 entries chained |
+| verify_conservation() |   n/a - no ledger exists |     PASS - no money created or destroyed |                 PASS - no money created or destroyed |
++=======================+==========================+==========================================+======================================================+
 ```
 
 All three run the *identical* workload — an agent that cannot find a report and keeps
 re-asking with cosmetic edits. The governed scenarios differ by exactly one constructor
 argument, so the third column isolates what loop detection buys and nothing else.
 
-**A — Ungoverned:** 1.2M calls in 3 seconds, $9,057 against a $5.00 intended budget,
-breached in 2 milliseconds and never stopped. **B — Financial:** capped at $4.996920 of
-the $5.00 envelope, 655,757 further attempts refused. Correct — but the money is gone;
-the envelope bounds the damage rather than preventing it. **C — Cognitive + financial:**
-halted after **3 executed calls and $0.018330**, 0.4% of the envelope and **273x cheaper
-than waiting for the budget to run out**. The remaining 239,337 attempts cost nothing at
+**A — Ungoverned:** 1.18M calls in 3 seconds, $9,224.87 against a $5.00 intended budget,
+breached in 2 milliseconds and never stopped. **B — Financial:** capped at $4.984635 of
+the $5.00 envelope, 30,382 further attempts refused. Correct — but the money is gone; the
+envelope bounds the damage rather than preventing it. **C — Cognitive + financial:**
+halted after **3 executed calls and $0.018330**, 0.4% of the envelope and **272x cheaper
+than waiting for the budget to run out**. The remaining 245,663 attempts cost nothing at
 all: the check runs ahead of the authorization hold, so a halted call never reaches the
-ledger. Both governed costs are bit-for-bit deterministic across runs — bounded by the
-policy, not by how many iterations the clock happened to allow.
+ledger.
+
+Scenario C's cost is bit-for-bit reproducible across runs — it is bounded by the policy,
+which does not care how many iterations the clock allowed. A and B are not, and the table
+above is one recorded run rather than a fixed expectation: A's total is however many calls
+fit in three seconds, and B settles somewhere just under the envelope depending on where
+the last holds land. For A and B the *bound* is the guarantee, not the figure.
 
 Reproduce it: `uv run python examples/denial_of_wallet_benchmark.py`. Add `--audit` to
 stream every hash-chained ledger line live instead of a tail sample.
@@ -161,6 +166,10 @@ uv run python scripts/generate_real_usage.py --dry-run   # free rehearsal, no ne
 uv run python scripts/generate_real_usage.py             # ~$0.05
 uv run python scripts/calibrate_result_threshold.py      # ~$0.03
 ```
+
+The full write-up of what this run exposed — envelope dominance, prose entropy, and why
+the per-pair distributions cannot be separated by any constant — is
+[`ARCHITECTURE.md`, Part A](ARCHITECTURE.md#part-a--the-simulation-gap).
 
 Every call carries an explicit `max_tokens`, the whole run executes inside a $1.50
 AgentGov envelope, and the runaway loop is additionally bounded by a hardcoded counter
@@ -606,6 +615,13 @@ raw API payload to disk as evidence — see [Live API metering](#live-api-meteri
 Phase 1 is a correct, single-process governor: one ledger, one mutex, durable to a local
 SQLite file, with financial and cognitive breakers on the same actuator. Beyond that:
 
+- **State recovery after a trip — the "what then?" protocol.** A breaker protects the
+  wallet, but nobody's goal was to not spend money; it was to finish the task. Halting is
+  the cheapest possible failure and it is still a failure. The design brief —
+  cryptographic state checkpointing over a Merkle prefix tree, an append-only intervention
+  ladder ordered by prompt-cache invalidation cost, and a budgeted stopping rule over the
+  breaker's own novelty signal — is
+  [`ARCHITECTURE.md`, Part B](ARCHITECTURE.md#part-b--the-what-then-protocol-v02-state-recovery-roadmap).
 - **Distributed multi-node consensus.** `agentgov.storage.PersistenceStore` is already the
   seam a replicated backend would implement — move the ledger off one host's disk onto a
   store shared across a fleet, so multiple machines share one authoritative view of every
