@@ -32,6 +32,7 @@ from agentgov.cognitive import (
     TrajectoryEntropyObserver,
     Verdict,
     canonical_arguments,
+    extract_result_text,
     jaccard,
     shingles,
 )
@@ -896,3 +897,114 @@ def test_stats_report_the_semantic_lane() -> None:
     stats = breaker.stats
     assert stats.observed == 10
     assert stats.queued > 0
+
+
+# --------------------------------------------------------------------------
+# Result-text extraction
+#
+# Comparing whole SDK response objects measures the envelope, not the answer.
+# These pin the shapes the extractor must understand and, more importantly,
+# the fallback contract: an unfamiliar shape yields None so the caller keeps
+# the old whole-object behaviour rather than silently comparing nothing.
+# --------------------------------------------------------------------------
+
+
+class _Block:
+    """An Anthropic-style content block."""
+
+    def __init__(self, text: str) -> None:
+        self.type = "text"
+        self.text = text
+
+
+class _ThinkingBlock:
+    def __init__(self, thinking: str) -> None:
+        self.type = "thinking"
+        self.thinking = thinking
+
+
+class _Message:
+    """The Anthropic Messages response shape, minus everything irrelevant."""
+
+    def __init__(self, *blocks: object) -> None:
+        self.id = "msg_01234567890"
+        self.role = "assistant"
+        self.content = list(blocks)
+
+
+def test_extract_result_text_reads_the_anthropic_message_shape() -> None:
+    message = _Message(_Block("the answer"), _Block(" and more"))
+    assert extract_result_text(message) == "the answer and more"
+
+
+def test_extract_result_text_reads_thinking_blocks() -> None:
+    assert extract_result_text(_Message(_ThinkingBlock("reasoning"))) == "reasoning"
+
+
+def test_extract_result_text_reads_the_langchain_shape() -> None:
+    class AIMessage:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    assert extract_result_text(AIMessage("hello")) == "hello"
+
+
+def test_extract_result_text_reads_mappings_and_strings() -> None:
+    assert extract_result_text("bare string") == "bare string"
+    assert extract_result_text({"content": [{"text": "nested"}]}) == "nested"
+    assert extract_result_text({"completion": "legacy"}) == "legacy"
+
+
+def test_extract_result_text_returns_none_for_unfamiliar_shapes() -> None:
+    # The fallback contract: callers canonicalise the whole object instead.
+    assert extract_result_text({"rows": ["a", "b"]}) is None
+    assert extract_result_text(object()) is None
+    assert extract_result_text(12345) is None
+    assert extract_result_text(_Message()) is None
+    assert extract_result_text({"text": "   "}) is None
+
+
+def test_extract_result_text_ignores_the_sdk_envelope() -> None:
+    """Two unrelated answers must not look alike merely by sharing a wrapper.
+
+    This is the regression that motivated the extractor: rendering the whole
+    response through ``repr`` made every response from one SDK share most of
+    its characters, so unrelated answers scored as similar as related ones.
+    """
+    left = extract_result_text(_Message(_Block("gross margin drivers")))
+    right = extract_result_text(_Message(_Block("tcp handshake phases")))
+    assert left is not None and right is not None
+    assert jaccard(shingles(left), shingles(right)) < 0.10
+
+    envelope = jaccard(
+        shingles(canonical_arguments((_Message(_Block("gross margin drivers")),))),
+        shingles(canonical_arguments((_Message(_Block("tcp handshake phases")),))),
+    )
+    # The un-extracted comparison is dominated by the shared wrapper.
+    assert envelope > 0.30
+
+
+def test_recorded_results_use_the_extracted_text() -> None:
+    """A thrashing loop whose answers are paraphrases must still be caught."""
+    breaker = CognitiveBreaker(policy=CognitivePolicy(retain_arguments=False))
+    prompts = [
+        "find the Q3 revenue report for the northwest region",
+        "find the Q3 revenue reports for the northwest region",
+        "find the Q3 revenue report for the northwest regions",
+        "find the Q3 revenue report for the northwest region now",
+    ]
+    # Same non-answer each time, reworded — what a real model returns when an
+    # agent keeps asking it for something it cannot reach.
+    answers = [
+        "I don't have access to that report. Try the finance portal.",
+        "I do not have access to those reports. Check the finance portal.",
+        "I don't have access to the report you want. Look in the finance portal.",
+        "I have no access to that revenue report. The finance portal may have it.",
+    ]
+    try:
+        with pytest.raises(AgentThrashingError):
+            for prompt, answer in zip(prompts, answers, strict=True):
+                breaker.observe("agent", "create", canonical_arguments((), {"prompt": prompt}))
+                breaker.record_result("agent", _Message(_Block(answer)))
+    finally:
+        breaker.close()

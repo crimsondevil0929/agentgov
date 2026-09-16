@@ -25,3 +25,7 @@ demo/
 
 # VHS-rendered terminal recordings (regenerate with `vhs demo.tape`)
 demo.gif
+
+# Live-API benchmark receipts (real usage payloads; regenerate with
+# `uv run python scripts/generate_real_usage.py`)
+benchmarks/live_data/

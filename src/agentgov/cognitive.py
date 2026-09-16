@@ -89,6 +89,7 @@ __all__ = [
     "TrajectoryEntropyObserver",
     "Verdict",
     "canonical_arguments",
+    "extract_result_text",
     "jaccard",
     "shingles",
 ]
@@ -124,6 +125,70 @@ def canonical_arguments(args: Sequence[object] = (), kwargs: Mapping[str, object
         )
     except (TypeError, ValueError):  # pragma: no cover - default=repr covers most
         return repr((tuple(args), tuple(sorted(kwargs.items()))))
+
+
+_RESULT_TEXT_ATTRS: Final = ("content", "text", "thinking", "completion")
+_MAX_RESULT_DEPTH: Final = 6
+
+
+def extract_result_text(result: object) -> str | None:
+    """Reduce a model response to the prose worth comparing, if recognisable.
+
+    Comparing whole SDK response objects measures the wrong thing. Rendering
+    an ``anthropic.types.Message`` through :func:`canonical_arguments` falls
+    back to ``repr``, so the shingled string is mostly *envelope* —
+    ``Message(id=…, content=[TextBlock(citations=None, type='text'…``,
+    ``role='assistant'``, ``usage=Usage(…)`` — which every response from that
+    SDK shares. Measured against live traffic, that boilerplate inflated two
+    *completely unrelated* responses to 0.42 similarity while two genuinely
+    progressing steps scored 0.48: no usable separation, and a threshold that
+    would drift with the SDK's ``__repr__`` rather than with meaning.
+
+    Extracting the text first restores the signal. On the same live corpus,
+    thrashing/progress separation roughly doubled (1.20x to 1.81x) and
+    unrelated responses fell to where they belong.
+
+    Duck-typed on purpose — AgentGov imports no provider SDK. Understands the
+    Anthropic Messages shape (``.content`` of blocks carrying ``.text`` or
+    ``.thinking``), the LangChain shape (``.content`` as a plain string),
+    mappings with those keys, and bare strings.
+
+    :param result: A call's return value.
+    :returns: The concatenated text, or ``None`` when the shape is unfamiliar
+        or carries no prose — the caller then falls back to canonicalising
+        the whole object, which is strictly better than comparing nothing.
+    """
+    found: list[str] = []
+    _walk_result_text(result, found, _MAX_RESULT_DEPTH)
+    joined = "".join(found).strip()
+    return joined or None
+
+
+def _walk_result_text(value: object, found: list[str], depth: int) -> None:
+    """Accumulate prose from a nested response structure."""
+    if depth <= 0:
+        return
+    if isinstance(value, str):
+        found.append(value)
+        return
+    if isinstance(value, bytes | bytearray):
+        return
+    if isinstance(value, Mapping):
+        for key in _RESULT_TEXT_ATTRS:
+            if key in value:
+                _walk_result_text(value[key], found, depth - 1)
+        return
+    if isinstance(value, Sequence):
+        for item in value:
+            _walk_result_text(item, found, depth - 1)
+        return
+    # An object: take the first text-bearing attribute it actually has, so a
+    # content-block list is preferred over a sibling summary field.
+    for name in _RESULT_TEXT_ATTRS:
+        attr = getattr(value, name, None)
+        if attr is not None:
+            _walk_result_text(attr, found, depth - 1)
+            return
 
 
 def shingles(text: str, *, size: int = 3, max_chars: int = 1024) -> frozenset[str]:
@@ -288,6 +353,24 @@ class CognitivePolicy:
         they must *also* be this similar for a near-duplicate to count. This
         is what separates thrashing from legitimate iteration: pagination has
         similar inputs but dissimilar outputs.
+
+        Calibrated against live traffic, not the offline stub — see
+        ``scripts/calibrate_result_threshold.py``, which is the reproducible
+        justification for this number. Model *prose* behaves nothing like
+        ``DummyLLM``'s templated completions: two answers meaning the same
+        thing share far fewer trigrams than two renderings of one template.
+        Over 36 measured pairs the per-pair distributions genuinely overlap
+        (thrashing 0.32-0.66, pagination 0.13-0.88), so no single-pair value
+        separates them. What separates them is
+        :attr:`max_similar_streak`: pagination's similarity is erratic — one
+        framing-heavy pair, then divergence — while thrashing stays
+        persistently elevated, so consecutive agreement is the real signal.
+        Sweeping the actual rule, ``0.25``-``0.30`` catches 4/4 thrashing
+        trajectories with zero false positives on pagination or on genuinely
+        progressing work; ``0.20`` starts false-positiving on pagination.
+        ``0.30`` is the top of that band, the conservative end for a rule that
+        halts an agent. The previous ``0.70`` — inherited from stub-based
+        tuning — detected **0/4** against live prose.
     :ivar comparison_window: How many recent calls the near-duplicate detector
         may compare against. Bounds inline cost.
     :ivar max_cycle_period: Longest call-graph cycle to look for (an
@@ -317,7 +400,7 @@ class CognitivePolicy:
     max_identical_repeats: int = 3
     similarity_threshold: float = 0.70
     max_similar_streak: int = 3
-    result_similarity_threshold: float = 0.70
+    result_similarity_threshold: float = 0.30
     comparison_window: int = 6
     max_cycle_period: int = 4
     min_cycle_repeats: int = 3
@@ -1045,7 +1128,10 @@ class CognitiveBreaker:
         with self._lock:
             state_calls = self._trajectories.get(key)
             tool = state_calls.calls[-1].tool if state_calls and state_calls.calls else ""
-        rendered = self._redact(tool, canonical_arguments((result,)))
+        payload = extract_result_text(result)
+        rendered = self._redact(
+            tool, payload if payload is not None else canonical_arguments((result,))
+        )
         digest = shingles(
             rendered, size=self._policy.shingle_size, max_chars=self._policy.max_argument_chars
         )

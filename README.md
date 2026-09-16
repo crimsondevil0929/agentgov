@@ -3,7 +3,7 @@
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
 [![CI](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml/badge.svg)](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-316%2F316%20passing-brightgreen)](#code-quality--packaging)
+[![tests](https://img.shields.io/badge/tests-323%2F323%20passing-brightgreen)](#code-quality--packaging)
 [![coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)](#code-quality--packaging)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
@@ -32,6 +32,10 @@ Zero runtime dependencies. Pure standard library (`decimal`, `hashlib`, `threadi
 the *identical* runaway-agent workload three times — with no backstop, with a $5.00
 spend envelope, and with the envelope plus cognitive loop detection — and diffs the
 outcome. Same orchestrator logic, same simulated model, same 3 seconds of wall clock.
+
+The model here is a deterministic offline stub, which is what makes a million-call
+comparison reproducible. For the same machinery measured against the real Anthropic API,
+see [Live API metering](#live-api-metering) below.
 
 ```
 +=======================+==========================+======================================+======================================================+
@@ -82,6 +86,88 @@ SHA-256 chain and the delegation topology; `verify_conservation()` checks the id
 
 across every scope in the tree. Money is never created, destroyed, or double-counted —
 it only ever moves between a parent and a child, or out to a vendor.
+
+---
+
+## Live API metering
+
+The benchmark above runs against a deterministic stub, which is the right harness for
+proving accounting invariants and the wrong one for proving anything about a real
+provider. [`scripts/generate_real_usage.py`](scripts/generate_real_usage.py) closes that
+gap: four governed workloads across four Anthropic model tiers, through the official
+`anthropic` SDK, with every raw response payload written to disk as evidence.
+
+```
++-----------+---------------------------+-------+--------+---------+-------------+-----------+
+| TIER      | MODEL SERVED              | CALLS | IN TOK | OUT TOK | COST        | HALTED BY |
++-----------+---------------------------+-------+--------+---------+-------------+-----------+
+| runaway   | claude-haiku-4-5-20251001 | 3     | 54     | 384     | $0.00197400 | cognitive |
+| workhorse | claude-sonnet-5           | 3     | 112    | 426     | $0.00448400 | -         |
+| analyst   | claude-opus-5             | 1     | 124    | 900     | $0.02312000 | -         |
+| heavy     | claude-fable-5-1          | 1     | 155    | 407     | $0.02190000 | -         |
++-----------+---------------------------+-------+--------+---------+-------------+-----------+
+| TOTAL     |                           | 8     | 445    | 2,117   | $0.05147800 |           |
++-----------+---------------------------+-------+--------+---------+-------------+-----------+
+
+  ledger settled total      $0.05147800
+  independent re-price      $0.05147800
+  drift                     $0E-8  (MATCH)
+  verify_integrity()        PASS - 33 entries chained
+```
+
+**Pricing is exact, not approximately right.** Every settled call is re-priced a second
+time straight from the published rates and compared against what the ledger captured.
+Across 445 input and 2,117 output tokens on four different price tiers the drift is
+**$0.00000000** — the metering path reads a real `usage` object and turns it into the
+same number twice, independently. `anthropic` 1.6.0; `claude-fable-5-1` served natively.
+
+**The cognitive breaker fires on live traffic.** Tier 1 drives a thrashing loop — four
+cosmetically-edited restatements of one request. It halted after **3 executed calls and
+$0.001974**, then refused 5 retry attempts with no balance movement at all. Tier 2, a
+genuinely progressing three-step workflow, ran to completion untouched: the detector
+discriminates, rather than simply halting whatever runs longest.
+
+**This run found a real bug, which is the point of running it.** Against the live API the
+breaker initially did *not* fire, despite the loop being obvious. Two defects, both
+invisible to a stub-backed test suite:
+
+1. **The result comparison was measuring the SDK envelope, not the answer.** Rendering an
+   `anthropic.types.Message` through `repr` meant most of the compared characters were
+   `Message(id=…`, `TextBlock(citations=None, type='text'…`, `usage=Usage(…)` —
+   boilerplate every response from that SDK shares. Two *completely unrelated* answers
+   scored 0.42 while two genuinely progressing ones scored 0.48: no usable signal.
+   `extract_result_text()` now pulls the prose out first, which roughly doubled the
+   separation between thrashing and progress (1.20x → 1.81x).
+2. **`result_similarity_threshold` was calibrated on templated stub output.** Real prose
+   that means the same thing shares far fewer character trigrams than two renderings of
+   one template. The inherited `0.70` detected **0 of 4** thrashing trajectories against
+   live traffic.
+
+[`scripts/calibrate_result_threshold.py`](scripts/calibrate_result_threshold.py) is the
+reproducible re-calibration: 36 measured pairs across thrashing, pagination, and
+genuinely progressing traffic. Its finding is more interesting than a new constant —
+**the per-pair distributions genuinely overlap** (thrashing 0.32–0.66, pagination
+0.13–0.88), so no single-pair threshold separates them. What separates them is the
+*streak* requirement: pagination's similarity is erratic, thrashing's stays persistently
+elevated. Sweeping the real rule, `0.25`–`0.30` catches 4/4 thrashing trajectories with
+zero false positives on either control family; `0.20` begins false-positiving on
+pagination. The shipped default is now **`0.30`**, the conservative end of that band.
+
+Reproduce it — this spends real money, so rehearse first:
+
+```bash
+export BENCHMARK_API_KEY=sk-ant-...        # never falls back to ANTHROPIC_API_KEY
+uv run python scripts/generate_real_usage.py --dry-run   # free rehearsal, no network
+uv run python scripts/generate_real_usage.py             # ~$0.05
+uv run python scripts/calibrate_result_threshold.py      # ~$0.03
+```
+
+Every call carries an explicit `max_tokens`, the whole run executes inside a $1.50
+AgentGov envelope, and the runaway loop is additionally bounded by a hardcoded counter
+that breaks at four iterations — so a regression in the breaker still cannot run away.
+Raw payloads, the cost summary, the ledger, and the metering journal are written to
+timestamped files under `benchmarks/live_data/` (gitignored: they are evidence, not
+repository content).
 
 ---
 
@@ -444,6 +530,77 @@ lock-contention, and durable-write-failure matrices.
   A corrupted or tampered file refuses to load rather than being trusted. See
   [Durability](#durability) above.
 
+## Known limitations & v0.1 scope
+
+Every claim on this page is measured, and the boundaries of what was measured matter as
+much as the numbers. This section states them plainly rather than leaving them to be
+discovered in production.
+
+### Single-writer by design — one process, one host
+
+`BudgetManager.open_sqlite()` takes an exclusive advisory lock on the database. **One
+process governs one ledger.** A second process is refused at open with
+`ConcurrentGovernorError` naming the holding PID; it is not silently allowed to diverge.
+
+Measured throughput on that single writer, all of it behind one global mutex:
+
+| Configuration | Mean per governed call | p99 | Sustained ceiling |
+|---|---|---|---|
+| In-memory ledger | 0.062 ms | — | ~16,000 calls/sec |
+| SQLite, `synchronous=FULL` | 0.613 ms | 3.448 ms | ~1,600 calls/sec |
+
+**This is a deliberate trade, not an oversight.** The alternative — shipping a
+coordination service — would mean infrastructure to deploy, a network hop in the hot
+path, and a dependency tree, all before anyone could evaluate whether the governor is
+worth having. `pip install agentgov` with zero runtime dependencies and a local file is
+what makes the thing adoptable in an afternoon. The cost of that choice is that
+AgentGov v0.1 governs *a process*, not a fleet.
+
+**The roadmap fix is already seamed for.** `agentgov.storage.PersistenceStore` is a
+Protocol, and `SqliteStore` is one implementation of it. A **Postgres or Redis
+`PersistenceStore`** puts the ledger in a shared transactional store, making the
+database the serialization point so N processes across N hosts share one authoritative
+view of every balance — fleet-wide consensus without a bespoke consensus cluster, and
+without touching the ledger, the budget DAG, or the breaker. SQLite stays the default so
+the zero-dependency install is unaffected.
+
+### A guardrail inside a process, not a sandbox around it
+
+AgentGov enforces at the call site, in your process. Anything that can `import agentgov`
+can also call the provider SDK directly and spend unmetered. The hash chain is
+**tamper-evident, not tamper-resistant** — `verify_chain()` will prove a file was edited,
+but nothing stops a process with write access from editing it, and there is no external
+anchoring. The [reconciliation engine](#reconciling-the-invoice) is the backstop for
+out-of-band spend, and it is *detection after the fact*, not prevention. Treat AgentGov
+as a budget guardrail against runaway and accident — the failure mode that actually burns
+money today — not as a security boundary against a hostile agent.
+
+### Published rates are a snapshot
+
+`agentgov.interceptor.PRICING` is a hardcoded table of published list rates, current as
+of the date in its docstring. Vendors change prices, and partner platforms (Bedrock,
+Vertex) bill differently. Pass an explicit `ModelPricing` for anything not in the table,
+and treat reconciliation against the real invoice as a production requirement rather than
+a nicety — that is precisely why the reconciliation engine exists.
+
+### What has been proven deterministically, and what has been proven live
+
+These are different claims and this project keeps them separate.
+
+**Proven deterministically.** The accounting invariants — no double-spend under
+concurrency, conservation of value, an unbroken SHA-256 chain, the latching breaker — are
+verified against `DummyLLM`, a deterministic offline stub, under 64 contending threads and
+100 concurrent asyncio tasks. This is the right harness for these properties: a governor
+that is only *probably* correct under load is not correct, and a nondeterministic backend
+cannot prove a race is absent.
+
+**Proven against the live API.** Correct accounting says nothing about whether the
+metering layer reads a *real* provider response. That gap is closed by
+[`scripts/generate_real_usage.py`](scripts/generate_real_usage.py), which drives four
+governed workloads across four Anthropic model tiers through the official `anthropic`
+SDK, re-prices every settled call independently from the published rates, and writes every
+raw API payload to disk as evidence — see [Live API metering](#live-api-metering) below.
+
 ## Roadmap — Phase 2
 
 Phase 1 is a correct, single-process governor: one ledger, one mutex, durable to a local
@@ -468,7 +625,7 @@ SQLite file, with financial and cognitive breakers on the same actuator. Beyond 
 
 ```bash
 uv sync                              # install (zero runtime dependencies)
-uv run pytest -v                     # 316 passed
+uv run pytest -v                     # 323 passed
 uv run pytest --cov=agentgov         # 96% coverage
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/                     # strict, zero errors

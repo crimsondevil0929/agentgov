@@ -6,6 +6,89 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
+## [Unreleased]
+
+### Empirical Optimizations
+
+Everything in 0.1.0 was verified against `DummyLLM`, a deterministic offline
+stub. That proves the accounting invariants and proves nothing about the
+integration surface. Running the same machinery against the live Anthropic API
+for the first time surfaced two defects that no stub-backed test could have
+caught, both in the cognitive breaker's result comparison.
+
+- **Compare the answer, not the SDK envelope.** `CognitiveBreaker.record_result()`
+  rendered whole response objects through `canonical_arguments()`, which falls
+  back to `repr`. For an `anthropic.types.Message` that meant most of the
+  compared characters were wrapper boilerplate — `Message(id=…`,
+  `TextBlock(citations=None, type='text'…`, `usage=Usage(…)` — shared by every
+  response from that SDK. Measured on live traffic, two *completely unrelated*
+  answers scored 0.42 similarity while two genuinely progressing ones scored
+  0.48: the metric was reading the envelope, and would have drifted with the
+  SDK's `__repr__` rather than with meaning. New `agentgov.cognitive.extract_result_text()`
+  pulls the prose out first — duck-typed across the Anthropic Messages shape,
+  the LangChain shape, mappings and bare strings, with no provider import and
+  a `None` fallback that preserves the previous behaviour for unfamiliar
+  shapes. Thrashing/progress separation roughly doubled (1.20x → 1.81x).
+
+- **`CognitivePolicy.result_similarity_threshold` recalibrated, 0.70 → 0.30.**
+  The 0.70 default was tuned against the stub's templated completions. Real
+  model prose that *means* the same thing shares far fewer character trigrams
+  than two renderings of one template, so the veto that distinguishes
+  thrashing from pagination was rejecting every genuine match: the inherited
+  threshold detected **0 of 4** live thrashing trajectories. The breaker's
+  headline feature was inert in production.
+
+  The re-calibration is reproducible (`scripts/calibrate_result_threshold.py`,
+  36 measured pairs across thrashing, pagination and genuinely progressing
+  traffic) and its finding matters more than the constant: the per-pair
+  distributions genuinely **overlap** (thrashing 0.32–0.66, pagination
+  0.13–0.88), so no single-pair threshold separates them. The discriminator is
+  the *streak* requirement — pagination's similarity is erratic, thrashing's
+  stays persistently elevated. Sweeping the real detector rule, 0.25–0.30
+  catches 4/4 thrashing trajectories with zero false positives on either
+  control family, while 0.20 begins false-positiving on pagination. 0.30 is
+  the conservative end of that band.
+
+- **No change was needed to `PRICING` or to usage extraction.** Both were
+  verified rather than assumed: the published rates for `claude-fable-5-1`,
+  `claude-opus-5`, `claude-sonnet-5` and `claude-haiku-4-5` already matched,
+  and `default_usage_extractor` read live `usage` objects — including
+  `stop_reason: max_tokens` truncation and null cache fields — with no
+  special-casing. Across 445 input and 2,117 output tokens on four price
+  tiers, independently re-pricing every settled call from the published rates
+  agreed with the ledger to **$0.00000000**.
+
+### Added
+
+- `scripts/generate_real_usage.py` — meters four governed workloads across four
+  Anthropic model tiers (`claude-haiku-4-5`, `claude-sonnet-5`,
+  `claude-opus-5`, `claude-fable-5-1`) through the official SDK, re-prices every
+  call independently, and persists raw response payloads, a cost summary, the
+  ledger and the metering journal to timestamped files under
+  `benchmarks/live_data/`. Authenticates only from `BENCHMARK_API_KEY` — never
+  falling back to `ANTHROPIC_API_KEY` or an `ant auth login` profile, so it
+  cannot bill an unintended account. Budget guardrails: an explicit `max_tokens`
+  on every call, a $1.50 AgentGov envelope around the whole run, a hardcoded
+  four-iteration bound on the runaway loop that holds even if the breaker
+  regresses, and a `--dry-run` mode that exercises every path with no network
+  and no spend.
+- `scripts/calibrate_result_threshold.py` — the reproducible justification for
+  `result_similarity_threshold`, sweeping the real detector rule over a live
+  three-family corpus.
+- `agentgov.cognitive.extract_result_text()`, exported for callers implementing
+  a custom `LoopDetector` or `Redactor`.
+- README: **Known limitations & v0.1 scope**, stating the single-writer boundary
+  and its measured ~1,600 calls/sec ceiling, the guardrail-not-sandbox
+  enforcement model, the pricing snapshot, and the line between what is proven
+  deterministically and what is proven live. README: **Live API metering**, with
+  the measured results.
+
+### Changed
+
+- `anthropic` added to the `dev` dependency *group* — local to this repository
+  and absent from the published wheel, so the installed package keeps its
+  zero-runtime-dependency guarantee.
+
 ## [0.1.0] — 2026-09-14
 
 Initial public release: a runtime spend governor and denial-of-wallet circuit

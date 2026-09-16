@@ -56,6 +56,11 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.6.0",
     "mypy>=1.11.0",
+    # Used only by scripts/generate_real_usage.py, which exercises the metering
+    # path against the live Anthropic API. A dependency *group* is local to this
+    # repository and is not published in the wheel, so the installed package
+    # keeps its zero-runtime-dependency guarantee.
+    "anthropic>=1.0.0",
 ]
 
 [tool.pytest.ini_options]
