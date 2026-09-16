@@ -23,8 +23,18 @@ from __future__ import annotations
 import sys
 from decimal import Decimal
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-import streamlit as st
+if TYPE_CHECKING:
+    # Streamlit is an optional extra (`uv sync --extra ui`) and is deliberately
+    # absent from the CI type-check environment, so the type checker cannot be
+    # allowed to depend on it either way. Declaring it as Any here, rather than
+    # silencing the import with `# type: ignore`, keeps this file checking
+    # identically whether or not the package is installed: a bare ignore would
+    # resolve cleanly in CI and then fail locally under `warn_unused_ignores`.
+    st: Any
+else:
+    import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -47,11 +57,17 @@ st.set_page_config(page_title="AgentGov Ledger Dashboard", page_icon="\U0001f4d2
 # --------------------------------------------------------------------------
 
 
-@st.cache_resource(show_spinner=False)
-def _open_ledger(path: str) -> BudgetManager:
+def _open_ledger_uncached(path: str) -> BudgetManager:
     """Open a ledger for audit. Cached per path so the advisory lock (which
     read-only mode does not take) isn't reopened on every rerun."""
     return BudgetManager.open_sqlite(path, read_only=True)
+
+
+# Applied as a call rather than with `@` syntax. `st` is untyped by
+# construction (see the import above) and `mypy --strict` rejects an untyped
+# decorator, so the wrapping is done here and the result is narrowed back to a
+# real type at the one call site below.
+_open_ledger = st.cache_resource(show_spinner=False)(_open_ledger_uncached)
 
 
 def load_manager(path: str) -> BudgetManager | None:
@@ -63,10 +79,11 @@ def load_manager(path: str) -> BudgetManager | None:
         )
         return None
     try:
-        return _open_ledger(path)
+        manager: BudgetManager = _open_ledger(path)
     except AgentGovError as exc:
         st.error(f"Could not open `{path}` as an AgentGov ledger: {exc}")
         return None
+    return manager
 
 
 def usd(amount: Decimal) -> str:
@@ -360,7 +377,12 @@ def main() -> None:
 
     manager = load_manager(db_path)
     if manager is None:
+        # st.stop() raises internally, so the return never executes. It is here
+        # so the None case is closed explicitly rather than relying on the type
+        # checker knowing that stop() is NoReturn, which it cannot know when
+        # Streamlit is not installed.
         st.stop()
+        return
 
     render_summary_metrics(manager)
     st.divider()
