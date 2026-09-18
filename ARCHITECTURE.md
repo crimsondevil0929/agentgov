@@ -8,10 +8,8 @@ records what we measured when we ran ours against the live Anthropic API for the
 first time, and why the calibration harness that came out of it is more durable
 than the constant it produced.
 
-**Part B** is the v0.2 design brief. A circuit breaker protects the wallet, but
-nobody's goal was to not spend money. It was to finish the task. Halting is
-the cheapest possible failure and it is still a failure. Part B architects what
-happens next.
+**Part B** is the v0.2 design brief: what should happen after a breaker trips,
+given that a halted agent has protected the budget and not finished the task.
 
 Part A describes shipped, measured behaviour. Part B is a roadmap and contains
 no implementation.
@@ -182,7 +180,7 @@ default is now **`0.30`**, the top of the clean band. A higher result threshold
 makes "these results agree" harder to assert, which is the conservative
 direction for a rule that halts somebody's agent.
 
-## A.5 Why the harness is the moat, not the number
+## A.5 Why the constant does not transfer
 
 `0.30` is one line. Anyone can copy it in ten seconds, and copying it is close
 to worthless, because the constant is only valid for the conditions it was
@@ -213,16 +211,14 @@ What actually transfers is the **Empirical Calibration Harness**:
    is committed, runs for about three cents, and prints the table above. The
    constant in `cognitive.py` cites it.
 
-That is a *methodology for calibrating safety thresholds on non-deterministic
-systems*, and it re-runs per model, per SDK bump, per customer workload. A
-competitor can copy our threshold. To copy the capability they need the corpus
-design, the gate analysis, the sweep, and the discipline to run it again every
-time the model underneath changes. That is roughly every few months.
+The harness has to be re-run per model, per SDK bump, per workload mix. Copying
+the constant out of this file gets you a number calibrated for Haiku on
+`anthropic` 1.6.0 with a 3-shingle window and a streak of 3. Change any of those
+and re-run the sweep.
 
-**Corollary worth stating plainly:** every AI-safety product with a tuned
-threshold in it has this problem. Most do not know it, because a detector that
-silently stops firing generates no alerts. The harness is how we find out
-before our users do.
+This applies to any detector with a tuned threshold in it. A threshold that has
+stopped firing produces no error and no alert, so the only way to find out is to
+measure it again against live traffic.
 
 ## A.6 Honest limits of Part A
 
@@ -244,15 +240,13 @@ before our users do.
 
 ## B.0 The reframing
 
-AgentGov v0.1 optimises the wrong objective.
+v0.1 minimises spend on failure. That is not the objective anyone has. The
+objective is to finish the task under a spend ceiling. Halting beats a runaway
+and is still a loss: the agent stops, the budget survives, the work is not done,
+and a human has to notice, diagnose and restart it. That human minute usually
+costs more than the dollars the halt saved.
 
-It minimises spend on failure. No user ever wanted "spend nothing." They wanted
-"finish the task, and don't let it cost more than $X." Halting is *strictly
-better* than a runaway and it is still a loss: the agent stops, the budget
-survives, the work is not done. A human has to notice, diagnose, and restart.
-The cost of that human minute usually exceeds the dollars saved.
-
-Stated properly, the objective is constrained completion:
+Written out, the objective is constrained completion:
 
 ```
     maximize   P(task completes successfully)
@@ -267,17 +261,15 @@ discards the distinction.
 **v0.2's thesis: a breaker trip should be a state transition in a priced
 decision process, not a terminal event.**
 
-AgentGov is the right layer to own this, and that is the whole argument.
-Recovery needs two things that live in different places everywhere else in the
-stack:
+Recovery needs two inputs that normally live in different components:
 
 - **the money**: what has been spent, what remains, at what rate, priced exactly;
 - **the progress signal**: the similarity history, the novelty decay, the
   call-graph shape.
 
-AgentGov already holds both, in one process, on one clock. A framework knows the
-trajectory but not the budget. A FinOps dashboard knows the budget but not the
-trajectory. Neither can answer "is another $0.40 likely to finish this?"
+AgentGov holds both, in one process, on one clock. An agent framework has the
+trajectory and not the budget; a cost dashboard has the budget and not the
+trajectory. Neither can evaluate "is another $0.40 likely to finish this?"
 
 ## B.1 Design constraints the live SDK work imposed
 
@@ -431,11 +423,9 @@ byproduct of normal operation, hash-chained and tamper-evident. Over a fleet,
 `p_r` becomes an empirical distribution conditioned on the *signature of the
 loop*: which detector fired, streak length, tool, model, elapsed spend.
 
-This is the compounding asset. The threshold in Part A is a constant we
-re-derive; `p_r` is a posterior that sharpens with every trip anyone's agent
-takes. A competitor starting later starts with a flat prior, and the cold-start
-problem is exactly what a hash-chained corpus of priced recovery outcomes
-solves.
+The threshold in Part A is a constant that gets re-derived; `p_r` is a posterior
+that sharpens with every recorded trip. Until there is volume it is a flat
+prior, which is the cold-start problem in B.7.
 
 ## B.5 Keeping recovery honest
 
@@ -462,19 +452,22 @@ today. Reports can attribute cost to recovery by scope, without a second
 accounting concept. **No new money primitive is introduced.** That is the
 design constraint every part of B.5 is written to satisfy.
 
-## B.6 Why this is hard to copy
+## B.6 Prerequisites
 
-- **It requires both halves.** The decision rule is a function of the ledger
-  *and* the cognitive trajectory. Anyone holding only one can guess.
-- **It requires the Part A harness.** The progress signal feeding the stopping
-  rule is only trustworthy if it is calibrated per model and per SDK version.
-  Recovery built on an uncalibrated detector recovers from phantom loops and
-  misses real ones.
-- **It requires provider-semantics depth.** The ladder is ordered by cache and
-  thinking-block invalidation cost. Getting that ordering wrong produces a
-  recovery system that is more expensive than the failure.
-- **It compounds.** `p_r` improves with volume, and the corpus is
-  tamper-evident by construction.
+Each of these has to hold before the decision rule in B.4 produces a number
+worth acting on.
+
+- **Both inputs in one process.** The rule is a function of the ledger *and* the
+  cognitive trajectory. With only one of them the rule degenerates to a guess.
+- **A calibrated progress signal.** The stopping rule reads the detector's
+  novelty history. On an uncalibrated detector it recovers from loops that are
+  not there and misses the ones that are. Part A is the prerequisite, not an
+  aside.
+- **Provider semantics for the ladder ordering.** The rungs are ordered by cache
+  and thinking-block invalidation cost (B.1). Order them wrong and recovery
+  costs more than the failure it is recovering from.
+- **Volume.** `p_r` is estimated from recorded outcomes. Below some number of
+  trips it is a prior, not an estimate.
 
 ## B.7 Open questions
 

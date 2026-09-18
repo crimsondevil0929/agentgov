@@ -8,6 +8,36 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`NearDuplicateDetector.result_threshold` default, 0.70 → 0.30.** The
+  recalibration below changed `CognitivePolicy.result_similarity_threshold` and
+  left the detector's own default at the stub-tuned `0.70`. `CognitiveBreaker`
+  passes the policy value in, so the shipped path was correct, but
+  `NearDuplicateDetector` is a documented extension point: a caller following
+  the README's `detectors=[...]` guidance constructed it directly and got the
+  threshold that detected 0 of 4 live thrashing trajectories. No test covered
+  the detector's own default; one now pins the two values equal.
+
+### Changed
+
+- **`CONCEPT.md` removed** and pitch/positioning filenames added to
+  `.gitignore`. This repository is public; its documentation is engineering
+  mechanics.
+- **`docs/DEMO_RUNBOOK.md` rewritten** as a command-by-command walkthrough. It
+  was a presentation script ("what to say", "the line to land", a question
+  bank); the commands, expected output and failure modes are what belongs in
+  the repo.
+- **`docs/EFFECT_ESCROW_SPEC.md` moved** to the `interlock` repository as
+  `docs/ESCROW_SPEC.md`, retargeted from the placeholder name `agentescrow` to
+  the shipped package, and given a conformance section stating what `interlock`
+  v0.1.0 implements, partially implements and does not implement. It described
+  a sibling package and claimed no implementation existed.
+- **`ARCHITECTURE.md` A.5 and B.6 retitled** and rewritten to drop competitive
+  framing. The technical content (why a threshold does not transfer across
+  models, SDK versions and traffic mixes; what the calibration harness has to
+  re-run) is unchanged.
+
 ### Empirical Optimizations
 
 Everything in 0.1.0 was verified against `DummyLLM`, a deterministic offline

@@ -740,10 +740,10 @@ def test_a_final_message_accessor_that_raises_is_tolerated(gov: BudgetManager) -
 
 
 def test_the_live_demo_runs_and_produces_its_artifacts(tmp_path: Path) -> None:
-    """Smoke-test examples/live_demo.py so the investor demo cannot rot.
+    """Smoke-test examples/live_demo.py so the walkthrough cannot rot.
 
-    Asserts the claims the runbook makes on stage: the breaker halts, it halts
-    for less than a cent, and every artifact the CLI steps need exists.
+    Asserts what docs/DEMO_RUNBOOK.md claims: the breaker halts, it halts for
+    less than a cent, and every artifact the later CLI steps read exists.
     """
     script = Path(__file__).resolve().parent.parent / "examples" / "live_demo.py"
     out = tmp_path / "demo"
@@ -782,7 +782,7 @@ def test_the_live_demo_runs_and_produces_its_artifacts(tmp_path: Path) -> None:
 
 
 def test_the_demo_halt_is_genuinely_sub_cent(tmp_path: Path) -> None:
-    """The runbook says 'sub-cent' on stage; hold the demo to it."""
+    """The runbook claims a sub-cent halt; hold the demo to that number."""
     script = Path(__file__).resolve().parent.parent / "examples" / "live_demo.py"
     result = subprocess.run(  # noqa: S603
         [sys.executable, str(script), "--out", str(tmp_path / "demo"), "--no-color"],

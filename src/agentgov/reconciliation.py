@@ -865,7 +865,7 @@ def reconcile(
 
 
 def format_report(report: ReconciliationReport, *, path: str = "", export: str = "") -> str:
-    """Render a report as an enterprise-grade terminal summary.
+    """Render a report as a terminal summary.
 
     :param report: The report to render.
     :param path: Ledger path, for the header.

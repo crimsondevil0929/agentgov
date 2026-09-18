@@ -20,7 +20,7 @@ breaker's inline latency, which is timed live on the machine running the demo.
 The model is :class:`~agentgov.dummy.DummyLLM`, a deterministic offline stub:
 the demo spends no money and needs no network or API key, and the run is
 reproducible on any machine. Swapping in a real client is a one-line change,
-and the governor cannot tell the difference — that is the point of the adapter.
+and the governor cannot tell the difference; that is what the adapter layer is for.
 
 Usage::
 

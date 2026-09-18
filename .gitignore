@@ -1,3 +1,12 @@
+# Pitch, positioning and brainstorming material. This repository is public and
+# its documentation is engineering mechanics only. Keep strategy notes out of it.
+CONCEPT.md
+CONCEPT*.md
+PITCH*.md
+*_pitch.md
+NOTES.md
+BRAINSTORM*.md
+
 # Secrets. Never commit an API key.
 .env
 .env.*

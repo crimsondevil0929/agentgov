@@ -42,7 +42,7 @@ computed under the cognitive lock, which is then **released before** the
 financial breaker is tripped — the two locks are never held simultaneously, so
 there is no lock-ordering hazard to reason about.
 
-**Known limitation, stated plainly.** Legitimate iteration — pagination,
+**Known limitation.** Legitimate iteration — pagination,
 map-over-a-list, retry-with-backoff — looks like a soft loop on input
 similarity alone. The discriminator is the *result*: near-identical inputs
 producing near-identical outputs is thrashing; near-identical inputs producing
@@ -339,13 +339,18 @@ class CognitivePolicy:
     :ivar similarity_threshold: Jaccard similarity at or above which two
         consecutive calls count as "no progress".
 
-        Note that character-trigram Jaccard is *not* the same scale as
-        intuitive "percent overlap": two search queries a human would call
-        90% identical measure 0.74-0.83, because a one-word edit disturbs
-        several trigrams. Measured on this project's corpus, cosmetically
-        edited queries score 0.74-0.83 while queries that genuinely advance
-        a task — even within one topic — score below 0.14. The ``0.70``
-        default sits in that gap with roughly 5x margin on either side.
+        Character-trigram Jaccard is not on the same scale as "percent
+        overlap": two queries a reader would call 90% identical measure
+        0.74-0.83, because a one-word edit disturbs several trigrams. On this
+        project's corpus, cosmetically edited queries score 0.74-0.83 and
+        queries that advance a task, even within one topic, score below 0.14.
+        The ``0.70`` default sits in that gap.
+
+        Measured against ``DummyLLM``, unlike
+        :attr:`result_similarity_threshold`, which was recalibrated against
+        live traffic. Input similarity is the more stable of the two because
+        tool arguments are short and structured, but this number has not had
+        the same treatment.
 
     :ivar max_similar_streak: Consecutive near-duplicate *pairs* tolerated.
         ``3`` trips on the fourth call of a soft loop.
@@ -490,20 +495,26 @@ class ExactRepeatDetector:
 class NearDuplicateDetector:
     """Trips on a run of consecutive calls that barely differ — the soft loop.
 
-    This is the detector that catches the failure mode exact matching misses:
-    an agent nudging a search query, incrementing a guess, or reformatting a
-    prompt while making no semantic progress. Similarity is Jaccard over
-    character shingles of tool-plus-arguments.
+    Catches what exact matching misses: an agent nudging a search query,
+    incrementing a guess, or reformatting a prompt while making no semantic
+    progress. Similarity is Jaccard over character shingles of
+    tool-plus-arguments.
 
-    When results are known for both calls in a pair, they must *also* be
-    similar for the pair to count as stagnant. That is the discriminator
-    between thrashing and legitimate iteration: paginating a cursor produces
-    near-identical inputs but genuinely different outputs, and is left alone.
+    When results are known for both calls in a pair, they must also be similar
+    for the pair to count as stagnant. That is the discriminator between
+    thrashing and legitimate iteration: paginating a cursor produces
+    near-identical inputs and different outputs, and is left alone.
     """
 
     threshold: float = 0.70
     max_streak: int = 3
-    result_threshold: float = 0.70
+    result_threshold: float = 0.30
+    """Matches :attr:`CognitivePolicy.result_similarity_threshold`. Calibrated
+    against live traffic by ``scripts/calibrate_result_threshold.py``; the
+    ``0.70`` this used to default to detected 0/4 thrashing trajectories
+    against real prose. Keep the two in step: constructing this detector
+    directly is a documented extension point, so a stale default here is a
+    detector that silently does not fire."""
 
     @property
     def name(self) -> str:

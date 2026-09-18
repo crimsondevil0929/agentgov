@@ -3,17 +3,17 @@
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
 [![CI](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml/badge.svg)](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-323%2F323%20passing-brightgreen)](#code-quality--packaging)
+[![tests](https://img.shields.io/badge/tests-324%2F324%20passing-brightgreen)](#code-quality--packaging)
 [![coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)](#code-quality--packaging)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
 [![license](https://img.shields.io/badge/license-Apache%202.0-lightgrey)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 
-When an agent spawns sub-agents that spawn tools, nothing in today's stack enforces a
-dollar ceiling on the *tree*. Per-account rate limits watch one caller; they cannot see
-a fan-out of 50 sub-agents each making a handful of "reasonable" calls that, together,
-burn a budget in seconds. AgentGov sits below the payment layer as that missing control
+When an agent spawns sub-agents that spawn tools, nothing in the stack enforces a dollar
+ceiling on the *tree*. A per-account rate limit watches one caller. It does not see a
+fan-out of 50 sub-agents each making a handful of individually reasonable calls that,
+together, burn a budget in seconds. AgentGov sits below the payment layer as that missing control
 plane: a hierarchical, capability-scoped spend envelope over an immutable, hash-chained
 ledger, with a circuit breaker that halts a runaway branch before settlement, not after.
 A second, *cognitive* breaker attacks the root cause: it detects the agent looping without
@@ -132,7 +132,7 @@ $0.001974**, then refused 5 retry attempts with no balance movement at all. Tier
 genuinely progressing three-step workflow, ran to completion untouched: the detector
 discriminates, rather than simply halting whatever runs longest.
 
-**This run found a real bug, which is the point of running it.** Against the live API the
+**This run found two real bugs.** Against the live API the
 breaker initially did *not* fire, despite the loop being obvious. Two defects, both
 invisible to a stub-backed test suite:
 
@@ -288,7 +288,7 @@ that raises causes the text to be dropped entirely rather than retained unredact
 [`SECURITY.md`](SECURITY.md) is the full data map: what lands in SQLite, in memory, and
 in logs, and what encryption at rest AgentGov does *not* provide.
 
-**Where it does not reach, stated plainly.** Legitimate iteration (pagination,
+**Where it does not reach.** Legitimate iteration (pagination,
 map-over-a-list) looks like a soft loop on *input* similarity alone. The discriminator is
 the result: near-identical inputs producing near-identical outputs is thrashing;
 near-identical inputs producing different outputs is progress. The `Interceptor` feeds
@@ -445,8 +445,7 @@ live and holding the write claim.
 
 ## Durability
 
-An in-memory ledger that calls itself an auditable financial record is a contradiction.
-Restart the process and the audit trail is gone. Swap `BudgetManager()` for
+An in-memory ledger is not an audit trail: restart the process and it is gone. Swap `BudgetManager()` for
 `BudgetManager.open_sqlite(path)` and every write goes through to disk first, in the same
 atomic transaction, before it ever touches memory:
 
@@ -615,12 +614,11 @@ raw API payload to disk as evidence. See [Live API metering](#live-api-metering)
 Phase 1 is a correct, single-process governor: one ledger, one mutex, durable to a local
 SQLite file, with financial and cognitive breakers on the same actuator. Beyond that:
 
-- **State recovery after a trip: the "what then?" protocol.** A breaker protects the
-  wallet, but nobody's goal was to not spend money. It was to finish the task. Halting is
-  the cheapest possible failure and it is still a failure. The design brief covers
-  cryptographic state checkpointing over a Merkle prefix tree, an append-only intervention
-  ladder ordered by prompt-cache invalidation cost, and a budgeted stopping rule over the
-  breaker's own novelty signal. See
+- **State recovery after a trip.** A halt protects the budget and leaves the task
+  unfinished, and a human then has to notice, diagnose and restart it. The design brief
+  covers cryptographic state checkpointing over a Merkle prefix tree, an append-only
+  intervention ladder ordered by prompt-cache invalidation cost, and a budgeted stopping
+  rule over the breaker's own novelty signal. See
   [`ARCHITECTURE.md`, Part B](ARCHITECTURE.md#part-b-the-what-then-protocol-v02-state-recovery-roadmap).
 - **Distributed multi-node consensus.** `agentgov.storage.PersistenceStore` is already the
   seam a replicated backend would implement. Move the ledger off one host's disk onto a
@@ -641,7 +639,7 @@ SQLite file, with financial and cognitive breakers on the same actuator. Beyond 
 
 ```bash
 uv sync                              # install (zero runtime dependencies)
-uv run pytest -v                     # 323 passed
+uv run pytest -v                     # 324 passed
 uv run pytest --cov=agentgov         # 96% coverage
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/                     # strict, zero errors
@@ -654,9 +652,9 @@ Python 3.11 and 3.12, on Linux and macOS, with a 95% coverage floor and a build 
 fails on packaging warnings. Both example scripts are executed end to end so a broken
 demo cannot merge.
 
-For a three-minute live walkthrough (adopt, halt a runaway, verify the chain,
-catch unmetered spend) see [`docs/DEMO_RUNBOOK.md`](docs/DEMO_RUNBOOK.md) and
-run `uv run python examples/live_demo.py`. [`demo.tape`](demo.tape) renders that
+[`docs/DEMO_RUNBOOK.md`](docs/DEMO_RUNBOOK.md) walks the four commands end to
+end (adopt, halt a runaway, read the chain, catch unmetered spend); start with
+`uv run python examples/live_demo.py`. [`demo.tape`](demo.tape) renders that
 same walkthrough as a terminal recording with [VHS](https://github.com/charmbracelet/vhs)
 (`vhs demo.tape`), and [`examples/streamlit_dashboard.py`](examples/streamlit_dashboard.py)
 gives the resulting ledger a web UI (balance tree, hash chain, and a

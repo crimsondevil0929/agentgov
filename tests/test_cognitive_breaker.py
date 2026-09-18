@@ -1008,3 +1008,22 @@ def test_recorded_results_use_the_extracted_text() -> None:
                 breaker.record_result("agent", _Message(_Block(answer)))
     finally:
         breaker.close()
+
+
+# --------------------------------------------------------------------------
+# The calibrated constant has two homes and they have to agree
+# --------------------------------------------------------------------------
+
+
+def test_detector_default_result_threshold_matches_the_policy() -> None:
+    """NearDuplicateDetector is a documented extension point, so its own
+    default has to carry the calibrated value too.
+
+    README tells callers to pass ``detectors=[...]``. A caller that constructs
+    the detector directly bypasses CognitivePolicy, so a stale default here is
+    a detector that silently does not fire. The ``0.70`` this defaulted to
+    before detected 0/4 thrashing trajectories against live prose; see
+    ARCHITECTURE.md Part A and scripts/calibrate_result_threshold.py.
+    """
+    assert NearDuplicateDetector().result_threshold == CognitivePolicy().result_similarity_threshold
+    assert NearDuplicateDetector().result_threshold == 0.30

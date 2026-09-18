@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Denial-of-wallet benchmark: the same runaway agent, with and without a backstop.
 
-This is the validation step from CONCEPT.md, made reproducible. It runs one
-agent workload three times:
+Runs one agent workload three times:
 
   Scenario A - Ungoverned.  A runaway orchestrator spawns sub-agents and calls
     a model in an unbounded loop. Nothing can stop it. We record what it would

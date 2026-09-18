@@ -53,12 +53,12 @@ _CACHED_ALIASES = ("cached_prompt_tokens", "cache_read_input_tokens")
 
 @dataclass(frozen=True, slots=True)
 class CrewHalted:
-    """Returned in place of a result when a halted crew exits gracefully.
+    """Returned in place of a result when a halted crew exits without raising.
 
-    A circuit-breaker trip mid-crew is a governance decision, not a crash. When
-    :class:`GovernedCrew` is built with ``raise_on_halt=False`` it returns this
-    instead of propagating, so an orchestrator can record a failed task and
-    move on without unwinding the rest of the crew's state.
+    When :class:`GovernedCrew` is built with ``raise_on_halt=False``, a
+    breaker trip mid-crew returns this instead of propagating, so an
+    orchestrator can record a failed task and continue without unwinding the
+    rest of the crew's state.
 
     :ivar scope_id: The scope that was halted.
     :ivar reason: Why the breaker tripped.
