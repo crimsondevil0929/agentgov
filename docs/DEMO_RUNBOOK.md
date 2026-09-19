@@ -12,7 +12,7 @@ on which model is priced.
 
 ```bash
 uv sync                      # zero runtime dependencies
-uv run pytest -q             # 324 passed
+uv run pytest -q             # 338 passed
 rm -rf demo                  # the demo writes into ./demo; start clean
 ```
 

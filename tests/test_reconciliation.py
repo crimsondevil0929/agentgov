@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -585,3 +586,67 @@ def test_the_cli_reconciles_a_live_governor(tmp_path: Path) -> None:
         assert code == 0
     finally:
         live.close()
+
+
+# --------------------------------------------------------------------------
+# Dated snapshot identifiers
+# --------------------------------------------------------------------------
+
+
+def test_a_dated_invoice_line_matches_an_undated_ledger_line() -> None:
+    """The invoice names the model that served; the ledger names the alias.
+
+    A provider bills `claude-haiku-4-5-20251001` for a call the governor
+    metered as `claude-haiku-4-5`. Folding the dated suffix is what keeps the
+    two the same model, and without it a healthy invoice reads as every line
+    being a model mismatch.
+    """
+    local = replace(settled(1), model="claude-haiku-4-5")
+    invoice = replace(billed(1), model="claude-haiku-4-5-20251001")
+
+    report = reconcile([local], [invoice])
+
+    assert len(report.matched) == 1
+    assert not report.phantom
+    assert not report.unsettled
+
+
+def test_a_genuinely_different_model_is_still_a_mismatch() -> None:
+    """Folding the suffix must not fold two different models together."""
+    local = replace(settled(1), model="claude-haiku-4-5")
+    invoice = replace(billed(1), model="claude-opus-5-20260401")
+
+    report = reconcile([local], [invoice])
+
+    assert not report.matched
+    assert len(report.phantom) == 1
+    assert len(report.unsettled) == 1
+
+
+def test_cost_is_derived_for_a_dated_model_with_no_billed_total() -> None:
+    """An export with tokens and no cost has to find the rate card.
+
+    `_derive_cost` looks the model up in PRICING, which is keyed on undated
+    aliases, so a dated line silently derived nothing before.
+    """
+    rows = parse_openai_json(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "id": "req_dated",
+                        "timestamp": T0.isoformat(),
+                        "model": "claude-haiku-4-5-20251001",
+                        "input_tokens": 1000,
+                        "output_tokens": 500,
+                    }
+                ]
+            }
+        )
+    )
+
+    haiku = pricing_for("claude-haiku-4-5")
+    expected = haiku.cost_of(TokenUsage(input_tokens=1000, output_tokens=500))
+    assert len(rows) == 1
+    assert rows[0].total_cost == expected
+    assert rows[0].cost_was_derived is True

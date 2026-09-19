@@ -47,7 +47,7 @@ from typing import TypeVar
 
 from agentgov.core import BudgetManager, EntryType
 from agentgov.exceptions import AgentGovError
-from agentgov.interceptor import PRICING, MeteredCall, TokenUsage
+from agentgov.interceptor import PRICING, MeteredCall, TokenUsage, normalize_model_id
 
 __all__ = [
     "Discrepancy",
@@ -440,8 +440,16 @@ def _derive_cost(model: str, input_tokens: int, output_tokens: int) -> tuple[Dec
 
 
 def _normalise_model(model: str) -> str:
-    """Fold a provider's model string toward a rate-card identifier."""
-    return model.strip().lower()
+    """Fold a provider's model string toward a rate-card identifier.
+
+    Strips a trailing dated snapshot suffix as well as case and whitespace.
+    A provider invoice reports the model that served, which is the dated form
+    (``claude-haiku-4-5-20251001``); a ledger entry priced through an undated
+    alias records ``claude-haiku-4-5``. Without folding the suffix the two
+    never match, so every line of a healthy invoice reads as a model mismatch
+    and cost derivation for a dated line silently finds no rate at all.
+    """
+    return normalize_model_id(model)
 
 
 def _record_from_row(row: Mapping[str, object], index: int, source: str) -> ProviderUsageRecord:

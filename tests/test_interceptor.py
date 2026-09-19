@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from agentgov.interceptor import (
     ModelPricing,
     TokenUsage,
     default_usage_extractor,
+    normalize_model_id,
     pricing_for,
 )
 
@@ -330,3 +332,134 @@ def test_dummy_llm_is_deterministic() -> None:
     second = llm.complete("same prompt")
     assert first.usage == second.usage
     assert llm.complete("other").usage != first.usage
+
+
+# --------------------------------------------------------------------------
+# Pricing follows what served, not what was configured
+# --------------------------------------------------------------------------
+
+
+def test_normalize_model_id_strips_a_dated_snapshot_suffix() -> None:
+    assert normalize_model_id("claude-haiku-4-5-20251001") == "claude-haiku-4-5"
+    assert normalize_model_id("claude-opus-4-5-20251101") == "claude-opus-4-5"
+
+
+def test_normalize_model_id_leaves_an_undated_alias_alone() -> None:
+    """The version segment is not eight digits, so it must survive."""
+    for alias in ("claude-haiku-4-5", "claude-opus-5", "claude-sonnet-4-6"):
+        assert normalize_model_id(alias) == alias
+
+
+def test_normalize_model_id_folds_case_and_whitespace() -> None:
+    assert normalize_model_id("  Claude-Haiku-4-5-20251001 ") == "claude-haiku-4-5"
+
+
+def test_pricing_for_resolves_a_dated_snapshot() -> None:
+    """The API resolves an alias to a dated id and reports that back.
+
+    Without folding the suffix, pricing from response.model raises KeyError
+    for every dated model, and an unmetered model is an unmetered budget.
+    """
+    assert pricing_for("claude-haiku-4-5-20251001") is PRICING["claude-haiku-4-5"]
+
+
+def test_pricing_for_still_rejects_a_genuinely_unknown_model() -> None:
+    with pytest.raises(KeyError, match="no published pricing"):
+        pricing_for("some-other-vendor-model-20251001")
+
+
+def test_a_dated_response_is_priced_at_the_alias_rate(gov: BudgetManager) -> None:
+    """End to end: a response naming the dated snapshot settles correctly."""
+    metered = Interceptor(gov, "worker", model="claude-haiku-4-5")
+    usage = TokenUsage(input_tokens=1000, output_tokens=1000)
+    response = DummyResponse(text="x", usage=usage, model="claude-haiku-4-5-20251001")
+
+    call = metered.invoke(lambda: response)
+
+    assert call.model_id == "claude-haiku-4-5"
+    assert call.cost == PRICING["claude-haiku-4-5"].cost_of(usage)
+
+
+def test_a_server_side_fallback_is_priced_at_the_model_that_served(
+    gov: BudgetManager,
+) -> None:
+    """A refusal fallback substitutes a different model mid-request.
+
+    Nothing tells the governor, so pricing the configured model books a cost
+    the provider will never invoice. The two tiers here are priced differently
+    on purpose: at the configured rates this call costs 5x what it should.
+    """
+    metered = Interceptor(gov, "worker", model="claude-opus-5")
+    usage = TokenUsage(input_tokens=1000, output_tokens=1000)
+    response = DummyResponse(text="x", usage=usage, model="claude-haiku-4-5")
+
+    call = metered.invoke(lambda: response)
+
+    assert call.model_id == "claude-haiku-4-5"
+    assert call.cost == PRICING["claude-haiku-4-5"].cost_of(usage)
+    assert call.cost < PRICING["claude-opus-5"].cost_of(usage)
+    assert call.entry.amount == call.cost, "the ledger books what served"
+
+
+def test_an_explicit_pricing_override_wins_over_the_response(
+    gov: BudgetManager,
+) -> None:
+    """An explicit ModelPricing is for a platform the rate card does not cover.
+
+    Bedrock and Vertex bill differently while reporting a first-party model id,
+    so a caller who supplied rates must keep them.
+    """
+    bedrock = ModelPricing(
+        model_id="bedrock/claude-haiku-4-5",
+        input_usd_per_mtok=Decimal("2.00"),
+        output_usd_per_mtok=Decimal("10.00"),
+        cache_read_usd_per_mtok=Decimal("0.20"),
+        cache_write_usd_per_mtok=Decimal("2.50"),
+    )
+    metered = Interceptor(gov, "worker", model="claude-haiku-4-5", pricing=bedrock)
+    usage = TokenUsage(input_tokens=1000, output_tokens=1000)
+    response = DummyResponse(text="x", usage=usage, model="claude-haiku-4-5-20251001")
+
+    call = metered.invoke(lambda: response)
+
+    assert call.model_id == "bedrock/claude-haiku-4-5"
+    assert call.cost == bedrock.cost_of(usage)
+
+
+def test_an_unpriceable_served_model_falls_back_and_warns(
+    gov: BudgetManager, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A served model with no rate card must not fail a settled call."""
+    metered = Interceptor(gov, "worker", model="claude-haiku-4-5")
+    usage = TokenUsage(input_tokens=1000, output_tokens=1000)
+    response = DummyResponse(text="x", usage=usage, model="something-unlisted")
+
+    with caplog.at_level("WARNING", logger="agentgov.interceptor"):
+        call = metered.invoke(lambda: response)
+
+    assert call.model_id == "claude-haiku-4-5"
+    assert call.cost == PRICING["claude-haiku-4-5"].cost_of(usage)
+    assert "no published rates" in caplog.text
+
+
+def test_a_response_without_a_model_field_uses_the_configured_rates(
+    gov: BudgetManager,
+) -> None:
+    metered = Interceptor(gov, "worker", model="claude-haiku-4-5")
+    usage = TokenUsage(input_tokens=1000, output_tokens=1000)
+
+    call = metered.invoke(lambda: SimpleNamespace(usage=usage))
+
+    assert call.model_id == "claude-haiku-4-5"
+    assert call.cost == PRICING["claude-haiku-4-5"].cost_of(usage)
+
+
+def test_the_hold_is_still_sized_from_the_configured_model(gov: BudgetManager) -> None:
+    """The hold is placed before the call, so it cannot know what will serve.
+
+    Only settlement moves to the served model. Pinned so the asymmetry is a
+    decision rather than something discovered during an incident.
+    """
+    metered = Interceptor(gov, "worker", model="claude-opus-5")
+    assert metered.pricing.model_id == "claude-opus-5"
+    assert metered.hold_amount > 0

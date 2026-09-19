@@ -26,6 +26,7 @@ it, and every rate is a :class:`~decimal.Decimal`.
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -290,8 +291,34 @@ reconciliation against the vendor invoice as a production requirement.
 """
 
 
+_DATED_SNAPSHOT = re.compile(r"-\d{8}$")
+
+
+def normalize_model_id(model_id: str) -> str:
+    """Fold a dated snapshot identifier onto the alias :data:`PRICING` is keyed on.
+
+    The API resolves an undated alias to a dated snapshot and reports that in
+    ``response.model``: a request for ``claude-haiku-4-5`` comes back as
+    ``claude-haiku-4-5-20251001``. Provider invoices report the dated form too.
+    Pricing or reconciling against what actually served therefore has to fold
+    the suffix off first, or every dated identifier misses the rate card.
+
+    Only a trailing ``-YYYYMMDD`` is stripped. A version segment that is part
+    of the model's name (``claude-haiku-4-5``) is left alone, because it is not
+    eight digits.
+
+    :param model_id: A vendor model identifier, dated or not.
+    :returns: The identifier with any dated snapshot suffix removed, trimmed
+        and lowercased.
+    """
+    return _DATED_SNAPSHOT.sub("", model_id.strip().lower())
+
+
 def pricing_for(model_id: str) -> ModelPricing:
     """Look up the published rates for ``model_id``.
+
+    Tries the identifier as given, then its :func:`normalize_model_id` form, so
+    a dated snapshot resolves to the alias it was served from.
 
     :param model_id: The vendor model identifier.
     :returns: The matching :class:`ModelPricing`.
@@ -299,14 +326,15 @@ def pricing_for(model_id: str) -> ModelPricing:
         :class:`ModelPricing` explicitly rather than guessing a rate — an
         unmetered model is an unmetered budget.
     """
-    try:
-        return PRICING[model_id]
-    except KeyError:
-        known = ", ".join(sorted(PRICING))
-        raise KeyError(
-            f"no published pricing for {model_id!r}; pass an explicit "
-            f"ModelPricing. Known models: {known}"
-        ) from None
+    for candidate in (model_id, normalize_model_id(model_id)):
+        found = PRICING.get(candidate)
+        if found is not None:
+            return found
+    known = ", ".join(sorted(PRICING))
+    raise KeyError(
+        f"no published pricing for {model_id!r}; pass an explicit "
+        f"ModelPricing. Known models: {known}"
+    ) from None
 
 
 # --------------------------------------------------------------------------
@@ -392,6 +420,11 @@ class MeteredCall(Generic[R]):
     :ivar hold: The amount that was authorized before the call.
     :ivar scope_id: The scope that was charged.
     :ivar model_id: The pricing model applied.
+    :ivar model_id: The model the call was priced against. Read from
+        ``response.model`` when the response reports one and its rates are
+        known, so a server-side fallback or an alias resolving to a dated
+        snapshot is priced at what actually served rather than at what was
+        requested. Falls back to the interceptor's configured model.
     :ivar entry: The committed ledger entry, for audit correlation.
     :ivar latency_seconds: Wall-clock duration of the wrapped call alone,
         excluding governor overhead.
@@ -581,6 +614,7 @@ class Interceptor:
         "_manager",
         "_max_output_tokens",
         "_pricing",
+        "_pricing_is_explicit",
         "_safety_buffer",
         "_scope_id",
         "_trajectory",
@@ -612,6 +646,11 @@ class Interceptor:
         self._manager = manager
         self._scope_id = scope_id
         self._pricing = pricing if pricing is not None else pricing_for(model)
+        # An explicit ModelPricing is an operator override for a model or
+        # platform the rate card does not cover, so it wins over whatever the
+        # response says served. A derived one does not: there the response is
+        # the better source.
+        self._pricing_is_explicit = pricing is not None
         self._max_output_tokens = max_output_tokens
         self._estimated_input_tokens = estimated_input_tokens
         self._extract_usage = extract_usage
@@ -834,10 +873,10 @@ class Interceptor:
             started = time.perf_counter()
             response = fn(*args, **kwargs)
             latency = time.perf_counter() - started
-            usage, cost = self._price(response)
+            usage, cost, applied = self._price(response)
             guard.settle(cost)
         self._record_cognitive_result(response)
-        return self._result(response, usage, cost, hold, guard, latency)
+        return self._result(response, usage, cost, hold, guard, latency, applied)
 
     async def ainvoke(
         self,
@@ -865,10 +904,10 @@ class Interceptor:
             started = time.perf_counter()
             response = await fn(*args, **kwargs)
             latency = time.perf_counter() - started
-            usage, cost = self._price(response)
+            usage, cost, applied = self._price(response)
             guard.settle(cost)
         self._record_cognitive_result(response)
-        return self._result(response, usage, cost, hold, guard, latency)
+        return self._result(response, usage, cost, hold, guard, latency, applied)
 
     def stream(
         self,
@@ -889,6 +928,14 @@ class Interceptor:
 
         The hold is resolved on every path out of that block — clean
         exhaustion, ``break``, exception, or timeout.
+
+        **Streamed calls settle at the configured model, not the served one.**
+        :meth:`invoke` reads ``response.model`` and prices what actually ran
+        (see :meth:`pricing_for_response`); a stream has no single response
+        object to read it from, so it keeps the configured rates. A server-side
+        fallback inside a stream is therefore mispriced, and nothing says so.
+        Reconciliation against the provider invoice is the backstop until a
+        stream reports its served model.
 
         :param fn: The provider's streaming entry point.
         :param args: Positional arguments forwarded to ``fn``.
@@ -966,10 +1013,47 @@ class Interceptor:
             return
         self._cognitive.record_result(self._scope_id, response, trajectory=self._trajectory)
 
-    def _price(self, response: object) -> tuple[TokenUsage, Decimal]:
-        """Extract usage from a response and price it."""
+    def pricing_for_response(self, response: object) -> ModelPricing:
+        """The rates to settle this response at.
+
+        The hold is sized before the call, so it can only use the configured
+        model. Settlement happens after, when ``response.model`` says which
+        model actually ran — which is not always the one that was asked for. A
+        server-side refusal fallback substitutes a different model, and an
+        undated alias resolves to a dated snapshot. Pricing the configured
+        model in either case books a cost the provider will not invoice.
+
+        Falls back to the configured rates when the response names no model,
+        names one with no published rates, or when an explicit
+        :class:`ModelPricing` was supplied.
+
+        :param response: The wrapped call's return value.
+        :returns: The rates to apply.
+        """
+        if self._pricing_is_explicit:
+            return self._pricing
+        served = getattr(response, "model", None)
+        if not isinstance(served, str) or not served.strip():
+            return self._pricing
+        try:
+            return pricing_for(served)
+        except KeyError:
+            # An unknown served model is louder than a silently wrong number,
+            # but it is not worth failing a settled call over: fall back to the
+            # configured rates and say so.
+            logger.warning(
+                "response reported model %r, which has no published rates; "
+                "pricing at the configured %r instead",
+                served,
+                self._pricing.model_id,
+            )
+            return self._pricing
+
+    def _price(self, response: object) -> tuple[TokenUsage, Decimal, ModelPricing]:
+        """Extract usage from a response and price it at what served."""
         usage = self._extract_usage(response)
-        return usage, self._pricing.cost_of(usage)
+        pricing = self.pricing_for_response(response)
+        return usage, pricing.cost_of(usage), pricing
 
     def _result(
         self,
@@ -979,15 +1063,17 @@ class Interceptor:
         hold: Decimal,
         guard: SpendGuard,
         latency: float,
+        pricing: ModelPricing | None = None,
     ) -> MeteredCall[R]:
         """Assemble the metered result once the guard has settled."""
         entry = guard.entry
         if entry is None:  # pragma: no cover - the guard always settles here
             raise RuntimeError("spend guard exited without settling")
+        applied = pricing if pricing is not None else self._pricing
         logger.info(
             "metered call scope=%s model=%s tokens=%d cost=%s hold=%s latency=%.4fs txn=%s",
             self._scope_id,
-            self._pricing.model_id,
+            applied.model_id,
             usage.total_tokens,
             cost,
             hold,
@@ -1000,7 +1086,7 @@ class Interceptor:
             cost=cost,
             hold=hold,
             scope_id=self._scope_id,
-            model_id=self._pricing.model_id,
+            model_id=applied.model_id,
             entry=entry,
             latency_seconds=latency,
         )

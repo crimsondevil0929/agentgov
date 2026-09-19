@@ -96,6 +96,7 @@ from agentgov.interceptor import (
     default_usage_extractor,
     estimate_tokens,
     extract_prompt_text,
+    normalize_model_id,
     pricing_for,
 )
 from agentgov.proxy import GovernedClient, GovernorHandle, govern
@@ -179,6 +180,7 @@ __all__ = [
     "govern",
     "load_provider_export",
     "money",
+    "normalize_model_id",
     "pricing_for",
     "reconcile",
 ]

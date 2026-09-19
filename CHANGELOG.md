@@ -10,6 +10,36 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ### Fixed
 
+- **Dated snapshot identifiers no longer miss the rate card.** The API resolves
+  an undated alias to a dated snapshot and reports it back: a request for
+  `claude-haiku-4-5` returns `claude-haiku-4-5-20251001`. `PRICING` is keyed
+  only on undated aliases, so `pricing_for(response.model)` raised `KeyError`
+  for every dated model, and `agentgov.interceptor` documents that an unmetered
+  model is an unmetered budget. New `normalize_model_id()` folds a trailing
+  `-YYYYMMDD`; `pricing_for()` tries the identifier as given and then folded.
+  The same fold now runs in `reconciliation._normalise_model`, where a provider
+  invoice reporting the dated form previously failed to match a ledger entry
+  recording the alias, making every line of a healthy invoice read as a model
+  mismatch and silently deriving no cost at all for a dated line.
+
+- **Settlement prices the model that served, not the one configured.**
+  `Interceptor` fixed its rates at construction from the `model` parameter. A
+  server-side refusal fallback substitutes a different model mid-request and
+  tells the caller only through `response.model`, so the ledger booked a cost
+  the provider will never invoice — silently, and in the dangerous direction
+  when the fallback is a cheaper tier. `invoke()` and `ainvoke()` now settle
+  through `Interceptor.pricing_for_response()`, and `MeteredCall.model_id`
+  reports what served. Three carve-outs, each deliberate and tested: an
+  explicit `ModelPricing` still wins, because it is an operator override for a
+  platform the rate card does not cover; a served model with no published rates
+  logs a warning and falls back rather than failing a settled call; and the
+  hold is still sized from the configured model, because it is placed before
+  the call and cannot know what will serve. Streamed calls keep the configured
+  rates — a stream has no single response object to read the served model from,
+  and `Interceptor.stream()` says so.
+
+### Fixed
+
 - **`NearDuplicateDetector.result_threshold` default, 0.70 → 0.30.** The
   recalibration below changed `CognitivePolicy.result_similarity_threshold` and
   left the detector's own default at the stub-tuned `0.70`. `CognitiveBreaker`

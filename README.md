@@ -3,7 +3,7 @@
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
 [![CI](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml/badge.svg)](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-324%2F324%20passing-brightgreen)](#code-quality--packaging)
+[![tests](https://img.shields.io/badge/tests-338%2F338%20passing-brightgreen)](#code-quality--packaging)
 [![coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)](#code-quality--packaging)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
@@ -591,6 +591,15 @@ Vertex) bill differently. Pass an explicit `ModelPricing` for anything not in th
 and treat reconciliation against the real invoice as a production requirement rather than
 a nicety. That is precisely why the reconciliation engine exists.
 
+**Settlement follows the model that served.** The provider can run a different model than
+the one requested — a server-side refusal fallback substitutes one mid-request, and an
+undated alias resolves to a dated snapshot (`claude-haiku-4-5` → `claude-haiku-4-5-20251001`).
+`invoke()` reads `response.model`, folds any dated suffix with `normalize_model_id()`, and
+settles at those rates, so the ledger books what will actually be invoiced.
+`MeteredCall.model_id` reports what served. Two gaps remain: the **hold** is sized before
+the call and can only use the configured model, and **streamed** calls keep the configured
+rates because a stream has no single response object to read the served model from.
+
 ### What has been proven deterministically, and what has been proven live
 
 These are different claims and this project keeps them separate.
@@ -639,7 +648,7 @@ SQLite file, with financial and cognitive breakers on the same actuator. Beyond 
 
 ```bash
 uv sync                              # install (zero runtime dependencies)
-uv run pytest -v                     # 324 passed
+uv run pytest -v                     # 338 passed
 uv run pytest --cov=agentgov         # 96% coverage
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/                     # strict, zero errors
