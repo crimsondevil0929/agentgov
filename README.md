@@ -195,6 +195,7 @@ repository content).
 Wrap an existing model call and give a sub-agent tree its own budget in a handful
 of lines:
 
+<!-- readme-test: skip reason="calls a live model provider; the runnable version is directly below" -->
 ```python
 from agentgov import BudgetManager, Interceptor, money
 
@@ -208,10 +209,28 @@ result = metered.invoke(client.messages.create, model="claude-opus-5", messages=
 print(result.cost, gov.available("researcher"))  # exact settled cost, remaining budget
 ```
 
-That's it: `invoke()` authorizes a worst-case hold, runs your call with no lock held,
-prices the model's real token usage, and settles atomically. Let it run past budget and
+Run it now, with no API key, by metering anything that reports token usage:
+
+```python
+from agentgov import BudgetManager, Interceptor, money
+
+gov = BudgetManager()
+gov.open_root("orchestrator", money("5.00"))
+gov.delegate("orchestrator", "researcher", money("1.00"))
+
+metered = Interceptor(gov, "researcher", model="claude-opus-5")
+result = metered.invoke(lambda **_: {"input_tokens": 1200, "output_tokens": 350})
+
+print(result.cost, gov.available("researcher"))
+# 0.01475000 0.98525000
+```
+
+The accounting is the same on either path: `invoke()` authorizes a worst-case
+hold, runs your call with no lock held, prices the token usage it reports, and
+settles atomically. Let it run past budget and
 you get `DenialOfWalletError`, not a silent overspend:
 
+<!-- readme-test: skip reason="calls a live model provider" -->
 ```python
 from agentgov.exceptions import CircuitOpenError, DenialOfWalletError
 
@@ -234,6 +253,7 @@ The financial breaker is reactive by construction: it fires when the money is go
 cognitive breaker attacks the cause: the open-loop execution cycle that spends it.
 Attach one and every call is checked for thrashing *before* its hold is placed:
 
+<!-- readme-test: skip reason="calls a live model provider" -->
 ```python
 from agentgov import BudgetManager, CognitiveBreaker, Interceptor, money
 
@@ -304,7 +324,12 @@ is [pinned by a test](tests/test_cognitive_breaker.py), along with its remedy:
 existing codebase means editing every call site, so there is a wrapper that
 governs the calls already written:
 
+<!-- readme-test: skip reason="calls a live model provider" -->
 ```python
+import anthropic
+
+from agentgov import govern
+
 client = govern(anthropic.Anthropic(), gov, "researcher", model="claude-opus-5")
 
 response = client.messages.create(model="claude-opus-5", messages=[...])  # unchanged
@@ -317,6 +342,7 @@ sugar over `client.agentgov.interceptor`, which hands the primitive back.
 
 **Streaming**, the shape most real agents use, is governed as a context manager:
 
+<!-- readme-test: skip reason="calls a live model provider" -->
 ```python
 with client.messages.stream(model="claude-opus-5", messages=[...]) as events:
     for event in events:
@@ -342,12 +368,65 @@ own `max_tokens`, and a configurable `safety_buffer` (1.5x by default)
 absorbs the heuristic's error. Unrecognised payloads fall back to the static
 ceiling rather than under-reserving.
 
+### When the cost is only known part-way through
+
+`invoke()` covers a call that returns once. When the cost emerges as you
+consume something — a stream you must settle whatever it produced before
+re-raising, or a vendor call that reports usage out of band — `SpendGuard` is
+the same authorize/settle pair as a context manager:
+
+```python
+from decimal import Decimal
+
+from agentgov import BudgetManager, SpendGuard, money
+
+gov = BudgetManager()
+gov.open_root("researcher", money("5.00"))
+
+with SpendGuard(gov, "researcher", money("0.25"), memo="batch") as guard:
+    consumed = sum(len(chunk) for chunk in ["alpha", "beta", "gamma"])
+    guard.settle(Decimal(consumed) / 1000)
+
+print(guard.cost, gov.available("researcher"))
+# 0.013 4.987
+```
+
+The hold is placed on entry and resolved on every path out, including an
+exception: an abandoned block never strands funds. Settling twice raises
+rather than double-booking.
+
+### Verifying a ledger
+
+Three checks, all on the manager:
+
+```python
+from agentgov import BudgetManager, money
+
+gov = BudgetManager()
+gov.open_root("orchestrator", money("5.00"))
+gov.delegate("orchestrator", "researcher", money("1.00"))
+
+gov.verify_chain()  # re-derives every SHA-256 link
+gov.verify_conservation()  # no money created, destroyed or double-counted
+gov.verify_integrity()  # both of the above, plus the delegation topology
+print("ok")
+```
+
+`verify_conservation()` checks
+
+```
+Σ(scope balances) + outstanding_holds + settled_spend − reversals == funded
+```
+
+across every scope in the tree.
+
 ## Framework adapters
 
 Two lines on an agent you have already written. Neither adapter imports its
 framework. Every object is duck-typed, so they load without LangChain or
 CrewAI installed and keep working when those libraries reshuffle internals.
 
+<!-- readme-test: skip reason="needs langchain installed; agentgov does not depend on it" -->
 ```python
 from agentgov.adapters.langchain import GovernedChatModel
 
@@ -360,6 +439,7 @@ object, use the callback handler instead. Callbacks propagate down the whole
 run tree, so one handler governs every model call in a graph, keyed by
 `run_id` so concurrent branches settle independently:
 
+<!-- readme-test: skip reason="needs langgraph installed; agentgov does not depend on it" -->
 ```python
 from agentgov.adapters.langchain import GovernedCallbackHandler
 
@@ -368,6 +448,7 @@ graph.invoke(state, config={"callbacks": [GovernedCallbackHandler(gov, "research
 
 **CrewAI** settles per run, because CrewAI reports usage per run:
 
+<!-- readme-test: skip reason="needs crewai installed; agentgov does not depend on it" -->
 ```python
 from agentgov.adapters.crewai import GovernedCrew
 
@@ -450,6 +531,8 @@ An in-memory ledger is not an audit trail: restart the process and it is gone. S
 atomic transaction, before it ever touches memory:
 
 ```python
+from agentgov import BudgetManager, money
+
 with BudgetManager.open_sqlite("governor.db") as gov:
     gov.open_root("orchestrator", money("5.00"))
     ...  # identical API; every write is durable before it's visible in memory
@@ -494,6 +577,7 @@ descriptor, so the kernel releases it even on `SIGKILL`: a crashed governor leav
 stale file but never a stale lock, and there is no timeout heuristic to get wrong. To
 inspect a ledger another process is governing, open it read-only:
 
+<!-- readme-test: continue -->
 ```python
 audit = BudgetManager.open_sqlite("governor.db", read_only=True)
 audit.verify_integrity()  # reads and verifies; every write is refused
@@ -594,7 +678,8 @@ a nicety. That is precisely why the reconciliation engine exists.
 **Settlement follows the model that served.** The provider can run a different model than
 the one requested — a server-side refusal fallback substitutes one mid-request, and an
 undated alias resolves to a dated snapshot (`claude-haiku-4-5` → `claude-haiku-4-5-20251001`).
-`invoke()` reads `response.model`, folds any dated suffix with `normalize_model_id()`, and
+`invoke()` reads `response.model`, folds any dated suffix with `normalize_model_id()`
+(exported from the package, so a caller pricing its own calls folds the same way), and
 settles at those rates, so the ledger books what will actually be invoiced.
 `MeteredCall.model_id` reports what served. Two gaps remain: the **hold** is sized before
 the call and can only use the configured model, and **streamed** calls keep the configured

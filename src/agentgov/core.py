@@ -1816,6 +1816,37 @@ class BudgetManager:
 
     # -- verification -----------------------------------------------------
 
+    def verify_chain(self) -> None:
+        """Re-derive the ledger's SHA-256 hash chain.
+
+        A pass-through to :meth:`Ledger.verify_chain`. It lives here because
+        the README names ``verify_chain()`` alongside ``verify_integrity()``
+        and a reader has no reason to guess that one is on the manager and the
+        other is a level down on ``manager.ledger``.
+
+        :raises LedgerIntegrityError: If any entry's hash does not re-derive,
+            or the chain's links do not match.
+        """
+        with self._lock:
+            self._ledger.verify_chain()
+
+    def verify_conservation(self) -> None:
+        """Check that no money was created, destroyed, or double-counted.
+
+        A pass-through to :meth:`Ledger.verify_conservation`, verifying::
+
+            sum(scope balances) + outstanding_holds + settled_spend
+                - reversals == funded
+
+        Narrower than :meth:`verify_integrity`, which also re-derives the hash
+        chain and the delegation topology. Use this when you want the
+        accounting identity on its own.
+
+        :raises LedgerIntegrityError: If the identity does not hold.
+        """
+        with self._lock:
+            self._ledger.verify_conservation()
+
     def verify_integrity(self) -> None:
         """Run every invariant check over the ledger and the budget tree.
 

@@ -48,6 +48,7 @@ from agentgov.cognitive import (
     TrajectoryEntropyObserver,
     Verdict,
     canonical_arguments,
+    extract_result_text,
 )
 from agentgov.core import (
     Authorization,
@@ -176,6 +177,7 @@ __all__ = [
     "default_usage_extractor",
     "estimate_tokens",
     "extract_prompt_text",
+    "extract_result_text",
     "format_audit_line",
     "govern",
     "load_provider_export",
@@ -185,4 +187,4 @@ __all__ = [
     "reconcile",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

@@ -8,6 +8,22 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-20
+
+Cut so that the two fixes below are available under a version number. They
+were correct on `main` and unreleased, which meant a resolver keyed on
+`agentgov==0.1.0` could serve a cached wheel built before them while the
+README described them in the present tense. A version that does not move when
+behaviour does is a supply-chain defect, not a formality.
+
+### Added
+
+- **`BudgetManager.verify_conservation()` and `BudgetManager.verify_chain()`.**
+  Both were reachable only as `manager.ledger.verify_conservation()`, while the
+  README named them beside `verify_integrity()` as if all three sat on the
+  manager. A reader had no way to know that two of the three were a level down.
+  Thin pass-throughs, each taking the manager's lock.
+
 ### Fixed
 
 - **Dated snapshot identifiers no longer miss the rate card.** The API resolves

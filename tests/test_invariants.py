@@ -193,3 +193,44 @@ def test_raw_ledger_lines_still_validate(gov: BudgetManager) -> None:
     with pytest.raises(ValueError, match="may not be a"):
         gov.ledger.post([LedgerLine(EntryType.HOLD, Direction.CREDIT, "child", money("0.01"))])
     gov.verify_integrity()
+
+
+# -- verification is reachable from the manager -----------------------------
+
+
+def test_manager_exposes_chain_and_conservation_checks(gov: BudgetManager) -> None:
+    """The README names all three beside each other, so all three live here.
+
+    ``verify_chain`` and ``verify_conservation`` were previously reachable only
+    as ``manager.ledger.*``, which no reader of the README had reason to guess.
+    """
+    gov.open_root("orchestrator", money("5.00"))
+    gov.delegate("orchestrator", "researcher", money("1.00"))
+    gov.capture(gov.authorize("researcher", money("0.10")), money("0.04"))
+
+    gov.verify_chain()
+    gov.verify_conservation()
+    gov.verify_integrity()
+
+
+def test_manager_conservation_check_catches_a_tampered_ledger(gov: BudgetManager) -> None:
+    """A pass-through that never fails is not a check."""
+    gov.open_root("orchestrator", money("5.00"))
+    # Conservation reads the balance cache, not the entry list: it is the check
+    # that catches a balance which no longer follows from the funding.
+    gov.ledger._balances["orchestrator"] = money("9999.00")
+
+    with pytest.raises(LedgerIntegrityError, match="conservation violated"):
+        gov.verify_conservation()
+
+
+def test_manager_chain_check_catches_a_tampered_ledger(gov: BudgetManager) -> None:
+    import dataclasses
+
+    gov.open_root("orchestrator", money("5.00"))
+    gov.delegate("orchestrator", "researcher", money("1.00"))
+    ledger = gov.ledger
+    ledger._entries[1] = dataclasses.replace(ledger._entries[1], memo="edited")
+
+    with pytest.raises(LedgerIntegrityError):
+        gov.verify_chain()
