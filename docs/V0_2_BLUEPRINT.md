@@ -201,14 +201,14 @@ from it. An agent receiving *the feasible region plus a minimal repair* can.
 class RefusalReflection:
     plan_id: PlanId
     stage_id: uuid.UUID
-    diff_hash: str                          # what was measured
-    chain_head: str                         # tamper-evident provenance
-    policy_epoch: str                       # which thresholds decided this (§3.2)
-    measured: MeasurementSummary            # what the substrate actually did
-    stated: StatedSummary                   # what the agent claimed
-    constraints: tuple[Constraint, ...]     # the feasible region, declarative
-    counterfactuals: tuple[Counterfactual, ...]   # minimal repairs
-    replan_grant: Decimal                   # what you may spend trying again
+    diff_hash: str  # what was measured
+    chain_head: str  # tamper-evident provenance
+    policy_epoch: str  # which thresholds decided this (§3.2)
+    measured: MeasurementSummary  # what the substrate actually did
+    stated: StatedSummary  # what the agent claimed
+    constraints: tuple[Constraint, ...]  # the feasible region, declarative
+    counterfactuals: tuple[Counterfactual, ...]  # minimal repairs
+    replan_grant: Decimal  # what you may spend trying again
 ```
 
 **Constraints are declarative, not prose.** `InvariantChecker` gains an
@@ -216,16 +216,32 @@ optional `describe() -> tuple[Constraint, ...]`; checkers that do not implement
 it degrade to message-only, so this is backward-compatible.
 
 ```python
-Constraint(invariant="blast_radius", kind=UPPER_BOUND,
-           metric="mutations", limit=6, observed=12, scope="plan")
+Constraint(
+    invariant="blast_radius",
+    kind=UPPER_BOUND,
+    metric="mutations",
+    limit=6,
+    observed=12,
+    scope="plan",
+)
 
-Constraint(invariant="tenant_isolation", kind=SET_CARDINALITY,
-           metric="tenants", limit=1, observed=4,
-           members=("acme-pay", "globex", "initech", "northwind"))
+Constraint(
+    invariant="tenant_isolation",
+    kind=SET_CARDINALITY,
+    metric="tenants",
+    limit=1,
+    observed=4,
+    members=("acme-pay", "globex", "initech", "northwind"),
+)
 
-Constraint(invariant="tenant_drawdown_guard", kind=RATIO_FLOOR,
-           metric="accounts.balance_cents", limit="-0.30",
-           observed="-0.998", group="acme-pay")
+Constraint(
+    invariant="tenant_drawdown_guard",
+    kind=RATIO_FLOOR,
+    metric="accounts.balance_cents",
+    limit="-0.30",
+    observed="-0.998",
+    group="acme-pay",
+)
 ```
 
 That is a constraint system an agent can solve against, not a log line.
@@ -304,14 +320,15 @@ Three invariants preserve the v0.1 guarantee:
    execution channel — the precise thing interlock exists to prevent.
 
 ```python
-with runtime.stage(plan) as stage:            # opens; does not commit
+with runtime.stage(plan) as stage:  # opens; does not commit
     for candidate in hypotheses:
-        with stage.branch() as b:             # SAVEPOINT
+        with stage.branch() as b:  # SAVEPOINT
             b.apply(candidate)
-            preview = b.measure()             # real diff, advisory verdict
+            preview = b.measure()  # real diff, advisory verdict
             if preview.admissible:
-                b.promote(); break
-    result = stage.commit()                   # one adjudication, then commit
+                b.promote()
+                break
+    result = stage.commit()  # one adjudication, then commit
 ```
 
 **Honest cost:** a stage holds write locks for its whole life, and branches
@@ -341,11 +358,11 @@ boundaries as versioned artifacts.
 @dataclass(frozen=True)
 class PolicyEpoch:
     epoch: int
-    parent_hash: str                      # hash-chained, like everything else
-    thresholds: Mapping[str, str]         # checker name -> serialised parameter
-    derived_from: EvidenceRef             # corpus, model, run id, sample size
-    proposer: str                         # "drift-detector:v3" | "operator:alice"
-    approved_by: str | None               # required for loosening (see below)
+    parent_hash: str  # hash-chained, like everything else
+    thresholds: Mapping[str, str]  # checker name -> serialised parameter
+    derived_from: EvidenceRef  # corpus, model, run id, sample size
+    proposer: str  # "drift-detector:v3" | "operator:alice"
+    approved_by: str | None  # required for loosening (see below)
     activated_at: datetime
     epoch_hash: str
 ```
