@@ -8,6 +8,15 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A file that is not a SQLite database crashed `agentgov verify` and
+  `agentgov inspect` with a traceback.** SQLite reports it as
+  `sqlite3.DatabaseError`, the parent of the `OperationalError` the store
+  caught. Opening one now raises `StorageError` naming the file, so the
+  commands report it and exit 1. A failed writable open now also closes its
+  connection.
+
 ## [0.1.2] - 2026-09-25
 
 Makes four of v0.1.1's guarantees true. Each was broken in a way that every
