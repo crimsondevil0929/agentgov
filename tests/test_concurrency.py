@@ -352,6 +352,14 @@ def test_stress_64_workers_with_holds_across_a_simulated_call() -> None:
 
     Each worker holds funds, "calls the model", then settles for less. A
     governor that only debited at settlement would let all 64 through.
+
+    The property is read from the chain, not from the scheduler. How many
+    workers win depends on timing: a straggler that reaches ``authorize``
+    after two winners have settled finds their unused headroom returned and
+    legitimately wins too. What must never happen, however the threads
+    interleave, is more than ten holds open at once — so that is what this
+    asserts, by replaying every HOLD and its release in chain order. (It used
+    to assert exactly ten winners, which a loaded machine could falsify.)
     """
     hold = money("0.05")
     settle = money("0.01")
@@ -375,10 +383,20 @@ def test_stress_64_workers_with_holds_across_a_simulated_call() -> None:
     with ThreadPoolExecutor(max_workers=workers) as pool:
         wins = sum(pool.map(attempt, range(workers)))
 
+    open_now = peak = 0
+    for entry in gov.audit_trail("root"):
+        if entry.entry_type is EntryType.HOLD:
+            open_now += 1
+            peak = max(peak, open_now)
+        elif entry.entry_type is EntryType.HOLD_VOID:
+            open_now -= 1
+
     count, total, lowest = audit_spend(gov, "root")
-    assert wins == concurrent_capacity, "holds bounded concurrency, not settlement"
+    assert 0 < peak <= concurrent_capacity, "holds bounded concurrency, not settlement"
+    assert open_now == 0, "every hold was released"
+    assert wins >= concurrent_capacity, "the first ten always fit"
     assert count == wins
-    assert total == settle * concurrent_capacity
+    assert total == settle * wins
     assert lowest >= ZERO
     # Unused hold headroom came back once every call settled.
     assert gov.available("root") == hold * concurrent_capacity - total

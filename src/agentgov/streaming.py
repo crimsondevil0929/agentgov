@@ -22,6 +22,13 @@ was actually observed, and void only when nothing was observed at all — a
 connection that died before its first event. Either way the encumbrance is
 always released, so funds are never stranded.
 
+**A stream is observed like any other call.** With a cognitive breaker
+attached, the stream is fingerprinted from the request it was opened with
+(the same tool name, arguments and trajectory :meth:`Interceptor.invoke`
+uses) before its hold is placed, and the text it produced is fed back as
+the result, so near-identical prompts that return different answers read
+as progress rather than a loop.
+
 The stream must be used as a context manager. A stream that is entered and
 then dropped without exiting leaves a hold that
 :meth:`~agentgov.core.BudgetManager.void_stale` will reap, and logs a warning
@@ -33,6 +40,7 @@ from __future__ import annotations
 import logging
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from types import TracebackType
 from typing import TYPE_CHECKING, Generic, TypeVar
@@ -46,7 +54,7 @@ if TYPE_CHECKING:
 if TYPE_CHECKING:
     _StreamFinalizer = weakref.finalize[[str, object], "_StreamCore"]
 
-__all__ = ["AsyncMeteredStream", "MeteredStream"]
+__all__ = ["AsyncMeteredStream", "BoundCall", "MeteredStream"]
 
 logger = logging.getLogger("agentgov.streaming")
 
@@ -65,6 +73,46 @@ def _try_usage(extract: UsageExtractor, chunk: object) -> TokenUsage | None:
         return None
 
 
+_MAX_RESULT_CHARS = 65536
+"""Streamed text kept for the cognitive breaker's result comparison. It
+samples from both ends of what it is given, so a bound here loses nothing it
+would have compared."""
+
+
+def _delta_text(chunk: object) -> str | None:
+    """The text a streamed event adds, when it is a text delta.
+
+    Duck-typed across the Anthropic event shape (``event.delta.text``) and its
+    mapping form, with no SDK import. Anything else adds nothing.
+    """
+    delta = chunk.get("delta") if isinstance(chunk, Mapping) else getattr(chunk, "delta", None)
+    text = delta.get("text") if isinstance(delta, Mapping) else getattr(delta, "text", None)
+    return text if isinstance(text, str) else None
+
+
+@dataclass(frozen=True, slots=True)
+class BoundCall:
+    """A provider call, bound to its arguments and opened later.
+
+    Opening the stream has to happen *after* the hold is placed, so the call
+    is deferred. It stays inspectable, because the cognitive breaker
+    fingerprints a stream by what it was asked, exactly as it fingerprints a
+    call made through :meth:`~agentgov.interceptor.Interceptor.invoke`.
+    """
+
+    fn: Callable[..., object]
+    args: tuple[object, ...]
+    kwargs: Mapping[str, object]
+
+    @property
+    def tool(self) -> str:
+        """The name the breaker records the call under."""
+        return getattr(self.fn, "__name__", type(self.fn).__name__)
+
+    def __call__(self) -> object:
+        return self.fn(*self.args, **self.kwargs)
+
+
 class _StreamCore:
     """Lifecycle shared by the sync and async stream wrappers.
 
@@ -76,9 +124,11 @@ class _StreamCore:
         # weakref.finalize needs this; a slotted class does not get it free.
         "__weakref__",
         "_auth",
+        "_call",
         "_cognitive",
         "_entry",
         "_extract",
+        "_final",
         "_finalizer",
         "_hold",
         "_manager",
@@ -87,6 +137,8 @@ class _StreamCore:
         "_resolved",
         "_scope_id",
         "_settled",
+        "_text",
+        "_text_chars",
         "_trajectory",
         "_usage",
         "chunks",
@@ -103,6 +155,7 @@ class _StreamCore:
         memo: str = "",
         cognitive: CognitiveBreaker | None = None,
         trajectory: str | None = None,
+        call: object = None,
     ) -> None:
         self._manager = manager
         self._scope_id = scope_id
@@ -112,12 +165,16 @@ class _StreamCore:
         self._memo = memo or "settled streamed call"
         self._cognitive = cognitive
         self._trajectory = trajectory
+        self._call = call if isinstance(call, BoundCall) else None
         self._auth: Authorization | None = None
         self._entry: LedgerEntry | None = None
         self._usage = TokenUsage()
         self._settled: Decimal | None = None
         self._resolved = False
         self._finalizer: _StreamFinalizer | None = None
+        self._final: object = None
+        self._text: list[str] = []
+        self._text_chars = 0
         self.chunks = 0
 
     # -- observation ------------------------------------------------------
@@ -158,11 +215,16 @@ class _StreamCore:
         self._usage = self._usage.merged(usage)
 
     def absorb(self, chunk: object) -> None:
-        """Fold one event's usage into the running total."""
+        """Fold one event's usage, and any text it adds, into the running totals."""
         self.chunks += 1
         found = _try_usage(self._extract, chunk)
         if found is not None:
             self._usage = self._usage.merged(found)
+        if self._cognitive is not None and self._text_chars < _MAX_RESULT_CHARS:
+            text = _delta_text(chunk)
+            if text:
+                self._text.append(text)
+                self._text_chars += len(text)
 
     def absorb_final(self, source: object) -> None:
         """Pull authoritative usage from the SDK's final-message accessor.
@@ -170,26 +232,44 @@ class _StreamCore:
         The Anthropic SDK exposes the settled message — and its exact usage —
         through ``get_final_message()`` once a stream completes. Preferring
         that over event fragments makes the settled cost exact rather than
-        reconstructed.
+        reconstructed. The message is also the result the cognitive breaker
+        compares, in preference to the text reassembled from events.
         """
         getter = getattr(source, "get_final_message", None)
         if not callable(getter):
             return
         try:
-            found = _try_usage(self._extract, getter())
+            final = getter()
         except Exception:  # an SDK may refuse this on an abandoned stream
             return
+        self._final = final
+        found = _try_usage(self._extract, final)
         if found is not None:
             self._usage = self._usage.merged(found)
 
     # -- lifecycle --------------------------------------------------------
 
     def authorize(self) -> None:
-        """Place the hold. Raises before any provider call is made."""
+        """Check for thrashing, then place the hold. Raises before any provider call.
+
+        A stream opened from a :class:`BoundCall` — every stream
+        :meth:`~agentgov.interceptor.Interceptor.stream` makes — is observed by
+        the request it carries. One opened from an opaque zero-argument
+        callable has nothing to fingerprint: it is refused if its trajectory
+        is already latched, and adds no evidence either way, rather than
+        adding the same placeholder every time and reading as a loop.
+        """
         if self._cognitive is not None:
-            self._cognitive.observe(
-                self._scope_id, "stream", self._memo, trajectory=self._trajectory
-            )
+            if self._call is not None:
+                self._cognitive.observe_call(
+                    self._scope_id,
+                    self._call.tool,
+                    self._call.args,
+                    self._call.kwargs,
+                    trajectory=self._trajectory,
+                )
+            else:
+                self._cognitive.check(self._scope_id, trajectory=self._trajectory)
         self._auth = self._manager.authorize(
             self._scope_id, self._hold, memo="streamed call authorization"
         )
@@ -212,6 +292,7 @@ class _StreamCore:
             self._finalizer.detach()
             self._finalizer = None
 
+        self._record_result()
         cost = self._pricing.cost_of(self._usage)
         if cost <= 0:
             self._manager.void(self._auth, memo="stream produced no billable usage")
@@ -219,6 +300,24 @@ class _StreamCore:
             return
         self._settled = cost
         self._entry = self._manager.capture(self._auth, cost, memo=self._memo)
+
+    def _record_result(self) -> None:
+        """Feed what the stream produced back to the cognitive breaker.
+
+        The same discriminator :meth:`~agentgov.interceptor.Interceptor.invoke`
+        provides: near-identical requests that return different answers are
+        iteration, not a loop. Never raises — it runs on every exit path out
+        of a stream, including one already carrying an exception.
+        """
+        if self._cognitive is None or self._call is None:
+            return
+        result: object = self._final if self._final is not None else "".join(self._text)
+        if result == "":
+            return
+        try:
+            self._cognitive.record_result(self._scope_id, result, trajectory=self._trajectory)
+        except Exception:
+            logger.exception("recording a streamed result for scope %s failed", self._scope_id)
 
 
 def _warn_unresolved(scope_id: str, authorization_id: object) -> None:
@@ -256,7 +355,9 @@ class MeteredStream(Generic[T]):
     :param hold: Amount to authorize before the call is made.
     :param pricing: Rates used to price the accumulated usage.
     :param extract: Reads usage off each event.
-    :param call: Zero-argument callable that opens the provider's stream.
+    :param call: Zero-argument callable that opens the provider's stream. A
+        :class:`BoundCall` (what :func:`build_call` returns) also tells a
+        cognitive breaker what the stream was asked.
     :param memo: Audit context recorded on the settled spend.
     :param cognitive: Optional thrashing breaker, checked before authorizing.
     :param trajectory: Cognitive trajectory this stream belongs to.
@@ -286,6 +387,7 @@ class MeteredStream(Generic[T]):
             memo=memo,
             cognitive=cognitive,
             trajectory=trajectory,
+            call=call,
         )
         self._call = call
         self._inner: object = None
@@ -437,6 +539,7 @@ class AsyncMeteredStream(Generic[T]):
             memo=memo,
             cognitive=cognitive,
             trajectory=trajectory,
+            call=call,
         )
         self._call = call
         self._inner: object = None
@@ -533,10 +636,11 @@ class AsyncMeteredStream(Generic[T]):
 
 def build_call(
     fn: Callable[..., object], args: Sequence[object], kwargs: Mapping[str, object]
-) -> Callable[[], object]:
+) -> BoundCall:
     """Bind a provider call so the stream can open it at ``__enter__`` time.
 
     Opening the stream must happen *after* the hold is placed, so the call is
-    deferred rather than made eagerly by the caller.
+    deferred rather than made eagerly by the caller. The binding keeps the
+    arguments inspectable for the cognitive breaker.
     """
-    return lambda: fn(*args, **kwargs)
+    return BoundCall(fn=fn, args=tuple(args), kwargs=dict(kwargs))

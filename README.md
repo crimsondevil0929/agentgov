@@ -3,8 +3,7 @@
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
 [![CI](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml/badge.svg)](https://github.com/crimsondevil0929/agentgov/actions/workflows/ci.yml)
-[![tests](https://img.shields.io/badge/tests-338%2F338%20passing-brightgreen)](#code-quality--packaging)
-[![coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)](#code-quality--packaging)
+[![coverage floor](https://img.shields.io/badge/coverage%20floor-95%25%2C%20CI--enforced-brightgreen)](.github/workflows/ci.yml)
 [![dependencies](https://img.shields.io/badge/core%20dependencies-zero-blue)](pyproject.toml)
 [![mypy](https://img.shields.io/badge/mypy-strict-blue)](pyproject.toml)
 [![license](https://img.shields.io/badge/license-Apache%202.0-lightgrey)](LICENSE)
@@ -42,20 +41,20 @@ see [Live API metering](#live-api-metering) below.
 | METRIC                | Scenario A - Ungoverned  |    Scenario B - AgentGov (Financial)     |    Scenario C - AgentGov (Cognitive + Financial)     |
 +=======================+==========================+==========================================+======================================================+
 | Wall clock            |                    3.00s |                                    3.00s |                                                3.00s |
-| Sub-agents spawned    |                      118 |                                   30,383 |                                                    1 |
-| Calls attempted       |                1,175,392 |                                   31,017 |                                              245,666 |
-| Calls executed        |                1,175,392 |                                      635 |                                                    3 |
-| Calls refused         |                        0 |                                   30,382 |                                              245,663 |
-| Tokens consumed       |              383,569,559 |                                  207,251 |                                                  770 |
+| Sub-agents spawned    |                       63 |                                   13,661 |                                                    1 |
+| Calls attempted       |                  627,228 |                                   14,295 |                                              140,075 |
+| Calls executed        |                  627,228 |                                      635 |                                                    3 |
+| Calls refused         |                        0 |                                   13,660 |                                              140,072 |
+| Tokens consumed       |              204,685,404 |                                  207,251 |                                                  770 |
 +-----------------------+--------------------------+------------------------------------------+------------------------------------------------------+
 | Intended budget       |                $5.000000 |                                $5.000000 |                                            $5.000000 |
-| Actual cost realized  |            $9,224.867435 |                                $4.984635 |                                            $0.018330 |
-| Cost vs budget        |               184,497.3% |                                    99.7% |                                                 0.4% |
-| Budget breached after |                   0.002s |                                    never |                                                never |
+| Actual cost realized  |            $4,922.694420 |                                $4.984635 |                                            $0.018330 |
+| Cost vs budget        |                98,453.9% |                                    99.7% |                                                 0.4% |
+| Budget breached after |                   0.003s |                                    never |                                                never |
 +-----------------------+--------------------------+------------------------------------------+------------------------------------------------------+
 | Cognitive breaker     |        n/a - not enabled |                        n/a - not enabled | TRIPPED [deterministic/near_duplicate] after 4 calls |
-| Financial breaker     | n/a - no backstop exists | LATCHED OPEN - 30382/30384 scopes halted |                     LATCHED OPEN - 1/2 scopes halted |
-| verify_integrity()    |   n/a - no ledger exists |            PASS - 123436 entries chained |                            PASS - 12 entries chained |
+| Financial breaker     | n/a - no backstop exists | LATCHED OPEN - 13660/13662 scopes halted |                     LATCHED OPEN - 1/2 scopes halted |
+| verify_integrity()    |   n/a - no ledger exists |             PASS - 70208 entries chained |                            PASS - 13 entries chained |
 | verify_conservation() |   n/a - no ledger exists |     PASS - no money created or destroyed |                 PASS - no money created or destroyed |
 +=======================+==========================+==========================================+======================================================+
 ```
@@ -64,14 +63,15 @@ All three run the *identical* workload: an agent that cannot find a report and k
 re-asking with cosmetic edits. The governed scenarios differ by exactly one constructor
 argument, so the third column isolates what loop detection buys and nothing else.
 
-**A, ungoverned:** 1.18M calls in 3 seconds, $9,224.87 against a $5.00 intended budget,
-breached in 2 milliseconds and never stopped. **B, financial:** capped at $4.984635 of
-the $5.00 envelope, 30,382 further attempts refused. Correct, but the money is gone. The
+**A, ungoverned:** 627K calls in 3 seconds, $4,922.69 against a $5.00 intended budget,
+breached in 3 milliseconds and never stopped. **B, financial:** capped at $4.984635 of
+the $5.00 envelope, 13,660 further attempts refused. Correct, but the money is gone. The
 envelope bounds the damage rather than preventing it. **C, cognitive + financial:**
 halted after **3 executed calls and $0.018330**, 0.4% of the envelope and **272x cheaper
-than waiting for the budget to run out**. The remaining 245,663 attempts cost nothing at
-all: the check runs ahead of the authorization hold, so a halted call never reaches the
-ledger.
+than waiting for the budget to run out**. The remaining 140,072 attempts cost nothing at
+all: the check runs ahead of the authorization hold, so a refused call never reaches the
+ledger. The halt itself is recorded once, as a zero-value entry in the chain (the 13th);
+nothing after it is written.
 
 Scenario C's cost is bit-for-bit reproducible across runs. It is bounded by the policy,
 which does not care how many iterations the clock allowed. A and B are not, and the table
@@ -83,7 +83,8 @@ Reproduce it: `uv run python examples/denial_of_wallet_benchmark.py`. Add `--aud
 stream every hash-chained ledger line live instead of a tail sample.
 
 Every number above is checked, not narrated. `verify_integrity()` re-derives the
-SHA-256 chain and the delegation topology; `verify_conservation()` checks the identity
+SHA-256 chain, the pairing of every hold with its release, and the delegation tree and
+breaker state, all from the chain itself; `verify_conservation()` checks the identity
 
 ```
 Σ(scope balances) + outstanding_holds + settled_spend − reversals == funded
@@ -119,6 +120,9 @@ gap: four governed workloads across four Anthropic model tiers, through the offi
   drift                     $0E-8  (MATCH)
   verify_integrity()        PASS - 33 entries chained
 ```
+
+Recorded with v0.1.1. From v0.1.2 the runaway tier's halt is itself a zero-value entry
+in the chain, so the same run chains one entry more.
 
 **Pricing is exact, not approximately right.** Every settled call is re-priced a second
 time straight from the published rates and compared against what the ledger captured.
@@ -406,11 +410,17 @@ gov = BudgetManager()
 gov.open_root("orchestrator", money("5.00"))
 gov.delegate("orchestrator", "researcher", money("1.00"))
 
-gov.verify_chain()  # re-derives every SHA-256 link
+gov.verify_chain()  # every SHA-256 link, running balance and hold release
 gov.verify_conservation()  # no money created, destroyed or double-counted
-gov.verify_integrity()  # both of the above, plus the delegation topology
+gov.verify_integrity()  # both, plus the tree and breaker state the chain implies
 print("ok")
 ```
+
+Each hold release names the hold it releases (its `ref`, inside the hash), so
+`verify_chain()` proves no hold was released twice, into the wrong scope, or for the
+wrong amount. Breaker trips, resets and every delegation are entries in the chain too,
+so `verify_integrity()` re-derives the tree and the breakers from the chain instead of
+trusting the tables that cache them.
 
 `verify_conservation()` checks
 
@@ -512,9 +522,9 @@ BALANCE TREE
      `- scraper  available $0.49248500  of $0.50000000   [HALTED by scraper]
 
 $ agentgov verify governor.db
-  ok    hash chain + balance cache
+  ok    hash chain, balances + hold pairing
   ok    conservation identity
-  ok    delegation topology
+  ok    topology + breakers, derived from the chain
 
 PASS  governor.db  (14 entries verified; head 56d879d72557ec6e)
 ```
@@ -522,13 +532,15 @@ PASS  governor.db  (14 entries verified; head 56d879d72557ec6e)
 `verify` exits `0` on PASS and `1` on FAIL, so it drops straight into a
 pipeline to assert an archived ledger is intact. Both commands open the
 database **read-only**, so they are safe to run against a governor that is
-live and holding the write claim.
+live and holding the write claim. `agentgov repair governor.db` is the one
+command that writes: see [Durability](#durability).
 
 ## Durability
 
 An in-memory ledger is not an audit trail: restart the process and it is gone. Swap `BudgetManager()` for
-`BudgetManager.open_sqlite(path)` and every write goes through to disk first, in the same
-atomic transaction, before it ever touches memory:
+`BudgetManager.open_sqlite(path)` and every operation goes to disk first, before it ever
+touches memory, as **one SQLite transaction**: a capture's release and spend, the hold it
+closes, the breaker trip it causes, all or none of it:
 
 ```python
 from agentgov import BudgetManager, money
@@ -551,14 +563,14 @@ uv run python examples/persistence_demo.py
 --- process 1: writes state, then exits completely ---
 WRITER  balance(researcher)=0.65000000
 WRITER  halted(scraper)=True
-WRITER  chain_length=15
+WRITER  chain_length=16
 WRITER  open_authorization_id=24b1af62-e7ac-4b54-b2fb-2475f6c40006
 
 --- process 2: independent interpreter, same file ---
 READER  verify_integrity() = PASS
 READER  balance(researcher)=0.65000000
 READER  halted(scraper)=True
-READER  chain_length=15
+READER  chain_length=16
 READER  open_authorizations=1
 READER  scraper still refuses calls: Scope 'scraper' is halted by its own breaker: ...
 ```
@@ -568,6 +580,21 @@ refused at open time, not served with a wrong balance: `open_sqlite()` re-runs
 `verify_chain()` and `verify_integrity()` before handing back a governor at all. This
 uses only `sqlite3` from the standard library, so durability adds zero runtime
 dependencies.
+
+**The chain is the record; the other tables are caches of it.** The delegation tree,
+the breaker events and the open authorizations are also kept in their own tables for
+fast reads, and at open they must agree exactly with what the chain implies. One that
+does not, such as the half-finished capture a v0.1.1 crash could leave behind, is
+refused with a message saying which rows disagree. `agentgov repair governor.db` (or
+`open_sqlite(path, repair=True)`) rebuilds those tables from the chain. No money moves,
+and `BudgetManager.repairs` lists what was rebuilt.
+
+**Upgrading from v0.1.0 or v0.1.1.** A database written by either is upgraded in place
+the first time v0.1.2 opens it for writing: its schema gains the columns v0.1.2 needs,
+and a migration seal, a zero-value entry carrying a digest of the old breaker events,
+commits those events into the chain. Opened read-only, it is served as it is. Entries
+keep the audit version they were written with (`AGOV1` or `AGOV2`), and each verifies
+under its own rules.
 
 **One writer, enforced.** A governor takes an exclusive advisory lock on its database.
 A second process, a second gunicorn worker or a second replica, is refused *at open*
@@ -581,7 +608,14 @@ inspect a ledger another process is governing, open it read-only:
 ```python
 audit = BudgetManager.open_sqlite("governor.db", read_only=True)
 audit.verify_integrity()  # reads and verifies; every write is refused
+audit.refresh()  # catch up with the writer, verifying every new entry
 ```
+
+A read-only view is a snapshot taken at open until it is refreshed. `refresh()` reads
+everything committed since in one consistent read, verifies it against the head the view
+already trusts, and applies it all or none of it: balances, tree and breaker state move
+forward together. If the ledger was rewritten under the view, `refresh()` raises and the
+view refuses to follow it any further.
 
 **Dangling holds are findable.** A hold left open by a process that died between
 `authorize()` and `capture()` encumbers funds with nothing left to settle it.
@@ -589,7 +623,9 @@ audit.verify_integrity()  # reads and verifies; every write is refused
 `void_stale(older_than)` releases them. Deliberately an operator action rather than a
 background timer: voiding asserts the call will never settle, and AgentGov cannot know
 that. If such a call *does* complete later, its capture raises `DoubleSpendError`. The
-ledger refuses to book the same encumbrance twice.
+ledger refuses to book the same encumbrance twice, and since v0.1.2 that refusal is a
+rule of the chain itself: a release that names a hold already released is rejected
+before it is written.
 
 See [`tests/test_persistence.py`](tests/test_persistence.py) and
 [`tests/test_hardening.py`](tests/test_hardening.py) for the restart, corruption,
@@ -607,6 +643,8 @@ lock-contention, and durable-write-failure matrices.
   halted until an operator calls `reset()`. A `DenialOfWalletError` on overdraw and a
   `RunawayLoopDetectedError` on call-frequency abuse both trip it; every subsequent
   attempt then fails fast with `CircuitOpenError` without touching the ledger at all.
+  The trip and the reset are themselves zero-value entries in the chain, so a halt
+  cannot be deleted without breaking verification.
 - **Cryptographic double-entry ledger.** Every line is a DEBIT or CREDIT against exactly
   one scope; internal transfers post balanced pairs in a single transaction. Entries are
   hash-chained with SHA-256 and never mutated. Corrections are compensating entries,
@@ -616,11 +654,17 @@ lock-contention, and durable-write-failure matrices.
   (77µs mean) plus a semantic observer off-thread, halting a thrashing agent for cents
   instead of dollars and recording the verdict in the same hash-anchored audit trail as
   every financial event. See [The cognitive circuit breaker](#the-cognitive-circuit-breaker).
-- **Write-through durability.** `BudgetManager.open_sqlite()` writes every ledger entry,
-  topology change, breaker trip, and open authorization to disk *before* committing it to
-  memory, so a store failure aborts the operation instead of leaving memory ahead of disk.
-  A corrupted or tampered file refuses to load rather than being trusted. See
+- **Write-through durability.** `BudgetManager.open_sqlite()` writes each operation, its
+  ledger entries, topology change, breaker trip and open authorization, to disk as one
+  transaction *before* committing it to memory, so a store failure or a crash aborts the
+  whole operation instead of leaving memory ahead of disk or half of it on disk. A
+  corrupted or tampered file refuses to load rather than being trusted. See
   [Durability](#durability) above.
+- **Anchors.** `anchor(scope_id, memo)` commits an external record, typically another
+  hash chain's head, into this chain as a zero-value entry. It moves no money, and
+  editing the memo afterwards breaks verification. This is how
+  [interlock](https://github.com/crimsondevil0929/interlock) binds its record of
+  database writes to this ledger.
 
 ## Known limitations & v0.1 scope
 
@@ -661,8 +705,10 @@ the zero-dependency install is unaffected.
 AgentGov enforces at the call site, in your process. Anything that can `import agentgov`
 can also call the provider SDK directly and spend unmetered. The hash chain is
 **tamper-evident, not tamper-resistant**. `verify_chain()` will prove a file was edited,
-but nothing stops a process with write access from editing it, and there is no external
-anchoring. The [reconciliation engine](#reconciling-the-invoice) is the backstop for
+but nothing stops a process with write access from editing it. The chain is keyless and
+there is no external witness yet, so someone who can compute SHA-256 can rewrite the
+whole chain consistently, or cut entries off its tail, and it will still verify. Only a
+copy of the head held somewhere else can show that. The [reconciliation engine](#reconciling-the-invoice) is the backstop for
 out-of-band spend, and it is *detection after the fact*, not prevention. Treat AgentGov
 as a budget guardrail against runaway and accident, the failure mode that actually burns
 money today. It is not a security boundary against a hostile agent.
@@ -733,8 +779,8 @@ SQLite file, with financial and cognitive breakers on the same actuator. Beyond 
 
 ```bash
 uv sync                              # install (zero runtime dependencies)
-uv run pytest -v                     # 338 passed
-uv run pytest --cov=agentgov         # 96% coverage
+uv run pytest -v
+uv run pytest --cov=agentgov         # CI fails the build below 95%
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/                     # strict, zero errors
 uv run python examples/denial_of_wallet_benchmark.py

@@ -81,7 +81,7 @@ uv run agentgov inspect demo/governor.db
 
 ```
 LEDGER  demo/governor.db
-  23 hash-chained entries across 3 scopes; head e6c5c0330217ea83
+  24 hash-chained entries across 3 scopes; head caa820d262420f3f
 
 BALANCE TREE
   orchestrator  available $3.00000000  of $5.00000000
@@ -98,26 +98,29 @@ CIRCUIT BREAKER  (1 control events)
   1/3 scopes halted
   ... circuit_tripped  runaway  cognitive breaker [near_duplicate]: ...
 
-ENTRIES  (last 20 of 23)
-   18  hold       runaway   -0.03073950  bal 0.96734850  call authorization
-   19  hold_void  runaway   +0.03073950  bal 0.99808800  authorization captured
-   20  spend      runaway   -0.00191300  bal 0.99617500  settled call cost
+ENTRIES  (last 20 of 24)
+   ...
+   21  hold            runaway   -0.03073950  bal 0.96543550  call authorization
+   22  hold_void       runaway   +0.03073950  bal 0.99617500  authorization captured
+   23  spend           runaway   -0.00191300  bal 0.99426200  settled call cost
+   24  circuit_tripped runaway    0.00000000  bal 0.99426200  cognitive breaker [near_duplicate]: ...
 ```
 
-Entries 18 through 20 are one model call: the hold encumbers the worst-case
+Entries 21 through 23 are one model call: the hold encumbers the worst-case
 cost before the call runs, then the void and the settled spend post together in
 one transaction. The funds are unavailable to sibling scopes for the whole
 in-flight duration, which is what closes the double-spend window.
 
-The cognitive trip is recorded as a control event in the same hash chain as the
-financial entries.
+The cognitive trip is entry 24: a zero-value `circuit_tripped` entry in the same
+hash chain as the financial entries, so deleting the halt breaks verification.
 
 `inspect` opens the database read-only, so it is safe to run against a live
 governor holding the write lock.
 
 **Precision on the chain:** tamper-evident, not tamper-resistant. Any process
 with write access to the file can rewrite the chain; `verify_chain()` will show
-that it was rewritten. There is no external anchoring in v0.1. See
+that it was rewritten, unless the rewrite re-links every entry after it, which only a
+copy of the head kept elsewhere can reveal. There is no external witness in v0.1. See
 [`SECURITY.md`](../SECURITY.md).
 
 ---

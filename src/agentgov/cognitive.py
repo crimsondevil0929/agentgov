@@ -1116,6 +1116,33 @@ class CognitiveBreaker:
             trajectory=trajectory,
         )
 
+    def check(self, scope_id: str, *, trajectory: str | None = None) -> None:
+        """Refuse a call on a latched trajectory, without recording one.
+
+        For a call whose arguments cannot be observed. Feeding it to
+        :meth:`observe` with a placeholder would fingerprint every such call
+        identically and read as a loop; skipping the breaker would let a
+        halted trajectory keep calling. This does neither: a trajectory that
+        is already latched — or that the semantic lane has since judged —
+        is halted, and nothing is added to its history.
+
+        :param scope_id: The budget scope making the call.
+        :param trajectory: Logical unit of work; defaults to ``scope_id``.
+        :raises ~agentgov.exceptions.AgentThrashingError: If the trajectory
+            is latched as thrashing.
+        """
+        key = trajectory if trajectory is not None else scope_id
+        with self._lock:
+            state = self._trajectories.get(key)
+            if state is None:
+                return
+            verdict = state.verdict
+            if verdict is None and state.pending is not None:
+                verdict = state.verdict = state.pending
+                state.pending = None
+        if verdict is not None:
+            self._halt(scope_id, key, verdict)
+
     def record_result(
         self,
         scope_id: str,

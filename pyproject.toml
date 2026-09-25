@@ -1,6 +1,6 @@
 [project]
 name = "agentgov"
-version = "0.1.1"
+version = "0.1.2"
 description = "Runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets."
 readme = "README.md"
 requires-python = ">=3.11"

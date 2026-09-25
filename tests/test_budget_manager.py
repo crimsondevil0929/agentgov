@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from agentgov.core import BudgetManager, EntryType, GovernancePolicy, money
+from agentgov.core import BudgetManager, Direction, EntryType, GovernancePolicy, money
 from agentgov.exceptions import (
     BudgetExceededError,
     CircuitOpenError,
@@ -220,7 +220,7 @@ def test_hitting_the_exact_limit_trips_the_breaker_and_halts(
     gov.verify_integrity()
 
 
-def test_overdrawing_raises_denial_of_wallet_and_writes_nothing(
+def test_overdrawing_raises_denial_of_wallet_and_moves_no_money(
     gov: BudgetManager,
 ) -> None:
     gov.delegate("root", "worker", money("0.10"))
@@ -232,7 +232,13 @@ def test_overdrawing_raises_denial_of_wallet_and_writes_nothing(
     assert excinfo.value.requested == money("0.50")
     assert excinfo.value.available == money("0.10")
     assert excinfo.value.overspent is False
-    assert len(gov.audit_trail()) == entries_before, "refusal must not touch the ledger"
+    # The refusal moves no money. The one entry it writes is the zero-value
+    # trip, which is what makes the halt part of the tamper-evident record.
+    (trip,) = gov.audit_trail()[entries_before:]
+    assert trip.entry_type is EntryType.CIRCUIT_TRIPPED
+    assert trip.direction is Direction.NONE
+    assert trip.amount == 0
+    assert gov.available("worker") == money("0.10"), "refusal must not move money"
     assert gov.is_halted("worker")
     gov.verify_integrity()
 
@@ -366,5 +372,5 @@ def test_audit_logging_emits_one_record_per_entry(
     records = [r for r in caplog.records if r.name == "agentgov.audit"]
     # allocation (2 legs) + hold + hold_void + spend
     assert len(records) == 5
-    assert all(r.message.startswith("AGOV1|") for r in records)
+    assert all(r.message.startswith("AGOV2|") for r in records)
     assert all(hasattr(r, "agentgov_entry") for r in records)
