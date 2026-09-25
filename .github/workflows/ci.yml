@@ -67,6 +67,19 @@ jobs:
           uv run python examples/live_demo.py --out /tmp/agentgov-demo --no-color
           uv run agentgov verify /tmp/agentgov-demo/governor.db
 
+      - name: Verify the ARC1 reference vectors with the installed CLI
+        working-directory: vectors/arc1
+        run: |
+          uv run agentgov verify-receipt valid/committed-refund.bundle.json \
+            --pubkey keys/issuer.pub \
+            --witness witness/cosignatures.jsonl --witness-pubkey keys/witness.pub \
+            --rows valid/committed-refund.rows.json
+          # A forged signature must exit 4 (SIGNATURE), not merely non-zero.
+          code=0
+          uv run agentgov verify-receipt invalid/forged-signature.bundle.json \
+            --pubkey keys/issuer.pub || code=$?
+          test "$code" -eq 4
+
   build:
     name: build (wheel + sdist)
     runs-on: ubuntu-latest

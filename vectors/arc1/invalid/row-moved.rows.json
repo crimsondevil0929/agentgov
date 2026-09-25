@@ -1,0 +1,55 @@
+{
+  "v": "ARC1-rows",
+  "receipt_id": "f87ad35e-c540-5f93-8c5a-62d3006db353",
+  "row_root": "9ab84da7294fe5de27ee8dbfdea810461c80e911fa0e541ce55dd9fd01caaebc",
+  "row_count": 3,
+  "rows": [
+    {
+      "index": 0,
+      "salt": "5d9ffc61ae656fc213ebab3cb86a267feb2bab6bcfdc94adfee86bd47b1a0e43",
+      "row": {
+        "table": "orders",
+        "pk": "1042",
+        "op": "update",
+        "tenant": "acme",
+        "before": {
+          "id": 1042,
+          "tenant": "acme",
+          "customer": 77,
+          "total": "480.00",
+          "status": "paid"
+        },
+        "after": {
+          "id": 1042,
+          "tenant": "acme",
+          "customer": 77,
+          "total": "480.00",
+          "status": "refunded"
+        }
+      },
+      "audit_path": [
+        "5684fbe29a0276bb8cf1889857cda66350ae443e6af68b5bbcfc21bac27af3e2",
+        "4e6463575d8a6646152522de3e85f5a4bf4f99b4f1f67eec9097a51c70daa368"
+      ]
+    },
+    {
+      "index": 1,
+      "salt": "c7a2678918f8ed352c370381d722d8e6f04c94f42615ca46fdf938b16a3557fb",
+      "row": {
+        "table": "order_audit",
+        "pk": "88211",
+        "op": "insert",
+        "tenant": "acme",
+        "before": null,
+        "after": {
+          "id": 88211,
+          "order_id": 1042,
+          "note": "refund 3310 issued by support-agent"
+        }
+      },
+      "audit_path": [
+        "6591949eb9a1d7664591f0858d9ceb4347c1c26127143496313d84eacc56e5cc"
+      ]
+    }
+  ]
+}

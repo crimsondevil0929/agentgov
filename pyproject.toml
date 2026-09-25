@@ -36,6 +36,9 @@ dependencies = []
 # st.dataframe's `width="stretch"` sizing API); an older floor risked pinning
 # to a version where that parameter doesn't exist.
 ui = ["streamlit>=1.63"]
+sign = [
+    "cryptography>=42",
+]
 
 [project.scripts]
 agentgov = "agentgov.cli:main"
@@ -61,6 +64,7 @@ dev = [
     # repository and is not published in the wheel, so the installed package
     # keeps its zero-runtime-dependency guarantee.
     "anthropic>=1.0.0",
+    "cryptography>=42",
 ]
 
 [tool.pytest.ini_options]

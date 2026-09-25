@@ -14,6 +14,9 @@ financial control plane:
   contended**. An operational condition with an operational fix, kept
   strictly apart from :class:`LedgerError` so that a second process opening
   the same database never masquerades as a corrupted audit chain.
+- :class:`ReceiptError` — a receipt, proof or witness record **does not
+  verify**. Evidence handed to a verifier is untrusted input; this is the
+  answer when it does not hold up.
 
 The single most important type here is :class:`DenialOfWalletError`: the
 hard backstop raised when an agent attempts to overdraw its envelope. It is
@@ -40,12 +43,19 @@ __all__ = [
     "DuplicateScopeError",
     "LedgerError",
     "LedgerIntegrityError",
+    "MalformedReceiptError",
     "ReadOnlyLedgerError",
+    "ReceiptError",
+    "ReceiptLogError",
+    "ReceiptSignatureError",
+    "RowDisclosureError",
     "RunawayLoopDetectedError",
     "ScopeError",
+    "SignerUnavailableError",
     "StorageError",
     "SubBudgetAllocationError",
     "UnknownScopeError",
+    "WitnessError",
 ]
 
 
@@ -449,3 +459,55 @@ class DoubleSpendError(LedgerError):
             f"Double-spend rejected for scope {scope_id!r}: "
             f"authorization {authorization_id} {detail}"
         )
+
+
+# --------------------------------------------------------------------------
+# Receipt errors — the evidence does not verify
+# --------------------------------------------------------------------------
+
+
+class ReceiptError(AgentGovError):
+    """Base class for errors about receipts, their logs and their witnesses.
+
+    A receipt, a proof or a cosignature arriving at a verifier is untrusted
+    input. Each subclass names the part of the evidence that failed, which
+    is also what ``agentgov verify-receipt`` reports as its exit code.
+    """
+
+
+class MalformedReceiptError(ReceiptError):
+    """The input is not a well-formed ARC1 document.
+
+    Raised for anything that cannot be decoded into the schema: invalid JSON,
+    a duplicate object key, a float, a missing or unknown field, a value of
+    the wrong type or format, or fields that contradict each other.
+    """
+
+
+class ReceiptSignatureError(ReceiptError):
+    """A signature does not verify under the key the verifier was given."""
+
+
+class WitnessError(ReceiptError):
+    """A checkpoint is not witnessed, or a witness refused to cosign it.
+
+    A witness refuses a checkpoint that rolls the log back, forks it (a
+    second root at a size it already cosigned), or does not extend what it
+    saw before. Each is evidence that the log operator rewrote history.
+    """
+
+
+class RowDisclosureError(ReceiptError):
+    """A disclosed row does not verify against the receipt's row commitment."""
+
+
+class ReceiptLogError(ReceiptError):
+    """A receipt log cannot be opened, resumed or appended to."""
+
+
+class SignerUnavailableError(ReceiptError):
+    """A signing algorithm needs an optional dependency that is not installed.
+
+    Ed25519 signing uses the ``cryptography`` package: install it with
+    ``pip install 'agentgov[sign]'``. Verification never needs it.
+    """
