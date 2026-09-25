@@ -1,0 +1,66 @@
+{
+  "v": "ARC1-rows",
+  "receipt_id": "73fdf098-5737-57f5-bd62-5cef23477056",
+  "row_root": "ba4affae81e1c4a07ff8d1c776d06910ec5375868d2450e80365f1eea8250947",
+  "row_count": 229,
+  "rows": [
+    {
+      "index": 5,
+      "salt": "a48cd8df48e0028be57f8584eaf5ab36eb0bcdb42970b769279759a74b141ef8",
+      "row": {
+        "table": "orders",
+        "pk": "2005",
+        "op": "update",
+        "tenant": "globex",
+        "before": {
+          "id": 2005,
+          "tenant": "globex",
+          "total": "197.05",
+          "status": "paid"
+        },
+        "after": {
+          "id": 2005,
+          "tenant": "globex",
+          "total": "0.00",
+          "status": "paid"
+        }
+      },
+      "audit_path": [
+        "8dc82f8ce6cddc4426889733d767fc87b6d9626a23b04b49429ca025083b5764",
+        "9b6f08f86f1ceba4556935baa875d76ad7a849bba051e46d672f91707e4d84c9",
+        "1877da764d3cef489e2a133601452cd8f1c9568cebb0b4dbcb67aceb90092e9d",
+        "9f39efcb1fb2bd9f7f252978af5debe6b43362e6285d95dfe15434fb1da43d35",
+        "996b4fdcec05a0a624633136f19cc555aa49f2999245117597b14ce8a7256675",
+        "9166c623c3e6fad19b2e485ab8acac78f13224cdebb7ae3ea825b01e3e2e6046",
+        "abd39bd3184e5c2fdc37803096a406078af74e41e8762c7619db4be81ce5a99b",
+        "57e38a858fd90a7b60a75e1a54b9df8262708b1cb4c02ff1ad236b21bb96c1a5"
+      ]
+    },
+    {
+      "index": 130,
+      "salt": "aec76e77a5b5939470bc8bf41c673523646ec3d9df1be71606dfc4d8deb4688b",
+      "row": {
+        "table": "order_audit",
+        "pk": "70004",
+        "op": "delete",
+        "tenant": "acme",
+        "before": {
+          "id": 70004,
+          "order_id": 1504,
+          "note": "payment captured"
+        },
+        "after": null
+      },
+      "audit_path": [
+        "31674afd9622c6055023afbee4b62e169012e30c9d6c61d8de6f650cf2df52cb",
+        "485a0ba10a968cbcc90b6411da0ecb3e795461432ae1937b34bb48fa0a549bc4",
+        "9a26bb4aac98ee32309c0a6fa7dcfb7b756a60f4a72c0c4e8986c4729931a1be",
+        "743cd792ead4e87934196f21923b00af4d8674f760aface8b3495b87fbe1b47f",
+        "c4dd780fd455c7a9bd63aa1bc85d33bcbcf2bc8665229bce1ecc71091af344eb",
+        "0ad379b5f0dc8085bbb35816f680948e268a25eae7e3447ec978d34a6171040b",
+        "908f853de2c0050e40a722ad1fc3047b241bf44b33b8e63ce387426d3bc91a18",
+        "c6d5a4a6569d913ebb94ff759b073d98b26712121f264975bfc66ce25cdff391"
+      ]
+    }
+  ]
+}

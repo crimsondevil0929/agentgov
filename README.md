@@ -535,6 +535,90 @@ database **read-only**, so they are safe to run against a governor that is
 live and holding the write claim. `agentgov repair governor.db` is the one
 command that writes: see [Durability](#durability).
 
+## Action receipts (ARC1)
+
+*Unreleased, on the v0.2 line: `agentgov.receipts` and `agentgov verify-receipt`.*
+
+A ledger proves what an agent **spent**. A receipt proves what it **did**.
+Every governed action against a system of record can leave an ARC1 receipt,
+including refused ones. A receipt is a signed record of:
+- who authorized the action;
+- what the agent said it would do;
+- what the action measurably did, and what the measurement could not see;
+- what was decided, and by which checks;
+- what it cost;
+- how it ended.
+
+Receipts go into an append-only [RFC 9162](https://www.rfc-editor.org/rfc/rfc9162)
+Merkle log, and a witness cosigns the log's checkpoints. A receipt therefore
+cannot be edited, moved, dropped from history, or shown differently to
+different people without it showing. Row data stays out of the receipt. A
+salted Merkle root commits to every changed row, and the issuer can later
+disclose any subset to an auditor, with proofs, while the rest stay hidden.
+
+```console
+$ cd vectors/arc1
+$ agentgov verify-receipt valid/committed-refund.bundle.json --pubkey keys/issuer.pub \
+      --witness witness/cosignatures.jsonl --witness-pubkey keys/witness.pub \
+      --rows valid/committed-refund.rows.json
+  ok    ARC1 schema        receipt f87ad35e-c540-5f93-8c5a-62d3006db353 (committed, ...)
+  ok    receipt signature  ed25519, key bcc542d53c8c1a1f
+  ok    log inclusion      leaf 0 of 7 in log 'arc1-vectors' (root 5b025750f43bc1be)
+  ok    witnessed          by 'arc1-vectors-witness' (key ac51d42df2b0ebbd) at 2026-09-25T15:05:00.000000Z
+  --    agentgov ledger    no ledger given
+  ok    disclosed rows     2 of 3 committed rows verify under row_root 9ab84da7294fe5de
+
+PASS  valid/committed-refund.bundle.json  (receipt f87ad35e-c540-5f93-8c5a-62d3006db353)
+```
+
+`--ledger governor.db` also checks the receipt's cost against the AgentGov
+ledger that paid for the action. The ledger must have settled exactly that
+amount, in transactions recorded before the receipt was anchored. The exit
+code says what failed, so a pipeline can gate on it:
+
+| Exit | Meaning |
+|---|---|
+| `0` | every check you gave evidence for passed |
+| `2` | usage error, or a file that cannot be read |
+| `3` | not a well-formed ARC1 document |
+| `4` | the receipt's signature does not verify |
+| `5` | the log checkpoint's signature, or the audit path to it, fails |
+| `6` | the checkpoint was never witnessed, or the witness saw a different history (a split view) |
+| `7` | the receipt disagrees with the AgentGov ledger |
+| `8` | a disclosed row is not one the receipt committed to |
+
+The same checks are available in code:
+
+<!-- readme-test: skip reason="reads vectors/arc1 from a checkout of this repository" -->
+```python
+from pathlib import Path
+
+from agentgov.receipts import load_cosignatures, parse_key, verify_bundle
+
+vectors = Path("vectors/arc1")
+report = verify_bundle(
+    (vectors / "valid" / "committed-refund.bundle.json").read_bytes(),
+    issuer_key=parse_key((vectors / "keys" / "issuer.pub").read_text()),
+    cosignatures=load_cosignatures(vectors / "witness" / "cosignatures.jsonl"),
+    witness_key=parse_key((vectors / "keys" / "witness.pub").read_text()),
+)
+print(report.exit_code, [check.status for check in report.checks])
+# 0 ['pass', 'pass', 'pass', 'pass', 'skip', 'skip']
+```
+
+Verifying needs only the standard library, including a built-in RFC 8032
+Ed25519 verifier. Issuing receipts with Ed25519 keys needs
+`pip install 'agentgov[sign]'`; HMAC-SHA256 keys, for internal use, need
+nothing. `receipts.ReceiptLog.issue()` places, signs and logs a receipt in one
+step, and `receipts.verify_bundle()` is the verifier behind the command.
+
+[`docs/RECEIPTS.md`](docs/RECEIPTS.md) is the specification. It covers the
+canonical encoding, the signed bytes, the log, witnesses, row commitments,
+the verification order, and what a receipt does *not* prove.
+[`vectors/arc1/`](vectors/arc1/) holds deterministic reference vectors,
+regenerated and byte-compared on every CI run. Its `manifest.json` lists each
+case with the exit code a conforming verifier must produce.
+
 ## Durability
 
 An in-memory ledger is not an audit trail: restart the process and it is gone. Swap `BudgetManager()` for

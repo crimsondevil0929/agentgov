@@ -1,0 +1,243 @@
+{
+  "description": "Run `agentgov verify-receipt` with 'args' (paths relative to this directory) and expect 'exit'. 0 pass, 3 malformed, 4 receipt signature, 5 log inclusion, 6 witness, 8 rows.",
+  "cases": [
+    {
+      "name": "committed-refund",
+      "exit": 0,
+      "args": [
+        "valid/committed-refund.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+        "--rows",
+        "valid/committed-refund.rows.json"
+      ],
+      "description": "a committed refund, witnessed, with two of its three rows disclosed"
+    },
+    {
+      "name": "refused-tenant-wipe",
+      "exit": 0,
+      "args": [
+        "valid/refused-tenant-wipe.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+        "--rows",
+        "valid/refused-tenant-wipe.rows.json"
+      ],
+      "description": "a refused 229-row cross-tenant plan: refusals get receipts too"
+    },
+    {
+      "name": "scoped-repair",
+      "exit": 0,
+      "args": [
+        "valid/scoped-repair.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a scoped plan that repairs the refused one (decision.repair_of)"
+    },
+    {
+      "name": "recovered-commit",
+      "exit": 0,
+      "args": [
+        "valid/recovered-commit.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a commit resolved after a crash from its commit marker"
+    },
+    {
+      "name": "halted-scope",
+      "exit": 0,
+      "args": [
+        "valid/halted-scope.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "admitted by every check, refused because the scope was halted"
+    },
+    {
+      "name": "internal-hmac",
+      "exit": 0,
+      "args": [
+        "valid/internal-hmac.receipt.json",
+        "--pubkey",
+        "keys/internal.hmac"
+      ],
+      "description": "a bare receipt signed with an internal HMAC key"
+    },
+    {
+      "name": "field-modified",
+      "exit": 4,
+      "args": [
+        "invalid/field-modified.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "settled_usd lowered after signing"
+    },
+    {
+      "name": "forged-signature",
+      "exit": 4,
+      "args": [
+        "invalid/forged-signature.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "re-signed by another key that claims the issuer's key_id"
+    },
+    {
+      "name": "alg-confusion",
+      "exit": 4,
+      "args": [
+        "invalid/alg-confusion.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "an HMAC keyed with the issuer's public key, claiming hmac-sha256"
+    },
+    {
+      "name": "checkpoint-forged",
+      "exit": 5,
+      "args": [
+        "invalid/checkpoint-forged.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "the checkpoint's tree size edited after signing"
+    },
+    {
+      "name": "reordered-log",
+      "exit": 5,
+      "args": [
+        "invalid/reordered-log.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "the log operator swapped two leaves and signed the new root"
+    },
+    {
+      "name": "leaf-moved",
+      "exit": 5,
+      "args": [
+        "invalid/leaf-moved.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "the same swap, with a valid audit path to the receipt's new index: only the position signed into the receipt catches it"
+    },
+    {
+      "name": "unwitnessed",
+      "exit": 6,
+      "args": [
+        "invalid/unwitnessed.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a real checkpoint the witness never saw"
+    },
+    {
+      "name": "split-view",
+      "exit": 6,
+      "args": [
+        "invalid/split-view.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a forked log: a different receipt 6 under a signed root no witness cosigned"
+    },
+    {
+      "name": "row-modified",
+      "exit": 8,
+      "args": [
+        "valid/committed-refund.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--rows",
+        "invalid/row-modified.rows.json"
+      ],
+      "description": "a disclosed row edited after commitment"
+    },
+    {
+      "name": "row-moved",
+      "exit": 8,
+      "args": [
+        "valid/committed-refund.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--rows",
+        "invalid/row-moved.rows.json"
+      ],
+      "description": "a disclosed row presented at another index"
+    },
+    {
+      "name": "rows-of-another-receipt",
+      "exit": 8,
+      "args": [
+        "valid/committed-refund.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--rows",
+        "valid/refused-tenant-wipe.rows.json"
+      ],
+      "description": "a valid disclosure, of a different receipt"
+    },
+    {
+      "name": "duplicate-key",
+      "exit": 3,
+      "args": [
+        "invalid/duplicate-key.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "a duplicate object key"
+    },
+    {
+      "name": "float-amount",
+      "exit": 3,
+      "args": [
+        "invalid/float-amount.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "a float where a decimal string belongs"
+    },
+    {
+      "name": "unknown-field",
+      "exit": 3,
+      "args": [
+        "invalid/unknown-field.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "a field the schema does not define"
+    }
+  ]
+}

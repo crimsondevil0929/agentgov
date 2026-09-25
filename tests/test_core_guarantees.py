@@ -1458,6 +1458,24 @@ def test_a_database_this_version_cannot_read_is_refused(tmp_path: Path) -> None:
     with pytest.raises(LedgerIntegrityError, match="schema version '99'"):
         BudgetManager.open_sqlite(future, read_only=True)
 
+
+def test_a_file_that_is_not_a_database_is_an_error_not_a_crash(tmp_path: Path) -> None:
+    """sqlite3 reports "file is not a database" as DatabaseError, the parent of
+    the OperationalError the store used to catch, so the CLI crashed with a
+    traceback instead of reporting it."""
+    junk = tmp_path / "notes.db"
+    junk.write_bytes(b"meeting notes, not a ledger\n" * 64)
+    with pytest.raises(AgentGovError, match="not an agentgov database"):
+        BudgetManager.open_sqlite(str(junk), read_only=True)
+    with pytest.raises(AgentGovError, match="as a ledger: file is not a database"):
+        BudgetManager.open_sqlite(str(junk))
+    # The failed writable open released its claim, and left the file alone.
+    assert junk.read_bytes() == b"meeting notes, not a ledger\n" * 64
+    with pytest.raises(AgentGovError, match="as a ledger"):
+        BudgetManager.open_sqlite(str(junk))
+    for command in ("verify", "inspect"):
+        assert cli_main([command, str(junk)]) == 1
+
     unversioned = str(tmp_path / "unversioned.db")
     with BudgetManager.open_sqlite(unversioned) as gov:
         gov.open_root("root", money("1.00"))

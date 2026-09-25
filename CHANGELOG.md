@@ -8,6 +8,64 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **ARC1 verifiable action receipts** (`agentgov.receipts`). A signed record
+  of one agent action:
+  - who authorized it;
+  - what the agent said it would do;
+  - what it measurably did, and what the measurement could not see;
+  - what was decided;
+  - what it cost;
+  - how it ended.
+
+  Refusals get receipts too. [`docs/RECEIPTS.md`](docs/RECEIPTS.md) is the
+  specification.
+  - **Canonical encoding.** RFC 8785 (JCS) over a float-free value domain,
+    and a strict decoder that refuses duplicate keys, floats and unknown
+    fields (`canonical_bytes`, `loads_strict`).
+  - **Signatures.** Domain-separated signing inputs that cover the claimed
+    algorithm and key id, and a verifier that never takes the algorithm from
+    the document. `HmacKey` uses only the standard library. `Ed25519Signer`
+    needs the new optional extra, `agentgov[sign]`. Verifying Ed25519 needs
+    nothing: a pure-Python RFC 8032 verifier is built in, and it accepts
+    exactly the signatures OpenSSL accepts.
+  - **An RFC 9162 receipt log** (`ReceiptLog`, `MerkleTree`). Every receipt
+    signs its own log position, so a receipt cannot be moved or reordered
+    without breaking its signature, and each receipt id enters the log once.
+    Signed checkpoints, and inclusion and consistency proofs. Durable
+    JSON-lines persistence with a single-writer claim, crash-torn-line
+    recovery, and a full re-check on reopen.
+  - **Witnesses** (`Witness`, `FileWitness`). A witness cosigns a checkpoint
+    only after checking the consistency proof. It refuses rollbacks, forks
+    and rewritten history. A verifier detects a split view from the witness's
+    record.
+  - **Row commitments.** A salted Merkle root over the rows an action
+    changed. The issuer can disclose any subset of the rows with proofs,
+    without revealing the rest (`commit_rows`, `verify_disclosure`).
+  - **`agentgov verify-receipt`** (`verify_bundle`). Verifies a receipt
+    against the issuer's key, the log checkpoint, a witness record, the
+    AgentGov ledger that paid for the action, and disclosed rows. It exits
+    with the class of the first failure: 3 malformed, 4 signature, 5
+    inclusion, 6 witness, 7 ledger, 8 rows. 0 means every check passed, and 2
+    is a usage error.
+  - **Reference test vectors** in [`vectors/arc1/`](vectors/arc1/),
+    generated deterministically by `scripts/generate_arc1_vectors.py`. The
+    test suite regenerates them and byte-compares them on every run.
+    `manifest.json` is a conformance suite of 20 command-line cases for any
+    other verifier.
+- The `agentgov[sign]` extra (`cryptography>=42`). The core package still has
+  no runtime dependencies.
+
+### Fixed
+
+- **A file that is not a SQLite database crashed `agentgov verify` and
+  `agentgov inspect` with a traceback.** SQLite reports it as
+  `sqlite3.DatabaseError`, the parent of the `OperationalError` the store
+  caught. Opening one now raises `StorageError` naming the file, so the
+  commands report it and exit 1. A failed writable open now also closes its
+  connection.
+
 ## [0.1.2] - 2026-09-25
 
 Makes four of v0.1.1's guarantees true. Each was broken in a way that every

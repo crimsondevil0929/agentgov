@@ -23,9 +23,16 @@ Two commands, aimed at two different readers:
     rebuilds those tables from the chain and says what it changed. Moves no
     money and never edits the chain.
 
-The first three open the database **read-only**, so they are safe to run
-against a governor that is live and holding the write claim. ``repair`` needs
-the write claim, and is refused while a governor holds it.
+``agentgov verify-receipt <bundle> --pubkey <key>``
+    For an auditor: verifies an ARC1 receipt offline — its signature, its
+    inclusion in the receipt log, a witness's cosignature of that log, its
+    agreement with the ledger, and any disclosed rows — and exits with a code
+    naming the first thing that failed (see :mod:`agentgov.receipts.verify`).
+
+The ledger commands other than ``repair`` open the database **read-only**, so
+they are safe to run against a governor that is live and holding the write
+claim. ``repair`` needs the write claim, and is refused while a governor holds
+it.
 
 Standard library only — argparse and nothing else, so the CLI costs the
 package no dependencies.
@@ -34,13 +41,25 @@ package no dependencies.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from decimal import Decimal
+from pathlib import Path
 from typing import TextIO
 
 from agentgov.core import BudgetManager, BudgetNode, EntryType, format_audit_line
-from agentgov.exceptions import AgentGovError, LedgerError
+from agentgov.exceptions import AgentGovError, LedgerError, MalformedReceiptError
+from agentgov.receipts import (
+    Check,
+    Failure,
+    RowDisclosure,
+    VerificationReport,
+    Verifier,
+    load_cosignatures,
+    parse_key,
+    verify_bundle,
+)
 from agentgov.reconciliation import (
     MeteringJournal,
     ReconciliationPolicy,
@@ -266,13 +285,104 @@ def _command_repair(args: argparse.Namespace, out: TextIO) -> int:
         manager.close()
 
 
+_KEY_PREFIXES = ("ed25519:", "hmac-sha256:")
+_MARKS = {"pass": "ok  ", "fail": "FAIL", "skip": "--  "}
+
+
+def _read_key(value: str) -> Verifier:
+    """A key given inline (``ed25519:<hex>``) or as a file holding one."""
+    text = value if value.startswith(_KEY_PREFIXES) else Path(value).read_text(encoding="utf-8")
+    return parse_key(text)
+
+
+def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
+    """Verify an ARC1 receipt bundle; exit with the first failure's code."""
+    try:
+        issuer = _read_key(args.pubkey)
+        log_key = _read_key(args.log_pubkey) if args.log_pubkey else None
+        witness_key = _read_key(args.witness_pubkey) if args.witness_pubkey else None
+        bundle = Path(args.bundle).read_bytes()
+    except (OSError, MalformedReceiptError) as exc:
+        out.write(f"error: {exc}\n")
+        return 2
+    if args.witness and witness_key is None:
+        out.write("error: --witness needs --witness-pubkey, the key the witness signs with\n")
+        return 2
+    if args.ledger and not Path(args.ledger).is_file():
+        out.write(f"error: no ledger at {args.ledger}\n")
+        return 2
+
+    # An input that exists but does not decode fails the check it feeds, in
+    # that check's place, so the exit code stays the first failure in order.
+    unreadable: dict[str, Check] = {}
+    cosignatures = None
+    rows = None
+    ledger: BudgetManager | None = None
+    try:
+        if args.witness:
+            try:
+                cosignatures = load_cosignatures(args.witness)
+            except MalformedReceiptError as exc:
+                unreadable["witnessed"] = Check("witnessed", "fail", str(exc), Failure.MALFORMED)
+        if args.rows:
+            try:
+                rows = RowDisclosure.loads(Path(args.rows).read_bytes())
+            except MalformedReceiptError as exc:
+                unreadable["disclosed rows"] = Check(
+                    "disclosed rows", "fail", str(exc), Failure.MALFORMED
+                )
+    except OSError as exc:
+        out.write(f"error: {exc}\n")
+        return 2
+    if args.ledger:
+        try:
+            ledger = BudgetManager.open_sqlite(args.ledger, read_only=True)
+        except AgentGovError as exc:
+            unreadable["agentgov ledger"] = Check(
+                "agentgov ledger", "fail", f"the ledger does not verify: {exc}", Failure.LEDGER
+            )
+    try:
+        report = verify_bundle(
+            bundle,
+            issuer_key=issuer,
+            log_key=log_key,
+            cosignatures=cosignatures,
+            witness_key=witness_key,
+            ledger=ledger,
+            rows=rows,
+        )
+    finally:
+        if ledger is not None:
+            ledger.close()
+    if unreadable:
+        placed = [unreadable.pop(check.name, check) for check in report.checks]
+        report = VerificationReport((*placed, *unreadable.values()), report.receipt)
+
+    if args.json:
+        out.write(json.dumps(report.to_json(), indent=2) + "\n")
+        return report.exit_code
+    width = max(len(check.name) for check in report.checks)
+    for check in report.checks:
+        out.write(f"  {_MARKS[check.status]}  {check.name:<{width}}  {check.detail}\n")
+    failure = report.first_failure
+    if failure is not None and failure.failure is not None:
+        out.write(
+            f"\nFAIL  {args.bundle}  ({failure.name}: exit {int(failure.failure)} "
+            f"{failure.failure.name})\n"
+        )
+    else:
+        receipt_id = report.receipt.receipt_id if report.receipt else "?"
+        out.write(f"\nPASS  {args.bundle}  (receipt {receipt_id})\n")
+    return report.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser."""
     parser = argparse.ArgumentParser(
         prog="agentgov",
-        description="Inspect, verify, reconcile and repair an AgentGov ledger. "
-        "inspect, verify and reconcile open the database read-only and are safe to "
-        "run against a live governor.",
+        description="Inspect, verify, reconcile and repair an AgentGov ledger, and verify "
+        "ARC1 action receipts. inspect, verify and reconcile open the database read-only "
+        "and are safe to run against a live governor.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -340,6 +450,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     repair.add_argument("path", help="path to the SQLite ledger")
     repair.set_defaults(handler=_command_repair)
+
+    receipt = subcommands.add_parser(
+        "verify-receipt",
+        help="verify an ARC1 receipt offline; exit 0 on PASS, 3-8 naming what failed",
+        description="Verify an ARC1 receipt bundle offline. Exit codes: 0 pass, 2 usage, "
+        "3 malformed, 4 receipt signature, 5 log inclusion, 6 witness, 7 ledger, 8 rows.",
+    )
+    receipt.add_argument("bundle", help="receipt bundle, or bare receipt, as JSON")
+    receipt.add_argument(
+        "--pubkey",
+        required=True,
+        help="the issuer's key: 'ed25519:<hex>', 'hmac-sha256:<hex>', or a file holding one",
+    )
+    receipt.add_argument(
+        "--log-pubkey", default="", help="the receipt log's checkpoint key (default: --pubkey)"
+    )
+    receipt.add_argument(
+        "--witness", default="", help="a witness's published cosignatures (JSON lines)"
+    )
+    receipt.add_argument(
+        "--witness-pubkey", default="", help="the witness's key; required with --witness"
+    )
+    receipt.add_argument(
+        "--ledger",
+        default="",
+        help="an AgentGov ledger the receipt's anchor and settled cost must agree with",
+    )
+    receipt.add_argument(
+        "--rows", default="", help="a row disclosure to check against the row commitment"
+    )
+    receipt.add_argument("--json", action="store_true", help="print the report as JSON")
+    receipt.set_defaults(handler=_command_verify_receipt)
 
     return parser
 

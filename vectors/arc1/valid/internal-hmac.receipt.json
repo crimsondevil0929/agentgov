@@ -1,0 +1,116 @@
+{
+  "v": "ARC1",
+  "receipt_id": "d00ba881-d2d9-509e-bbde-b297b41ec7cc",
+  "issued_at": "2026-09-25T14:09:00.009999Z",
+  "issuer": "interlock/0.2.0 support-eu-1",
+  "authority": {
+    "scope_path": [
+      "orchestrator",
+      "support-agent"
+    ],
+    "trajectory_id": "traj-98bf8dc67e42",
+    "capability": {
+      "grant": "grant:support-agent/tables-rw@v3",
+      "tables": [
+        "customers",
+        "order_audit",
+        "orders",
+        "refunds",
+        "support_notes"
+      ],
+      "tenants": [
+        "globex"
+      ],
+      "row_limit": 8
+    }
+  },
+  "intent": {
+    "plan_hash": "1430a21db2d7ff21aaa8eae17e226a55c674d747201156fc11b2395bf6d6a660",
+    "stated": {
+      "rows": 1,
+      "tables": [
+        "customers"
+      ]
+    }
+  },
+  "effect": {
+    "substrate_id": "sqlite",
+    "schema_hash": "57e7211a7e34df0b936d2d9689882cd7b461f72d2cf826780b8e58afdc55c20b",
+    "diff_hash": "d6a0428df12abe409c91a1bea4e69bd0dbfe99cf7b6f4aa144a452fb0c249e53",
+    "row_root": "e57c51be3a523b7ef63369c9f57fc4a4e9988f26ef053f05d37b347da4ec43f0",
+    "row_count": 1,
+    "summary": {
+      "ins": 0,
+      "upd": 1,
+      "del": 0,
+      "tables": [
+        "customers"
+      ],
+      "tenants": [
+        "globex"
+      ]
+    },
+    "truncated": false
+  },
+  "coverage": {
+    "observed_tables": [
+      "customers",
+      "order_audit",
+      "orders",
+      "refunds",
+      "support_notes"
+    ],
+    "cascade_closed": true,
+    "authorizer_on": true,
+    "known_gaps": [
+      "rows written by database triggers into unobserved tables"
+    ]
+  },
+  "decision": {
+    "verdict_hash": "e8bdc3348640b6ea80e6e979837d320a60ccf7a65a3c4b751b87e28007fde095",
+    "admitted": true,
+    "checkers": [
+      {
+        "name": "blast_radius",
+        "config_hash": "bb9f138a16e216e85cbe9676b3dab7bde97bfde04007c8033119177febdf89c6"
+      },
+      {
+        "name": "tenant_isolation",
+        "config_hash": "3826b3ac6a80ea35bc6135ebc3bd72b1e0f919d7be1136d839a2b2f44ea3ade3"
+      },
+      {
+        "name": "no_delete",
+        "config_hash": "823c37ae2da6dbd285e0b8b184e91f1a420dc2cd8f1e505ac5bf9e3693cef871"
+      },
+      {
+        "name": "stated_footprint",
+        "config_hash": "5f4299e89ff2109c70982f15808dfea32a2d27ddbaa3df9888392b132683fda0"
+      }
+    ],
+    "policy_epoch": 7,
+    "repair_of": null
+  },
+  "cost": {
+    "ledger_txn_ids": [
+      "0e811d7a-621e-519b-a266-53756c177dd7"
+    ],
+    "settled_usd": "0.00137500",
+    "served_models": [
+      "claude-sonnet-5"
+    ]
+  },
+  "outcome": {
+    "status": "committed",
+    "substrate_txid": "stage:9e7fb382-77b0-560f-969f-5df9f825f95a"
+  },
+  "anchors": {
+    "agentgov": null,
+    "escrow": null,
+    "log": null
+  },
+  "sig": {
+    "alg": "hmac-sha256",
+    "key_id": "bea061c26f80dc50",
+    "signature": "5b2e77aa68fbeb810c0ff72b93eeae27534087c568bffca05df1b33bbdd78baa"
+  }
+}

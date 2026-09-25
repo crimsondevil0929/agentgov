@@ -1,0 +1,33 @@
+{
+  "description": "The witness checked this RFC 9162 consistency proof before it cosigned the second checkpoint.",
+  "old": {
+    "v": "ARC1-checkpoint",
+    "log_id": "arc1-vectors",
+    "tree_size": 3,
+    "root_hash": "bb988aa2d069dc0182d456fc5fda5006631a5f54d090b5a2124acbe43c76512f",
+    "issued_at": "2026-09-25T14:59:00.000000Z",
+    "sig": {
+      "alg": "ed25519",
+      "key_id": "bcc542d53c8c1a1f",
+      "signature": "356acbc65970ddccc4049cea2f3b6d88237819f4d6a559cd425c765d24c22daae57a2750eb241a7a3f8e2a46a86429def99f05adb9e593f4fd3b8b221b82e803"
+    }
+  },
+  "new": {
+    "v": "ARC1-checkpoint",
+    "log_id": "arc1-vectors",
+    "tree_size": 7,
+    "root_hash": "5b025750f43bc1be49fd5e9d58a3fb63971d4c8427d2f660d9877f2029fa5866",
+    "issued_at": "2026-09-25T15:01:00.000000Z",
+    "sig": {
+      "alg": "ed25519",
+      "key_id": "bcc542d53c8c1a1f",
+      "signature": "cb508635414203a66a90929ede80c72059c56f62d59274cd1b1457ee94109aa617a32b5010bac9e898a00afbbcc29fff721630fa44d97c40025323bf5939e809"
+    }
+  },
+  "proof": [
+    "a8874fdb147cfa4b6380258680c6d998daee0886b4fffa336555a65dad5febeb",
+    "16e68b1aa982a901f09ec61af41f1d7dc8425e20c27bd52a6231d4776cf16aa2",
+    "15b13e6087b8762068767a936781369618464f0a4e6295e55d0b29a19d86f3f4",
+    "b044a6d30e7cca91470dc942f3cba0c332fc00945e587c13e3db79c8a7ef1578"
+  ]
+}

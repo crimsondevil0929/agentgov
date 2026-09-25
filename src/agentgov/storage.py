@@ -397,7 +397,11 @@ class SqliteStore:
                     f"cannot open {self._path!r} read-only: {exc}. The file may not "
                     f"exist, or may not be readable by this user."
                 ) from exc
-            self._read_schema_version()
+            try:
+                self._read_schema_version()
+            except BaseException:
+                self._conn.close()
+                raise
             return
 
         # Claim the database before opening it for writing. Two governors on
@@ -408,15 +412,22 @@ class SqliteStore:
         if self._path != ":memory:" and not self._path.startswith("file::memory:"):
             self._lock = _AdvisoryLock(self._path)
             self._lock.acquire()
+        conn: sqlite3.Connection | None = None
         try:
-            self._conn = sqlite3.connect(self._path, check_same_thread=False)
+            conn = self._conn = sqlite3.connect(self._path, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute(f"PRAGMA synchronous = {synchronous}")
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._init_schema()
-        except BaseException:
+        except BaseException as exc:
+            if conn is not None:
+                conn.close()
             if self._lock is not None:
                 self._lock.release()
+            if isinstance(exc, sqlite3.DatabaseError):
+                # "file is not a database", a full disk, a locked file:
+                # an operational error with a message, not a traceback.
+                raise StorageError(f"cannot open {self._path!r} as a ledger: {exc}") from exc
             raise
 
     @property
@@ -442,7 +453,9 @@ class SqliteStore:
             row = self._conn.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.DatabaseError as exc:
+            # OperationalError for a database without our tables; its parent,
+            # DatabaseError, for a file that is not a SQLite database at all.
             raise StorageError(
                 f"{self._path!r} is not an agentgov database (or is empty): {exc}"
             ) from exc

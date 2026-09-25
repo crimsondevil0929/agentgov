@@ -1,0 +1,149 @@
+{
+  "v": "ARC1-bundle",
+  "receipt": {
+    "v": "ARC1",
+    "receipt_id": "6c679cd2-3180-5bcb-938f-77f115f36a91",
+    "issued_at": "2026-09-25T14:52:00.057772Z",
+    "issuer": "interlock/0.2.0 support-eu-1",
+    "authority": {
+      "scope_path": [
+        "orchestrator",
+        "fulfilment-agent"
+      ],
+      "trajectory_id": "traj-4bfdf13ab47d",
+      "capability": {
+        "grant": "grant:fulfilment-agent/tables-rw@v3",
+        "tables": [
+          "customers",
+          "order_audit",
+          "orders",
+          "refunds",
+          "support_notes"
+        ],
+        "tenants": [
+          "acme"
+        ],
+        "row_limit": 8
+      }
+    },
+    "intent": {
+      "plan_hash": "d613e5fbba0a0e5c26f72182bda261b2a8d4427300b84f696e9d09951b1f034f",
+      "stated": {
+        "rows": 1,
+        "tables": [
+          "orders"
+        ]
+      }
+    },
+    "effect": {
+      "substrate_id": "sqlite",
+      "schema_hash": "57e7211a7e34df0b936d2d9689882cd7b461f72d2cf826780b8e58afdc55c20b",
+      "diff_hash": "34daea19dbbd66ee503de19dc14442b994fc17d8822747548112e2b8d2f523ca",
+      "row_root": "8551e5a61b67c91b2d996b5ba027c5ea084a3a0a3ed2e096faf2790565515204",
+      "row_count": 1,
+      "summary": {
+        "ins": 0,
+        "upd": 1,
+        "del": 0,
+        "tables": [
+          "orders"
+        ],
+        "tenants": [
+          "acme"
+        ]
+      },
+      "truncated": false
+    },
+    "coverage": {
+      "observed_tables": [
+        "customers",
+        "order_audit",
+        "orders",
+        "refunds",
+        "support_notes"
+      ],
+      "cascade_closed": true,
+      "authorizer_on": true,
+      "known_gaps": [
+        "rows written by database triggers into unobserved tables"
+      ]
+    },
+    "decision": {
+      "verdict_hash": "7cb046d7b06efcfba1670394d82305653f93f706461681b11dca13f0bec9da21",
+      "admitted": true,
+      "checkers": [
+        {
+          "name": "blast_radius",
+          "config_hash": "bb9f138a16e216e85cbe9676b3dab7bde97bfde04007c8033119177febdf89c6"
+        },
+        {
+          "name": "tenant_isolation",
+          "config_hash": "3826b3ac6a80ea35bc6135ebc3bd72b1e0f919d7be1136d839a2b2f44ea3ade3"
+        },
+        {
+          "name": "no_delete",
+          "config_hash": "823c37ae2da6dbd285e0b8b184e91f1a420dc2cd8f1e505ac5bf9e3693cef871"
+        },
+        {
+          "name": "stated_footprint",
+          "config_hash": "5f4299e89ff2109c70982f15808dfea32a2d27ddbaa3df9888392b132683fda0"
+        }
+      ],
+      "policy_epoch": 7,
+      "repair_of": null
+    },
+    "cost": {
+      "ledger_txn_ids": [
+        "1a5d47c3-0042-52ce-9647-9a01ed51508b"
+      ],
+      "settled_usd": "0.00104500",
+      "served_models": [
+        "claude-sonnet-5"
+      ]
+    },
+    "outcome": {
+      "status": "recovered_committed",
+      "substrate_txid": "stage:4ca060f9-e879-5b2c-9616-3615427e3cbe"
+    },
+    "anchors": {
+      "agentgov": {
+        "seq": 1364,
+        "head": "49ecf17f13155bca1a748555084f5f66616f519da2880d8ffca0fddcc7b47aee"
+      },
+      "escrow": {
+        "seq": 418,
+        "head": "b743aa2875a5dafdff2e3dc7fe035bda72056bbadd5a7bfe9fbfe4324bf6949e"
+      },
+      "log": {
+        "log_id": "arc1-vectors",
+        "leaf_index": 5
+      }
+    },
+    "sig": {
+      "alg": "ed25519",
+      "key_id": "bcc542d53c8c1a1f",
+      "signature": "75109911fb51f124656335f74189b6d9ff1c301ba9bdbd8ff6f043ad6394a94a07defbc6676e9cb710b9dae6164a83a49e24d9c7bf44727c4f08a83ea5f2a401"
+    }
+  },
+  "inclusion": {
+    "leaf_index": 5,
+    "tree_size": 7,
+    "audit_path": [
+      "64cc49b0f724ef4e33c9bb119f79a2ca20c67b5b41de6c0f43a2794898e1f54b",
+      "702f91ff3de19da98db69cdc727ea2c8a7b3d8b43ebe14a1b2e3a711ba6c878b",
+      "e2d5c1880b6978d5df2ca7dc0f05a386b2d1540f0f2670f33ff9adc74b282251"
+    ]
+  },
+  "checkpoint": {
+    "v": "ARC1-checkpoint",
+    "log_id": "arc1-vectors",
+    "tree_size": 7,
+    "root_hash": "5b025750f43bc1be49fd5e9d58a3fb63971d4c8427d2f660d9877f2029fa5866",
+    "issued_at": "2026-09-25T15:01:00.000000Z",
+    "sig": {
+      "alg": "ed25519",
+      "key_id": "bcc542d53c8c1a1f",
+      "signature": "cb508635414203a66a90929ede80c72059c56f62d59274cd1b1457ee94109aa617a32b5010bac9e898a00afbbcc29fff721630fa44d97c40025323bf5939e809"
+    }
+  }
+}

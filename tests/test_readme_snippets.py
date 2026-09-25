@@ -209,6 +209,13 @@ def _resolves(symbol: str) -> bool:
     head, *rest = symbol.split(".")
     target: Any = getattr(agentgov, head, None)
     if target is None:
+        # A subpackage is an attribute only once something has imported it,
+        # so ``receipts.verify_bundle()`` must not depend on test order.
+        try:
+            target = _import_module(f"{PACKAGE}.{head}")
+        except ImportError:
+            target = None
+    if target is None:
         # Bare method names like ``verify()`` resolve against any export.
         return any(
             hasattr(getattr(agentgov, name), head)
