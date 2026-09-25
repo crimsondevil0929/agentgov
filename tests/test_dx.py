@@ -526,7 +526,7 @@ def test_inspect_honours_limit_and_raw(ledger_path: str) -> None:
     assert "last 2 of" in capped
 
     _, raw = run_cli("inspect", ledger_path, "--raw", "--limit", "1")
-    assert "AGOV1|seq=" in raw
+    assert "AGOV2|seq=" in raw
 
 
 def test_inspect_handles_an_empty_ledger(tmp_path: Path) -> None:

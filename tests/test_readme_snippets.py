@@ -220,3 +220,32 @@ def _resolves(symbol: str) -> bool:
         if target is None:
             return False
     return True
+
+
+# --------------------------------------------------------------------------
+# Badges state only what CI enforces
+# --------------------------------------------------------------------------
+
+_CI = README.parent / ".github" / "workflows" / "ci.yml"
+_BADGE = re.compile(r"\[!\[(?P<alt>[^\]]*)\]\((?P<url>https://img\.shields\.io/[^)]*)\)\]")
+
+
+def test_no_badge_claims_a_number_ci_does_not_enforce() -> None:
+    """A hard-coded "338/338 passing" was stale within a release. A count is
+    only true on the commit it was typed on; the CI badge is the live one."""
+    for badge in _BADGE.finditer(README.read_text(encoding="utf-8")):
+        url = badge["url"]
+        assert "/badge/tests-" not in url, f"static test-count badge: {url}"
+        assert not re.search(r"/badge/coverage-\d", url), f"static coverage figure: {url}"
+
+
+def test_the_coverage_floor_badge_matches_the_floor_ci_enforces() -> None:
+    floors = re.findall(r"--fail-under[= ](\d+)", _CI.read_text(encoding="utf-8"))
+    assert floors, "ci.yml no longer enforces a coverage floor"
+    badges = [
+        b["url"]
+        for b in _BADGE.finditer(README.read_text(encoding="utf-8"))
+        if "coverage%20floor" in b["url"]
+    ]
+    assert len(badges) == 1, "exactly one coverage-floor badge"
+    assert f"floor-{floors[0]}%25" in badges[0], (badges[0], floors)

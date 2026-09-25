@@ -61,6 +61,7 @@ from agentgov.core import (
     Ledger,
     LedgerEntry,
     LedgerLine,
+    WriteBatch,
     format_audit_line,
     money,
 )
@@ -109,7 +110,14 @@ from agentgov.reconciliation import (
     load_provider_export,
     reconcile,
 )
-from agentgov.storage import PersistedAuthorization, PersistedNode, PersistenceStore, SqliteStore
+from agentgov.storage import (
+    PersistedAuthorization,
+    PersistedNode,
+    PersistenceStore,
+    SqliteStore,
+    StoreDelta,
+    StoreImage,
+)
 from agentgov.streaming import AsyncMeteredStream, MeteredStream
 
 __all__ = [
@@ -167,12 +175,15 @@ __all__ = [
     "SpendGuard",
     "SqliteStore",
     "StorageError",
+    "StoreDelta",
+    "StoreImage",
     "SubBudgetAllocationError",
     "TokenUsage",
     "ToolCall",
     "TrajectoryEntropyObserver",
     "UnknownScopeError",
     "Verdict",
+    "WriteBatch",
     "canonical_arguments",
     "default_usage_extractor",
     "estimate_tokens",
@@ -187,4 +198,4 @@ __all__ = [
     "reconcile",
 ]
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

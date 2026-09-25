@@ -13,12 +13,26 @@ persistence adds zero runtime dependencies), but the interface is the natural
 place a future distributed backend — the multi-node consensus store the
 project roadmap describes — would plug in instead.
 
+Two properties every implementation must provide, and :class:`SqliteStore`
+does:
+
+**One transaction per unit of work.** :meth:`PersistenceStore.commit` makes a
+whole :class:`~agentgov.core.WriteBatch` durable or none of it. A governor
+operation touches the ledger and up to three cache tables; writing them in
+separate transactions is what let a crash between two of them leave a
+released hold behind an open authorization.
+
+**One consistent read.** :meth:`PersistenceStore.load` and
+:meth:`PersistenceStore.snapshot` read every table inside a single read
+transaction, so a reader following a live writer never sees an entry without
+the cache rows committed with it, or the reverse.
+
 Every write happens *before* the corresponding in-memory mutation in
-:mod:`agentgov.core`, and every reader-facing figure this file writes has
-already been quantized and validated by :mod:`agentgov.core`. This module
-does not reinterpret money: amounts round-trip through ``TEXT`` columns as
-the exact ``Decimal`` string :mod:`agentgov.core` already produced, never
-through a floating-point column type.
+:mod:`agentgov.core`, and every figure this file writes has already been
+quantized and validated by :mod:`agentgov.core`. This module does not
+reinterpret money: amounts round-trip through ``TEXT`` columns as the exact
+``Decimal`` string :mod:`agentgov.core` produced, never through a
+floating-point column type.
 """
 
 from __future__ import annotations
@@ -29,15 +43,25 @@ import socket
 import sqlite3
 import sys
 import uuid
-from collections.abc import Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
 
-from agentgov.core import ControlEvent, Direction, EntryType, LedgerEntry, _iso, _parse_iso
+from agentgov.core import (
+    Authorization,
+    BudgetNode,
+    ControlEvent,
+    Direction,
+    EntryType,
+    LedgerEntry,
+    WriteBatch,
+    _iso,
+    _parse_iso,
+)
 from agentgov.exceptions import (
     ConcurrentGovernorError,
     LedgerIntegrityError,
@@ -50,9 +74,24 @@ __all__ = [
     "PersistedNode",
     "PersistenceStore",
     "SqliteStore",
+    "StoreDelta",
+    "StoreImage",
 ]
 
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
+"""v0.1.2: entries carry their payload ``version`` and hold ``ref``; control
+events name the chain entry that records them."""
+
+_LEGACY_SCHEMA_VERSION = "1"
+"""v0.1.0 and v0.1.1. Read as-is when opened read-only; upgraded in place the
+first time it is opened for writing."""
+
+_SUPPORTED_VERSIONS = frozenset({_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION})
+
+_ENTRY_COLUMNS = (
+    "sequence, entry_id, transaction_id, timestamp, entry_type, direction, scope_id, "
+    "counterparty_id, amount, balance_after, prev_hash, entry_hash, memo"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,19 +127,62 @@ class PersistedAuthorization:
     entry_id: uuid.UUID
 
 
+@dataclass(frozen=True, slots=True)
+class StoreImage:
+    """Everything a store holds, read in one transaction.
+
+    :ivar control_high_water: The highest ``control_events`` row id read, so a
+        later :meth:`PersistenceStore.snapshot` can continue from it.
+    """
+
+    schema_version: str
+    entries: tuple[LedgerEntry, ...]
+    nodes: tuple[PersistedNode, ...]
+    control_events: tuple[ControlEvent, ...]
+    authorizations: tuple[PersistedAuthorization, ...]
+    control_high_water: int
+
+
+@dataclass(frozen=True, slots=True)
+class StoreDelta:
+    """What changed since a reader last looked, read in one transaction.
+
+    :ivar anchor_hash: The ``entry_hash`` stored at the sequence the reader
+        last verified, so the reader can tell that history was not rewritten
+        under it. ``None`` when it asked from the start, or when that entry no
+        longer exists.
+    :ivar entries: Entries after that sequence, in chain order.
+    :ivar authorizations: Every open authorization, now.
+    :ivar legacy_control_events: Control events after the reader's high-water
+        mark that no chain entry records — written by a pre-0.1.2 governor.
+    """
+
+    schema_version: str
+    anchor_hash: str | None
+    entries: tuple[LedgerEntry, ...]
+    authorizations: tuple[PersistedAuthorization, ...]
+    legacy_control_events: tuple[ControlEvent, ...]
+    control_high_water: int
+
+
 class PersistenceStore(Protocol):
     """The durability seam a :class:`~agentgov.core.Ledger` and
     :class:`~agentgov.core.BudgetManager` write through to.
 
-    Every method here is called with the manager's own lock held, so an
+    Every write is called with the manager's own lock held, so an
     implementation never needs to provide its own concurrency control — it
-    only needs to make each individual call durable. A distributed backend
-    (the Phase 2 multi-node consensus store) implements this same interface
-    with a replicated write in place of a local file.
+    only needs to make each :meth:`commit` durable as a whole. A distributed
+    backend (the Phase 2 multi-node consensus store) implements this same
+    interface with a replicated write in place of a local file.
     """
 
-    def append_entries(self, entries: Sequence[LedgerEntry]) -> None:
-        """Durably append ``entries``. Must be all-or-nothing.
+    @property
+    def read_only(self) -> bool:
+        """Whether every write is refused."""
+        ...
+
+    def commit(self, batch: WriteBatch) -> None:
+        """Durably apply ``batch``, all of it or none of it.
 
         :raises Exception: Any failure must propagate — a caller that
             catches this and continues would commit to memory a transaction
@@ -108,53 +190,29 @@ class PersistenceStore(Protocol):
         """
         ...
 
+    def load(self) -> StoreImage:
+        """Read every table in one consistent read."""
+        ...
+
     def load_entries(self) -> tuple[LedgerEntry, ...]:
-        """Return every previously persisted entry, oldest first."""
+        """Return every persisted entry, oldest first."""
         ...
 
-    def upsert_node(
+    def snapshot(self, *, after_sequence: int, after_control_row: int) -> StoreDelta:
+        """Read what changed after ``after_sequence``, in one consistent read."""
+        ...
+
+    def rebuild_caches(
         self,
-        scope_id: str,
-        parent_id: str | None,
-        depth: int,
-        allocated: Decimal,
-        created_at: datetime,
+        *,
+        nodes: Sequence[BudgetNode],
+        control_events: Sequence[ControlEvent],
+        authorizations: Sequence[Authorization],
     ) -> None:
-        """Durably record a scope's current topology and lifetime allocation."""
-        ...
+        """Replace the cache tables with rows derived from the chain.
 
-    def load_nodes(self) -> tuple[PersistedNode, ...]:
-        """Return every persisted scope's topology, in no particular order."""
-        ...
-
-    def append_control_event(self, event: ControlEvent) -> None:
-        """Durably record a circuit-breaker trip or reset."""
-        ...
-
-    def load_control_events(self) -> tuple[ControlEvent, ...]:
-        """Return every persisted control event, oldest first."""
-        ...
-
-    def put_authorization(
-        self,
-        authorization_id: uuid.UUID,
-        scope_id: str,
-        amount: Decimal,
-        opened_at: datetime,
-        entry_id: uuid.UUID,
-    ) -> None:
-        """Durably record a newly placed authorization hold."""
-        ...
-
-    def delete_authorization(self, authorization_id: uuid.UUID) -> None:
-        """Remove a settled or voided authorization hold."""
-        ...
-
-    def load_open_authorizations(self) -> tuple[PersistedAuthorization, ...]:
-        """Return every hold that was never settled or voided, in no
-        particular order — a restart-time reconciliation list as much as a
-        recovery mechanism: a hold present here after a long-dead process
-        exited is a candidate for an operator to void by hand."""
+        Leaves the entries, and any pre-0.1.2 control events, untouched.
+        """
         ...
 
     def close(self) -> None:
@@ -300,6 +358,10 @@ class SqliteStore:
     connection is opened with ``check_same_thread=False`` on that basis, not
     because SQLite is safe to share across threads unsupervised.
 
+    A database written by v0.1.0 or v0.1.1 (schema version 1) is upgraded in
+    place, inside one transaction, the first time it is opened for writing.
+    Opened read-only, it is read as it is.
+
     :param path: Filesystem path to the database file, or ``":memory:"`` for
         a store that never touches disk (useful in tests; does not survive
         a restart, since there is nothing on disk to restart from).
@@ -335,7 +397,7 @@ class SqliteStore:
                     f"cannot open {self._path!r} read-only: {exc}. The file may not "
                     f"exist, or may not be readable by this user."
                 ) from exc
-            self._verify_schema_version()
+            self._read_schema_version()
             return
 
         # Claim the database before opening it for writing. Two governors on
@@ -362,13 +424,20 @@ class SqliteStore:
         """Whether this store refuses writes."""
         return self._read_only
 
+    @property
+    def schema_version(self) -> str:
+        """The schema version currently on disk."""
+        return self._read_schema_version()
+
     def _require_writable(self, operation: str) -> None:
         """Refuse a mutation up front rather than deep inside a transaction."""
         if self._read_only:
             raise ReadOnlyLedgerError(operation)
 
-    def _verify_schema_version(self) -> None:
-        """Check the schema version without creating anything (read-only path)."""
+    # -- schema -----------------------------------------------------------
+
+    def _read_schema_version(self) -> str:
+        """The stored schema version, refusing one this code cannot read."""
         try:
             row = self._conn.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
@@ -377,34 +446,36 @@ class SqliteStore:
             raise StorageError(
                 f"{self._path!r} is not an agentgov database (or is empty): {exc}"
             ) from exc
-        if row is not None and row[0] != _SCHEMA_VERSION:
+        if row is None:
+            return _SCHEMA_VERSION
+        version = str(row[0])
+        if version not in _SUPPORTED_VERSIONS:
             raise LedgerIntegrityError(
-                f"database schema version {row[0]!r} does not match "
+                f"database schema version {version!r} does not match "
                 f"this version of agentgov ({_SCHEMA_VERSION!r}); "
                 f"refusing to open a file this version cannot interpret"
             )
+        return version
 
     def _init_schema(self) -> None:
-        with self._conn:
-            self._conn.execute(
+        """Create the schema, or upgrade a version-1 database, in one transaction."""
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
-            row = self._conn.execute(
+            row = conn.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
-                    (_SCHEMA_VERSION,),
-                )
-            elif row[0] != _SCHEMA_VERSION:
+            found = None if row is None else str(row[0])
+            if found is not None and found not in _SUPPORTED_VERSIONS:
                 raise LedgerIntegrityError(
-                    f"database schema version {row[0]!r} does not match "
+                    f"database schema version {found!r} does not match "
                     f"this version of agentgov ({_SCHEMA_VERSION!r}); "
                     f"refusing to open a file this version cannot interpret"
                 )
-
-            self._conn.execute(
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entries (
                     sequence        INTEGER PRIMARY KEY,
@@ -419,11 +490,13 @@ class SqliteStore:
                     balance_after   TEXT NOT NULL,
                     prev_hash       TEXT NOT NULL,
                     entry_hash      TEXT NOT NULL,
-                    memo            TEXT NOT NULL DEFAULT ''
+                    memo            TEXT NOT NULL DEFAULT '',
+                    version         TEXT NOT NULL DEFAULT 'AGOV1',
+                    ref             TEXT
                 )
                 """
             )
-            self._conn.execute(
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS nodes (
                     scope_id   TEXT PRIMARY KEY,
@@ -434,7 +507,7 @@ class SqliteStore:
                 )
                 """
             )
-            self._conn.execute(
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS control_events (
                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -443,11 +516,12 @@ class SqliteStore:
                     event_type        TEXT NOT NULL,
                     scope_id          TEXT NOT NULL,
                     reason            TEXT NOT NULL,
-                    ledger_head_hash  TEXT NOT NULL
+                    ledger_head_hash  TEXT NOT NULL,
+                    entry_id          TEXT
                 )
                 """
             )
-            self._conn.execute(
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS open_authorizations (
                     authorization_id TEXT PRIMARY KEY,
@@ -458,54 +532,259 @@ class SqliteStore:
                 )
                 """
             )
+            # A version-1 database already had these tables, without the
+            # columns v0.1.2 needs. Existing rows keep their meaning: an entry
+            # with no version is AGOV1, a control event with no entry_id was
+            # written before control events were chained.
+            if not self._has_column("entries", "version"):
+                conn.execute("ALTER TABLE entries ADD COLUMN version TEXT NOT NULL DEFAULT 'AGOV1'")
+            if not self._has_column("entries", "ref"):
+                conn.execute("ALTER TABLE entries ADD COLUMN ref TEXT")
+            if not self._has_column("control_events", "entry_id"):
+                conn.execute("ALTER TABLE control_events ADD COLUMN entry_id TEXT")
+            conn.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_SCHEMA_VERSION,),
+            )
+            conn.commit()
+        except BaseException:
+            with suppress(sqlite3.Error):
+                conn.rollback()
+            raise
 
-    # -- ledger entries -----------------------------------------------------
+    def _has_column(self, table: str, column: str) -> bool:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(row[1] == column for row in rows)
 
-    def append_entries(self, entries: Sequence[LedgerEntry]) -> None:
-        self._require_writable("append ledger entries")
+    # -- writing ----------------------------------------------------------
+
+    def _write(self, operation: str, work: Callable[[sqlite3.Connection], None]) -> None:
+        """Run ``work`` as one immediate transaction, committed or rolled back."""
+        self._require_writable(operation)
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            with self._conn:
-                self._conn.executemany(
-                    """
-                    INSERT INTO entries (
-                        sequence, entry_id, transaction_id, timestamp, entry_type,
-                        direction, scope_id, counterparty_id, amount, balance_after,
-                        prev_hash, entry_hash, memo
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            e.sequence,
-                            str(e.entry_id),
-                            str(e.transaction_id),
-                            _iso(e.timestamp),
-                            e.entry_type.value,
-                            e.direction.value,
-                            e.scope_id,
-                            e.counterparty_id,
-                            str(e.amount),
-                            str(e.balance_after),
-                            e.prev_hash,
-                            e.entry_hash,
-                            e.memo,
-                        )
-                        for e in entries
-                    ],
+            work(conn)
+            conn.commit()
+        except BaseException:
+            with suppress(sqlite3.Error):
+                conn.rollback()
+            raise
+
+    def commit(self, batch: WriteBatch) -> None:
+        """Durably apply one unit of work in a single transaction."""
+        if not batch:
+            return
+
+        def work(conn: sqlite3.Connection) -> None:
+            if batch.entries:
+                conn.executemany(
+                    # Column names are this module's constant, never input.
+                    f"INSERT INTO entries ({_ENTRY_COLUMNS}, version, ref) "  # noqa: S608
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [_entry_row(e) for e in batch.entries],
                 )
+            for node in batch.nodes:
+                _upsert_node(conn, node)
+            for event in batch.control_events:
+                _insert_control_event(conn, event)
+            for auth in batch.opened:
+                conn.execute(
+                    """
+                    INSERT INTO open_authorizations
+                        (authorization_id, scope_id, amount, opened_at, entry_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(auth.authorization_id),
+                        auth.scope_id,
+                        str(auth.amount),
+                        _iso(auth.opened_at),
+                        str(auth.entry.entry_id),
+                    ),
+                )
+            for authorization_id in batch.closed:
+                conn.execute(
+                    "DELETE FROM open_authorizations WHERE authorization_id = ?",
+                    (str(authorization_id),),
+                )
+
+        count = len(batch.entries)
+        try:
+            self._write("commit a transaction", work)
         except sqlite3.IntegrityError as exc:
             raise LedgerIntegrityError(
-                f"failed to durably append {len(entries)} entr"
-                f"{'y' if len(entries) == 1 else 'ies'}: {exc}"
+                f"failed to durably append {count} entr{'y' if count == 1 else 'ies'}: {exc}"
             ) from exc
 
+    def rebuild_caches(
+        self,
+        *,
+        nodes: Sequence[BudgetNode],
+        control_events: Sequence[ControlEvent],
+        authorizations: Sequence[Authorization],
+    ) -> None:
+        """Replace the topology, chained control events and open authorizations."""
+
+        def work(conn: sqlite3.Connection) -> None:
+            conn.execute("DELETE FROM nodes")
+            for node in nodes:
+                _upsert_node(conn, node)
+            conn.execute("DELETE FROM control_events WHERE entry_id IS NOT NULL")
+            for event in control_events:
+                _insert_control_event(conn, event)
+            conn.execute("DELETE FROM open_authorizations")
+            for auth in authorizations:
+                conn.execute(
+                    """
+                    INSERT INTO open_authorizations
+                        (authorization_id, scope_id, amount, opened_at, entry_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(auth.authorization_id),
+                        auth.scope_id,
+                        str(auth.amount),
+                        _iso(auth.opened_at),
+                        str(auth.entry.entry_id),
+                    ),
+                )
+
+        self._write("repair cache tables", work)
+
+    # -- single-purpose writes, kept for direct callers --------------------
+
+    def append_entries(self, entries: Sequence[LedgerEntry]) -> None:
+        """Durably append ``entries`` as one transaction."""
+        self.commit(WriteBatch(entries=list(entries)))
+
+    def upsert_node(
+        self,
+        scope_id: str,
+        parent_id: str | None,
+        depth: int,
+        allocated: Decimal,
+        created_at: datetime,
+    ) -> None:
+        """Durably record a scope's current topology and lifetime allocation."""
+        node = BudgetNode(scope_id, parent_id, depth, allocated, created_at=created_at)
+        self.commit(WriteBatch(nodes=[node]))
+
+    def append_control_event(self, event: ControlEvent) -> None:
+        """Durably record a circuit-breaker trip or reset."""
+        self.commit(WriteBatch(control_events=[event]))
+
+    def put_authorization(
+        self,
+        authorization_id: uuid.UUID,
+        scope_id: str,
+        amount: Decimal,
+        opened_at: datetime,
+        entry_id: uuid.UUID,
+    ) -> None:
+        """Durably record a newly placed authorization hold."""
+
+        def work(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO open_authorizations
+                    (authorization_id, scope_id, amount, opened_at, entry_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (str(authorization_id), scope_id, str(amount), _iso(opened_at), str(entry_id)),
+            )
+
+        self._write("record an authorization", work)
+
+    def delete_authorization(self, authorization_id: uuid.UUID) -> None:
+        """Remove a settled or voided authorization hold."""
+        self.commit(WriteBatch(closed=[authorization_id]))
+
+    # -- reading ----------------------------------------------------------
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[None]:
+        """Hold one read transaction, so several SELECTs see one snapshot."""
+        conn = self._conn
+        if conn.in_transaction:
+            yield
+            return
+        conn.execute("BEGIN")
+        try:
+            yield
+        finally:
+            with suppress(sqlite3.Error):
+                conn.rollback()
+
+    def load(self) -> StoreImage:
+        """Read every table in one consistent read."""
+        with self._read_transaction():
+            version = self._read_schema_version()
+            entries = self._select_entries("", ())
+            nodes = self._select_nodes()
+            rows = self._select_control_rows(after=0)
+            authorizations = self._select_authorizations()
+        return StoreImage(
+            schema_version=version,
+            entries=entries,
+            nodes=nodes,
+            control_events=tuple(event for _, event in rows),
+            authorizations=authorizations,
+            control_high_water=max((row_id for row_id, _ in rows), default=0),
+        )
+
+    def snapshot(self, *, after_sequence: int, after_control_row: int) -> StoreDelta:
+        """Read what changed after ``after_sequence``, in one consistent read."""
+        with self._read_transaction():
+            version = self._read_schema_version()
+            anchor: str | None = None
+            if after_sequence > 0:
+                row = self._conn.execute(
+                    "SELECT entry_hash FROM entries WHERE sequence = ?", (after_sequence,)
+                ).fetchone()
+                anchor = None if row is None else str(row[0])
+            entries = self._select_entries("WHERE sequence > ?", (after_sequence,))
+            authorizations = self._select_authorizations()
+            rows = self._select_control_rows(after=after_control_row)
+        return StoreDelta(
+            schema_version=version,
+            anchor_hash=anchor,
+            entries=entries,
+            authorizations=authorizations,
+            legacy_control_events=tuple(event for _, event in rows if event.entry_id is None),
+            control_high_water=max((row_id for row_id, _ in rows), default=after_control_row),
+        )
+
     def load_entries(self) -> tuple[LedgerEntry, ...]:
+        """Return every persisted entry, oldest first."""
+        with self._read_transaction():
+            return self._select_entries("", ())
+
+    def load_nodes(self) -> tuple[PersistedNode, ...]:
+        """Return every persisted scope's topology, in no particular order."""
+        with self._read_transaction():
+            return self._select_nodes()
+
+    def load_control_events(self) -> tuple[ControlEvent, ...]:
+        """Return every persisted control event, oldest first."""
+        with self._read_transaction():
+            return tuple(event for _, event in self._select_control_rows(after=0))
+
+    def load_open_authorizations(self) -> tuple[PersistedAuthorization, ...]:
+        """Return every hold that was never settled or voided, in no
+        particular order — a restart-time reconciliation list as much as a
+        recovery mechanism: a hold present here after a long-dead process
+        exited is a candidate for an operator to void by hand."""
+        with self._read_transaction():
+            return self._select_authorizations()
+
+    def _select_entries(self, where: str, params: tuple[object, ...]) -> tuple[LedgerEntry, ...]:
+        versioned = self._has_column("entries", "version")
+        columns = _ENTRY_COLUMNS + (", version, ref" if versioned else "")
         rows = self._conn.execute(
-            """
-            SELECT sequence, entry_id, transaction_id, timestamp, entry_type,
-                   direction, scope_id, counterparty_id, amount, balance_after,
-                   prev_hash, entry_hash, memo
-            FROM entries ORDER BY sequence ASC
-            """
+            f"SELECT {columns} FROM entries {where} ORDER BY sequence ASC",  # noqa: S608
+            params,
         ).fetchall()
         return tuple(
             LedgerEntry(
@@ -522,35 +801,13 @@ class SqliteStore:
                 prev_hash=row[10],
                 entry_hash=row[11],
                 memo=row[12],
+                ref=uuid.UUID(row[14]) if versioned and row[14] else None,
+                version=row[13] if versioned else "AGOV1",
             )
             for row in rows
         )
 
-    # -- topology -------------------------------------------------------
-
-    def upsert_node(
-        self,
-        scope_id: str,
-        parent_id: str | None,
-        depth: int,
-        allocated: Decimal,
-        created_at: datetime,
-    ) -> None:
-        self._require_writable("record a budget scope")
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO nodes (scope_id, parent_id, depth, allocated, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(scope_id) DO UPDATE SET
-                    parent_id = excluded.parent_id,
-                    depth = excluded.depth,
-                    allocated = excluded.allocated
-                """,
-                (scope_id, parent_id, depth, str(allocated), _iso(created_at)),
-            )
-
-    def load_nodes(self) -> tuple[PersistedNode, ...]:
+    def _select_nodes(self) -> tuple[PersistedNode, ...]:
         rows = self._conn.execute(
             "SELECT scope_id, parent_id, depth, allocated, created_at FROM nodes"
         ).fetchall()
@@ -565,76 +822,32 @@ class SqliteStore:
             for row in rows
         )
 
-    # -- control events -------------------------------------------------
-
-    def append_control_event(self, event: ControlEvent) -> None:
-        self._require_writable("record a control event")
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO control_events
-                    (event_id, timestamp, event_type, scope_id, reason, ledger_head_hash)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(event.event_id),
-                    _iso(event.timestamp),
-                    event.event_type,
-                    event.scope_id,
-                    event.reason,
-                    event.ledger_head_hash,
-                ),
-            )
-
-    def load_control_events(self) -> tuple[ControlEvent, ...]:
+    def _select_control_rows(self, *, after: int) -> tuple[tuple[int, ControlEvent], ...]:
+        chained = self._has_column("control_events", "entry_id")
+        columns = "id, event_id, timestamp, event_type, scope_id, reason, ledger_head_hash"
+        if chained:
+            columns += ", entry_id"
         rows = self._conn.execute(
-            """
-            SELECT event_id, timestamp, event_type, scope_id, reason, ledger_head_hash
-            FROM control_events ORDER BY id ASC
-            """
+            f"SELECT {columns} FROM control_events WHERE id > ? ORDER BY id ASC",  # noqa: S608
+            (after,),
         ).fetchall()
         return tuple(
-            ControlEvent(
-                event_id=uuid.UUID(row[0]),
-                timestamp=_parse_iso(row[1]),
-                event_type=row[2],
-                scope_id=row[3],
-                reason=row[4],
-                ledger_head_hash=row[5],
+            (
+                int(row[0]),
+                ControlEvent(
+                    event_id=uuid.UUID(row[1]),
+                    timestamp=_parse_iso(row[2]),
+                    event_type=row[3],
+                    scope_id=row[4],
+                    reason=row[5],
+                    ledger_head_hash=row[6],
+                    entry_id=uuid.UUID(row[7]) if chained and row[7] else None,
+                ),
             )
             for row in rows
         )
 
-    # -- open authorizations ---------------------------------------------
-
-    def put_authorization(
-        self,
-        authorization_id: uuid.UUID,
-        scope_id: str,
-        amount: Decimal,
-        opened_at: datetime,
-        entry_id: uuid.UUID,
-    ) -> None:
-        self._require_writable("record an authorization")
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO open_authorizations
-                    (authorization_id, scope_id, amount, opened_at, entry_id)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (str(authorization_id), scope_id, str(amount), _iso(opened_at), str(entry_id)),
-            )
-
-    def delete_authorization(self, authorization_id: uuid.UUID) -> None:
-        self._require_writable("settle an authorization")
-        with self._conn:
-            self._conn.execute(
-                "DELETE FROM open_authorizations WHERE authorization_id = ?",
-                (str(authorization_id),),
-            )
-
-    def load_open_authorizations(self) -> tuple[PersistedAuthorization, ...]:
+    def _select_authorizations(self) -> tuple[PersistedAuthorization, ...]:
         rows = self._conn.execute(
             "SELECT authorization_id, scope_id, amount, opened_at, entry_id "
             "FROM open_authorizations"
@@ -659,3 +872,56 @@ class SqliteStore:
             if self._lock is not None:
                 self._lock.release()
                 self._lock = None
+
+
+def _entry_row(entry: LedgerEntry) -> tuple[object, ...]:
+    return (
+        entry.sequence,
+        str(entry.entry_id),
+        str(entry.transaction_id),
+        _iso(entry.timestamp),
+        entry.entry_type.value,
+        entry.direction.value,
+        entry.scope_id,
+        entry.counterparty_id,
+        str(entry.amount),
+        str(entry.balance_after),
+        entry.prev_hash,
+        entry.entry_hash,
+        entry.memo,
+        entry.version,
+        str(entry.ref) if entry.ref is not None else None,
+    )
+
+
+def _upsert_node(conn: sqlite3.Connection, node: BudgetNode) -> None:
+    conn.execute(
+        """
+        INSERT INTO nodes (scope_id, parent_id, depth, allocated, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(scope_id) DO UPDATE SET
+            parent_id = excluded.parent_id,
+            depth = excluded.depth,
+            allocated = excluded.allocated
+        """,
+        (node.scope_id, node.parent_id, node.depth, str(node.allocated), _iso(node.created_at)),
+    )
+
+
+def _insert_control_event(conn: sqlite3.Connection, event: ControlEvent) -> None:
+    conn.execute(
+        """
+        INSERT INTO control_events
+            (event_id, timestamp, event_type, scope_id, reason, ledger_head_hash, entry_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(event.event_id),
+            _iso(event.timestamp),
+            event.event_type,
+            event.scope_id,
+            event.reason,
+            event.ledger_head_hash,
+            str(event.entry_id) if event.entry_id is not None else None,
+        ),
+    )

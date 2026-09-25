@@ -101,10 +101,12 @@ def test_balances_thread_through_a_single_transaction() -> None:
     """A capture credits and debits the same scope in one transaction."""
     ledger = Ledger()
     ledger.post([fund("root", "1.00")])
-    ledger.post([LedgerLine(EntryType.HOLD, Direction.DEBIT, "root", money("0.30"))])
+    (hold,) = ledger.post([LedgerLine(EntryType.HOLD, Direction.DEBIT, "root", money("0.30"))])
     entries = ledger.post(
         [
-            LedgerLine(EntryType.HOLD_VOID, Direction.CREDIT, "root", money("0.30")),
+            LedgerLine(
+                EntryType.HOLD_VOID, Direction.CREDIT, "root", money("0.30"), ref=hold.entry_id
+            ),
             spend("root", "0.05"),
         ]
     )
@@ -237,7 +239,7 @@ def test_audit_line_is_fixed_field_and_parseable() -> None:
     line = format_audit_line(entry)
     fields = dict(part.split("=", 1) for part in line.split("|")[1:])
 
-    assert line.startswith("AGOV1|")
+    assert line.startswith("AGOV2|")
     assert fields["seq"] == "0000000001"
     assert fields["type"] == "funding"
     assert fields["dir"] == "CR"

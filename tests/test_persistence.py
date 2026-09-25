@@ -15,7 +15,6 @@ import subprocess
 import sys
 import threading
 import uuid
-from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
@@ -29,8 +28,8 @@ from agentgov.core import (
     EntryType,
     GovernancePolicy,
     Ledger,
-    LedgerEntry,
     LedgerLine,
+    WriteBatch,
     money,
 )
 from agentgov.exceptions import BudgetExceededError, CircuitOpenError, LedgerIntegrityError
@@ -258,10 +257,11 @@ def test_appending_a_duplicate_sequence_number_is_rejected(db_path: str) -> None
 
 
 class _BrokenStoreAfterN:
-    """Wraps a real store but fails ``append_entries`` after N successes.
+    """Wraps a real store but fails ``commit`` after N successes.
 
     Used to simulate a disk-full / I/O-error mid-run without needing to
-    actually exhaust disk space.
+    actually exhaust disk space. ``commit`` is the store's only write path:
+    every governor operation reaches the disk through one call to it.
     """
 
     def __init__(self, inner: SqliteStore, fail_after: int) -> None:
@@ -269,11 +269,11 @@ class _BrokenStoreAfterN:
         self._fail_after = fail_after
         self._calls = 0
 
-    def append_entries(self, entries: Sequence[LedgerEntry]) -> None:
+    def commit(self, batch: WriteBatch) -> None:
         self._calls += 1
         if self._calls > self._fail_after:
             raise OSError("simulated disk failure")
-        self._inner.append_entries(entries)
+        self._inner.commit(batch)
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._inner, name)

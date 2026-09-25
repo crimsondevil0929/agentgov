@@ -8,6 +8,119 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-25
+
+Makes four of v0.1.1's guarantees true. Each was broken in a way that every
+verifier passed, and each fix is tested against a reproduction of the break in
+[`tests/test_core_guarantees.py`](tests/test_core_guarantees.py).
+
+### Fixed
+
+- **A crash inside `capture()` could return the same hold twice (R1).**
+  `capture()` committed the release and the spend, then deleted the open
+  authorization in a second transaction. A process killed between the two
+  restarted with a released hold behind an open authorization, and the
+  documented recovery, `void_stale()`, released it again: on a $1.00 envelope
+  with $0.10 spent, $1.40 became available, and every verifier passed. Three
+  independent fixes, any one of which stops it:
+  - **One operation is one transaction.** `PersistenceStore.commit(batch)`
+    writes an operation's entries, topology, breaker events and authorization
+    changes in a single SQLite transaction, and memory changes only once it has
+    committed. Tested by failing every statement of every operation in turn,
+    and by killing a real process at every statement of `capture()`.
+  - **A release names its hold.** `AGOV2` entries carry `ref`, the `entry_id`
+    of the hold that a `hold_void` releases and a settling `spend` settles,
+    inside the hash. The ledger refuses to release a hold that is not open, one
+    from another scope, or a different amount, so no caller can release a hold
+    twice, including a buggy recovery path.
+  - **The tables must agree with the chain.** At open, every open-authorization
+    row must name an open hold of the same scope and amount, and every open hold
+    must be named. A database that disagrees, including one a v0.1.1 crash left
+    behind, is refused with the rows named. `open_sqlite(path, repair=True)` or
+    `agentgov repair` rebuilds the tables from the chain. No money moves.
+- **Deleting a trip row un-halted a scope; editing `nodes.parent_id` moved a
+  scope out from under its halted parent (R2, R6).** Breaker trips and the
+  delegation tree lived in tables outside the chain, and `verify_integrity()`
+  never compared the two. Trips and resets are now zero-value
+  `circuit_tripped` / `circuit_reset` entries, and the tree is derived from the
+  `funding` and `allocation` entries. The `nodes` and `control_events` tables
+  are caches, checked against the chain at open and by `verify_integrity()`.
+- **The third streamed call on a trajectory tripped as an exact repeat (R3).**
+  The streaming path fingerprinted a fixed memo string rather than the request,
+  so three different prompts looked identical to the loop detector, at
+  confidence 1.0. A stream is now observed by the call it carries, and the text
+  it produces (up to 64K characters) is recorded as its result, so the
+  result-similarity check can tell pagination from thrashing. An opaque thunk is
+  checked against the breaker but not recorded as a call.
+- **A read-only manager never saw anything written after it opened (R4, this
+  side).** New `BudgetManager.refresh()` reads everything committed since, in
+  one consistent read, verifies it against the head the view already trusts,
+  and applies it all or nothing: balances, tree and breaker state move together
+  or not at all. A rewrite under the view, or anything that fails verification,
+  raises, and the view then refuses every later refresh. It follows a writer
+  that upgrades the schema under it. interlock calls it before every breaker
+  check.
+- **The 64-worker stress test is no longer timing-dependent.** It asserted
+  exactly ten winners, which failed about one run in five: a straggler that
+  reaches `authorize()` after two winners settle legitimately wins too. It now
+  replays the chain and asserts what must hold however the threads interleave:
+  never more than ten holds open at once.
+
+### Added
+
+- `EntryType.CIRCUIT_TRIPPED`, `CIRCUIT_RESET`, `ANCHOR` and `SEAL`: zero-value
+  entries with direction `--`, excluded from the money totals.
+- `BudgetManager.anchor(scope_id, memo)` commits an external record, such as
+  another chain's head, as a zero-value entry. interlock's reverse anchor uses
+  it, so it no longer costs a settled spend.
+- `BudgetManager.refresh()`, `BudgetManager.repairs`,
+  `open_sqlite(..., repair=True)` and `agentgov repair`.
+- `LedgerEntry.ref`, `LedgerEntry.version`, `LedgerLine.ref`,
+  `ControlEvent.entry_id`.
+- `WriteBatch`, `StoreImage` and `StoreDelta`, and on `PersistenceStore`:
+  `commit()`, `load()`, `snapshot()`, `rebuild_caches()` and `read_only`.
+- `CognitiveBreaker.check()` and `agentgov.streaming.BoundCall`.
+
+### Changed
+
+- **Audit version `AGOV2`.** New entries also hash `ref` and log as
+  `AGOV2|...|ref=<uuid>`. Every entry records the version it was written with,
+  and an `AGOV1` entry still verifies under the `AGOV1` rules. `AGOV1` entries
+  cannot follow `AGOV2` ones.
+- **Schema version 2, upgraded in place.** A v0.1.0 or v0.1.1 database gains
+  its new columns the first time v0.1.2 opens it for writing, and a migration
+  seal (a zero-value `seal` entry carrying a digest of the old, unchained
+  breaker events) commits those events into the chain. Opened read-only, it is
+  served as it is.
+- **`Authorization.authorization_id` is its hold's `entry_id`**, so the chain
+  alone links an authorization to its settlement.
+- **A trip is one entry.** The call that trips a breaker now leaves one
+  zero-value entry; every refused call after it still writes nothing. Entry
+  counts in the benchmark and the demos grow by one per trip, and the README's
+  recorded benchmark run is re-recorded.
+- **Custom `PersistenceStore` implementations need the new methods.** The
+  per-row writers (`append_entries`, `upsert_node` and the rest) stay on
+  `SqliteStore` but the core no longer calls them.
+- **Consistent reads.** A store is opened with one read transaction over every
+  table, so a live writer cannot commit between the entries and the tables
+  that describe them.
+- **The per-entry audit line is only rendered when something listens at
+  `INFO`.** Measured in memory, authorize plus capture went from 116 µs to
+  110 µs. `verify_integrity()` on 66,000 entries went from 0.61 s to about
+  1.0 s: the new pairing and governance checks run in the same single pass.
+- **`agentgov verify` names what each check covers**, and `inspect` aligns
+  zero-value rows.
+- **README badges state only what CI enforces.** The hard-coded test count and
+  coverage figure are gone, and a test ties the coverage-floor badge to the
+  floor in `ci.yml`.
+
+### Known limitations
+
+- The chain is keyless. Someone who can write the file and compute SHA-256 can
+  rewrite it consistently, or truncate its tail, and it still verifies. Only a
+  copy of the head kept elsewhere shows that; signed receipts and an external
+  witness are planned.
+
 ## [0.1.1] - 2026-09-20
 
 Cut so that the two fixes below are available under a version number. They

@@ -17,8 +17,15 @@ Two commands, aimed at two different readers:
     on any phantom line — billed spend with no local authorization — so it too
     belongs in a pipeline.
 
-Both open the database **read-only**, so they are safe to run against a
-governor that is live and holding the write claim.
+``agentgov repair <db>``
+    For an operator whose governor refused to open because a cache table
+    (topology, control events, open authorizations) disagrees with the chain:
+    rebuilds those tables from the chain and says what it changed. Moves no
+    money and never edits the chain.
+
+The first three open the database **read-only**, so they are safe to run
+against a governor that is live and holding the write claim. ``repair`` needs
+the write claim, and is refused while a governor holds it.
 
 Standard library only — argparse and nothing else, so the CLI costs the
 package no dependencies.
@@ -45,7 +52,7 @@ from agentgov.reconciliation import (
 
 __all__ = ["main"]
 
-_DIRECTION_SIGN = {"DR": "-", "CR": "+"}
+_DIRECTION_SIGN = {"DR": "-", "CR": "+", "--": " "}
 
 
 def _open(path: str) -> BudgetManager:
@@ -144,6 +151,7 @@ def _command_inspect(args: argparse.Namespace, out: TextIO) -> int:
 
         shown = entries[-args.limit :] if args.limit else entries
         out.write(f"\nENTRIES  (last {len(shown):,} of {len(entries):,})\n")
+        width = max((len(entry.entry_type.value) for entry in shown), default=10)
         for entry in shown:
             if args.raw:
                 out.write(f"  {format_audit_line(entry)}\n")
@@ -151,8 +159,8 @@ def _command_inspect(args: argparse.Namespace, out: TextIO) -> int:
                 sign = _DIRECTION_SIGN[entry.direction.value]
                 out.write(
                     f"  {entry.sequence:>8}  {entry.timestamp:%H:%M:%S}  "
-                    f"{entry.entry_type.value:<10} {entry.scope_id:<22} "
-                    f"{sign}{entry.amount:>14}  bal {entry.balance_after:>14}"
+                    f"{entry.entry_type.value:<{width}} {entry.scope_id:<22} "
+                    f"{sign}{entry.amount:>14.8f}  bal {entry.balance_after:>14}"
                     f"  {entry.memo}\n"
                 )
         out.write("\n")
@@ -172,9 +180,9 @@ def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
     try:
         checks: list[tuple[str, str | None]] = []
         for label, check in (
-            ("hash chain + balance cache", manager.ledger.verify_chain),
+            ("hash chain, balances + hold pairing", manager.ledger.verify_chain),
             ("conservation identity", manager.ledger.verify_conservation),
-            ("delegation topology", manager.verify_integrity),
+            ("topology + breakers, derived from the chain", manager.verify_integrity),
         ):
             try:
                 check()
@@ -237,12 +245,34 @@ def _command_reconcile(args: argparse.Namespace, out: TextIO) -> int:
     return 0 if report.passed else 1
 
 
+def _command_repair(args: argparse.Namespace, out: TextIO) -> int:
+    """Rebuild the cache tables from the chain, and report what changed."""
+    manager = BudgetManager.open_sqlite(args.path, repair=True)
+    try:
+        if not manager.repairs:
+            out.write(
+                f"nothing to repair  {args.path}  (every cache table agrees with the chain)\n"
+            )
+            return 0
+        out.write(f"REPAIRED  {args.path}  ({len(manager.repairs)} cache disagreement(s))\n")
+        for problem in manager.repairs:
+            out.write(f"  - {problem}\n")
+        out.write(
+            f"\nThe chain was not touched; it verifies "
+            f"({len(manager.ledger):,} entries, head {manager.ledger.head_hash[:16]}).\n"
+        )
+        return 0
+    finally:
+        manager.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser."""
     parser = argparse.ArgumentParser(
         prog="agentgov",
-        description="Inspect and verify an AgentGov ledger. Both commands open "
-        "the database read-only and are safe to run against a live governor.",
+        description="Inspect, verify, reconcile and repair an AgentGov ledger. "
+        "inspect, verify and reconcile open the database read-only and are safe to "
+        "run against a live governor.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -303,6 +333,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="percent of cost drift before a match is a discrepancy (default: 1.0)",
     )
     reconcile_cmd.set_defaults(handler=_command_reconcile)
+
+    repair = subcommands.add_parser(
+        "repair",
+        help="rebuild cache tables that disagree with the chain; moves no money",
+    )
+    repair.add_argument("path", help="path to the SQLite ledger")
+    repair.set_defaults(handler=_command_repair)
 
     return parser
 

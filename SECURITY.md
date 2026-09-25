@@ -103,10 +103,27 @@ The ledger is a SHA-256 hash chain: `verify_integrity()` re-derives every entry
 and detects any retroactive edit, including a doctored balance. A corrupted or
 tampered database is refused at open rather than served.
 
+Since v0.1.2 the chain also carries the state that decides what may run:
+
+- **Hold pairing.** Every hold release names the hold it releases inside its
+  hash, and the ledger refuses a release of a hold that is not open. A hold
+  cannot be returned twice, even by a crash-recovery path.
+- **Breakers and topology.** Trips, resets and delegations are entries in the
+  chain. Deleting a trip row, or re-parenting a scope out from under a halted
+  parent, no longer un-halts anything: the `nodes`, `control_events` and
+  `open_authorizations` tables are caches, checked against the chain at open
+  and by `verify_integrity()`. A disagreement is refused, and `agentgov repair`
+  rebuilds the caches from the chain without moving money.
+- **One operation, one transaction.** An operation's entries and cache writes
+  commit together or not at all, so a crash cannot leave a half-applied
+  operation for a recovery path to act on twice.
+
 This is **tamper-evidence, not tamper-resistance.** Anyone who can write to the
-file can rewrite the whole chain from any point and re-link it, because the
-chain is not anchored to anything outside the file. Detecting that requires
-periodically copying `ledger.head_hash` somewhere the writer cannot reach.
+file can rewrite the whole chain from any point and re-link it, or cut entries
+off its tail, because the chain is keyless and not anchored to anything outside
+the file. Detecting that requires periodically copying `ledger.head_hash`
+somewhere the writer cannot reach, or committing it into another system's chain
+with `BudgetManager.anchor()`.
 Treat write access to the database as equivalent to write access to the audit
 log, and restrict it accordingly.
 

@@ -617,8 +617,12 @@ def test_a_cognitive_trip_latches_the_financial_breaker() -> None:
     (event,) = gov.control_events
     assert event.event_type == "circuit_tripped"
     assert "cognitive breaker [near_duplicate]" in event.reason
-    # Anchored to the ledger, like every other governance event.
-    assert event.ledger_head_hash == gov.ledger.head_hash
+    # Recorded in the chain itself, as a zero-value entry, and pinned to the
+    # head it followed.
+    trip = gov.ledger.entries()[-1]
+    assert trip.entry_type is EntryType.CIRCUIT_TRIPPED
+    assert event.entry_id == trip.entry_id
+    assert event.ledger_head_hash == trip.prev_hash
     gov.verify_integrity()
 
 
@@ -697,7 +701,10 @@ def test_the_tripping_call_costs_absolutely_nothing() -> None:
     with pytest.raises(AgentThrashingError):
         metered.invoke(llm.complete, SOFT_LOOP_QUERIES[3])
 
-    assert len(gov.audit_trail()) == entries_before, "no ledger entry for a halted call"
+    # The halted call moved no money: the only entry it caused is the
+    # zero-value trip that records the halt itself.
+    new = [e.entry_type for e in gov.audit_trail()[entries_before:]]
+    assert new == [EntryType.CIRCUIT_TRIPPED], "no money entry for a halted call"
     assert gov.available("root") == balance_before
     types = [e.entry_type for e in gov.audit_trail()]
     assert types.count(EntryType.HOLD) == 3, "no fourth hold was ever placed"
