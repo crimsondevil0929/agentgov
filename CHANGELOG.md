@@ -8,6 +8,30 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-26
+
+### Fixed
+
+- **`AgentThrashingError` did not subclass `CircuitOpenError`.** The two sat
+  as siblings under `CircuitBreakerError`, so code written against the
+  documented "catch `CircuitOpenError` to mean this scope is halted"
+  contract (`Interceptor.invoke`, `BudgetGuard.authorize`) silently never
+  caught a cognitive-breaker halt, only a financial one. `AgentThrashingError`
+  is now a `CircuitOpenError`, with `scope_id`/`tripped_scope_id`/`reason`
+  populated the same way, so a caller that only ever catches
+  `CircuitOpenError` now catches both. Catch `AgentThrashingError` first when
+  the distinction (loop vs. overdraft) changes what you do next.
+- **A witness file torn by a crash mid-append could never be reopened.**
+  `ReceiptLog` has always cut off an incomplete final line left by a crash;
+  `FileWitness`/`load_cosignatures()` read the raw file with no such
+  tolerance and raised `MalformedReceiptError` on the torn tail forever
+  after, on a file an ordinary crash should not be able to brick. The
+  torn-line reader is now shared (`agentgov.receipts._lines`) between the log
+  and the witness. A witness resuming its own file repairs the torn tail (so
+  a later append cannot concatenate onto it); a read-only caller inspecting
+  someone else's published file (`load_cosignatures(path)`, the default)
+  tolerates the torn tail without ever mutating a file it does not own.
+
 ### Added
 
 - **ARC1 verifiable action receipts** (`agentgov.receipts`). A signed record
