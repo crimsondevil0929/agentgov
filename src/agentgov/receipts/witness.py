@@ -35,6 +35,7 @@ from agentgov.exceptions import (
     ReceiptSignatureError,
     WitnessError,
 )
+from agentgov.receipts._lines import read_complete_lines
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
 from agentgov.receipts.merkle import verify_consistency
 from agentgov.receipts.schema import Checkpoint, Cosignature
@@ -103,7 +104,11 @@ class FileWitness:
         self._lock = threading.Lock()
         self._latest: dict[str, Cosignature] = {}
         if self._path.exists():
-            for cosignature in load_cosignatures(self._path):
+            # repair=True: this witness owns and appends to this file, so a
+            # torn tail left by a crash mid-append must be truncated now, or
+            # the next append would concatenate onto it and corrupt the line
+            # that follows.
+            for cosignature in load_cosignatures(self._path, repair=True):
                 try:
                     cosignature.verify(signer)
                 except ReceiptSignatureError as exc:
@@ -196,18 +201,39 @@ class FileWitness:
                 os.fsync(handle.fileno())
 
 
-def load_cosignatures(path: str | Path) -> tuple[Cosignature, ...]:
+def load_cosignatures(path: str | Path, *, repair: bool = False) -> tuple[Cosignature, ...]:
     """Read a witness's published cosignature file.
 
     Signatures are not checked here: a verifier checks the one it relies on
     against the witness key it trusts, with :func:`find_cosignature`.
 
-    :raises MalformedReceiptError: If any line is not a cosignature.
+    A file torn by a crash mid-append (bytes after the last newline, never
+    acknowledged as a completed write) is tolerated: the incomplete final
+    line is ignored rather than raising. Previously it was not -- reopening
+    a witness file crashed mid-write raised ``MalformedReceiptError`` on the
+    torn tail and the file could never be reopened at all, unlike
+    :class:`~agentgov.receipts.log.ReceiptLog`, which has always cut off a
+    torn line the same way.
+
+    :param repair: When true, also truncate the file in place to drop the
+        torn tail, so a subsequent append does not concatenate onto it. Only
+        :class:`FileWitness` resuming its own file passes this; a caller
+        inspecting someone else's published file should never mutate it and
+        must leave this false (the default).
+    :raises OSError: If ``path`` does not exist or cannot be read. A missing
+        witness file is a plain I/O error, the same as it always was --
+        :func:`read_complete_lines`'s "missing means no records yet" reading
+        is for a resuming *owner* (:class:`FileWitness`'s own ``__init__``
+        already guards its call with an existence check), not for a
+        standalone read that a caller like the ``verify-receipt`` CLI treats
+        as a usage error distinct from "never witnessed."
+    :raises MalformedReceiptError: If any complete line is not a cosignature.
     """
+    p = Path(path)
+    if not p.exists():
+        p.read_bytes()  # raises the natural FileNotFoundError/OSError
     cosignatures = []
-    for number, line in enumerate(Path(path).read_bytes().splitlines(), start=1):
-        if not line.strip():
-            continue
+    for number, line in enumerate(read_complete_lines(p, repair=repair), start=1):
         try:
             cosignatures.append(Cosignature.from_json(loads_strict(line), f"line {number}"))
         except MalformedReceiptError as exc:

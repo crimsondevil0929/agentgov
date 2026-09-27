@@ -727,6 +727,34 @@ def test_after_a_cognitive_halt_further_calls_fail_on_the_financial_breaker() ->
         metered.invoke(llm.complete, "a completely fresh and unrelated question")
 
 
+def test_agent_thrashing_error_is_a_circuit_open_error() -> None:
+    """A cognitive trip IS a circuit trip; catching the general contract must
+    catch the specific one.
+
+    Before this, AgentThrashingError and CircuitOpenError were siblings under
+    CircuitBreakerError, not parent/child. Code written against the
+    documented "catch CircuitOpenError to mean this scope is halted"
+    contract silently never caught a cognitive halt, only a financial one.
+    """
+    gov = BudgetManager(policy=GovernancePolicy(max_calls_per_window=0))
+    gov.open_root("root", money("5.00"))
+    breaker = CognitiveBreaker(observer=None, manager=gov)
+    llm = DummyLLM("claude-opus-5", output_tokens=100)
+    metered = Interceptor(gov, "root", model="claude-opus-5", cognitive=breaker)
+
+    with pytest.raises(CircuitOpenError) as excinfo:
+        for query in SOFT_LOOP_QUERIES:
+            metered.invoke(llm.complete, query)
+
+    assert isinstance(excinfo.value, AgentThrashingError)
+    # The attributes CircuitOpenError promises are populated too, and a
+    # cognitive trip always halts the scope it was watching (never some
+    # other ancestor found by a different mechanism).
+    assert excinfo.value.scope_id == "root"
+    assert excinfo.value.tripped_scope_id == "root"
+    assert isinstance(excinfo.value.reason, str) and excinfo.value.reason
+
+
 def test_the_interceptor_feeds_results_back_to_the_breaker() -> None:
     """Without results the discriminator is blind; the wiring must be real."""
     gov = BudgetManager(policy=GovernancePolicy(max_calls_per_window=0))

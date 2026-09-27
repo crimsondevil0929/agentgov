@@ -323,7 +323,7 @@ class CircuitOpenError(CircuitBreakerError):
         super().__init__(f"Scope {scope_id!r} is halted by {where}: {reason}")
 
 
-class AgentThrashingError(CircuitBreakerError):
+class AgentThrashingError(CircuitOpenError):
     """Raised when the cognitive breaker finds an agent looping without progress.
 
     Where :class:`DenialOfWalletError` is reactive — it fires once the money
@@ -336,6 +336,17 @@ class AgentThrashingError(CircuitBreakerError):
     Like every other breaker trip this latches: the trajectory stays halted
     until :meth:`~agentgov.cognitive.CognitiveBreaker.reset` is called, so a
     retry storm cannot wear it down.
+
+    **A subclass of** :class:`CircuitOpenError`, not merely a sibling under
+    :class:`CircuitBreakerError`, as of 0.2.1. A cognitive trip *is* a circuit
+    trip — it calls the same latch as a financial one — so ``except
+    CircuitOpenError`` written against the general "this scope is halted"
+    contract catches a cognitive halt too, without a caller needing to know
+    which detector fired. ``tripped_scope_id`` is set equal to ``scope_id``:
+    a cognitive trip always halts the scope it was watching, never an
+    ancestor found some other way. Catch :class:`AgentThrashingError`
+    specifically first when the distinction (loop vs. overdraft) changes
+    what you do next.
 
     :param scope_id: The budget scope that made the offending call.
     :param trajectory: The logical unit of work that was found to be looping.
@@ -362,10 +373,8 @@ class AgentThrashingError(CircuitBreakerError):
         tier: str = "deterministic",
         evidence: dict[str, str] | None = None,
     ) -> None:
-        self.scope_id = scope_id
         self.trajectory = trajectory
         self.detector = detector
-        self.reason = reason
         self.observations = observations
         self.confidence = confidence
         self.tier = tier
@@ -375,10 +384,20 @@ class AgentThrashingError(CircuitBreakerError):
             if trajectory == scope_id
             else f"scope {scope_id!r} (trajectory {trajectory!r})"
         )
-        super().__init__(
+        message = (
             f"Agent thrashing halted for {where} after {observations} calls "
             f"[{tier}/{detector}, confidence {confidence:.2f}]: {reason}"
         )
+        # Bypass CircuitOpenError.__init__: its constructor shape and message
+        # format are different (and its "ancestor" framing doesn't apply here
+        # -- a cognitive trip always halts the scope it was watching). Set the
+        # attributes it promises directly instead, so code written against
+        # CircuitOpenError's contract (scope_id, tripped_scope_id, reason)
+        # still works uniformly on a thrashing halt.
+        self.scope_id = scope_id
+        self.tripped_scope_id = scope_id
+        self.reason = reason
+        CircuitBreakerError.__init__(self, message)
 
 
 AgentThrashingException = AgentThrashingError

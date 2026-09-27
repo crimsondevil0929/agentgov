@@ -682,6 +682,45 @@ def test_a_witness_resumes_from_its_file(tmp_path: Path) -> None:
     assert [c.tree_size for c in load_cosignatures(path)] == [4, 9]
 
 
+def test_a_torn_final_line_in_a_witness_file_is_cut_off(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression: a witness file crashed mid-append used to be unopenable.
+
+    ReceiptLog has always cut off a torn final line (see
+    test_a_torn_final_line_is_cut_off above); FileWitness did not, because
+    load_cosignatures() read the raw file with no torn-line tolerance at all.
+    Reopening a witness whose last cosignature was cut off mid-write raised
+    MalformedReceiptError forever after, on a file no crash should be able to
+    brick.
+    """
+    path = tmp_path / "w.jsonl"
+    four, _ = _grown(4)
+    witness_at(path).cosign(four, [])
+    intact = path.read_bytes()
+
+    torn_cosignature = Cosignature(
+        "witness-1", LOG_ID, 9, "cd" * 32, datetime(2026, 9, 26, tzinfo=UTC)
+    ).sign(WITNESS_KEY)
+    torn = canonical_bytes(torn_cosignature.to_json())[:20]
+    path.write_bytes(intact + torn)
+
+    with caplog.at_level(logging.WARNING, logger="agentgov.receipts"):
+        resumed = witness_at(path)
+    assert any("torn line" in r.getMessage() for r in caplog.records)
+    assert path.read_bytes() == intact, "resuming its own file must repair the torn tail"
+
+    latest = resumed.latest(LOG_ID)
+    assert latest is not None and latest.tree_size == 4
+
+    # A read-only caller (a verifier inspecting someone else's published
+    # file) must never mutate it, even to fix a crash artifact.
+    path.write_bytes(intact + torn)
+    readonly = load_cosignatures(path)
+    assert [c.tree_size for c in readonly] == [4]
+    assert path.read_bytes() == intact + torn, "a read-only load must not repair the file"
+
+
 def test_a_witness_refuses_a_file_it_did_not_write(tmp_path: Path) -> None:
     path = tmp_path / "w.jsonl"
     four, _ = _grown(4)

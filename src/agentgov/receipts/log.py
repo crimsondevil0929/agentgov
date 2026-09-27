@@ -39,6 +39,7 @@ from agentgov.exceptions import (
     StorageError,
     WitnessError,
 )
+from agentgov.receipts._lines import read_complete_lines
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
 from agentgov.receipts.merkle import MerkleTree
 from agentgov.receipts.schema import (
@@ -352,7 +353,7 @@ class ReceiptLog:
 
     def _resume(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        for number, line in enumerate(_complete_lines(path), start=1):
+        for number, line in enumerate(read_complete_lines(path, repair=True), start=1):
             try:
                 receipt = ActionReceipt.from_json(loads_strict(line), f"{path}:{number}")
             except MalformedReceiptError as exc:
@@ -361,7 +362,9 @@ class ReceiptLog:
             self._tree.append(receipt.leaf_hash())
             self._index_of[receipt.receipt_id] = len(self._receipts)
             self._receipts.append(receipt)
-        for number, line in enumerate(_complete_lines(_checkpoint_path(path)), start=1):
+        for number, line in enumerate(
+            read_complete_lines(_checkpoint_path(path), repair=True), start=1
+        ):
             try:
                 checkpoint = Checkpoint.from_json(loads_strict(line), f"checkpoint {number}")
                 checkpoint.verify(self._signer)
@@ -395,29 +398,6 @@ class ReceiptLog:
 
 def _checkpoint_path(path: Path) -> Path:
     return path.with_name(path.name + ".checkpoints")
-
-
-def _complete_lines(path: Path) -> list[bytes]:
-    """The file's complete lines, after cutting off a torn final one.
-
-    Every append writes a whole line and a newline, so bytes after the last
-    newline are an append that never finished, and was never acknowledged.
-    """
-    if not path.exists():
-        return []
-    data = path.read_bytes()
-    cut = data.rfind(b"\n") + 1
-    if cut < len(data):
-        logger.warning(
-            "%s ends in a torn line (%d bytes) left by a crash mid-append; cutting it off",
-            path,
-            len(data) - cut,
-        )
-        with path.open("r+b") as handle:
-            handle.truncate(cut)
-            handle.flush()
-            os.fsync(handle.fileno())
-    return [line for line in data[:cut].split(b"\n") if line.strip()]
 
 
 class _Claim:
