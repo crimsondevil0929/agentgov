@@ -114,9 +114,11 @@ from agentgov.storage import (
     PersistedAuthorization,
     PersistedNode,
     PersistenceStore,
+    SharedStore,
     SqliteStore,
     StoreDelta,
     StoreImage,
+    WriterSession,
 )
 from agentgov.streaming import AsyncMeteredStream, MeteredStream
 
@@ -172,6 +174,7 @@ __all__ = [
     "RunawayLoopDetectedError",
     "ScopeError",
     "SemanticObserver",
+    "SharedStore",
     "SpendGuard",
     "SqliteStore",
     "StorageError",
@@ -184,6 +187,7 @@ __all__ = [
     "UnknownScopeError",
     "Verdict",
     "WriteBatch",
+    "WriterSession",
     "canonical_arguments",
     "default_usage_extractor",
     "estimate_tokens",

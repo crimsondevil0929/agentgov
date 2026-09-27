@@ -715,6 +715,88 @@ See [`tests/test_persistence.py`](tests/test_persistence.py) and
 [`tests/test_hardening.py`](tests/test_hardening.py) for the restart, corruption,
 lock-contention, and durable-write-failure matrices.
 
+### A ledger shared by a fleet (PostgreSQL)
+
+SQLite gives a ledger one writer. When N workers on N hosts need one authoritative
+balance, put the ledger in PostgreSQL and open a governor in each of them:
+
+```bash
+pip install 'agentgov[postgres]'
+```
+
+<!-- readme-test: skip reason="needs a live PostgreSQL server" -->
+```python
+from agentgov import BudgetManager, money
+
+# In every worker, on every host: the same database, the same schema.
+gov = BudgetManager.open_postgres("postgresql://governor@db/fleet", schema="agentgov")
+gov.open_root("orchestrator", money("5.00"))  # once, anywhere in the fleet
+auth = gov.authorize("orchestrator", money("0.02"))  # a dollar held here is held fleet-wide
+gov.capture(auth, money("0.013"))
+```
+
+Every governor keeps a verified copy of the ledger in memory, but none of them is the
+ledger any more; the database is. So every mutation is one database transaction that:
+
+1. takes a fleet-wide writer lock (`pg_advisory_xact_lock` on the ledger's schema);
+2. reads everything the other governors committed since this one last looked, and
+   verifies it entry by entry, hash links, balances and hold pairing, exactly as a
+   fresh open would;
+3. only then checks the balance or the breaker and builds its entries on the head it
+   just verified;
+4. commits, which releases the lock.
+
+A hold one governor places is visible to every other: they all check against the same
+balance. A breaker one of them trips halts the subtree for all of them, and latches
+once, however many raced into it. A hold placed on one host can be captured on another.
+The first governor to open a database creates the ledger's tables; after that a role
+granted only DML on them can run one, and cannot edit history or lift the triggers.
+
+**The lock is for liveness; the chain is for safety.** Two triggers keep the chain
+linear by themselves: an entry is admitted only if it links, by sequence and hash, to
+the committed head, and entries refuse `UPDATE`, `DELETE` and `TRUNCATE`. A governor
+whose view went stale, or one that never took the lock, is refused rather than allowed
+to fork the chain. `tests/test_fleet_concurrency.py` removes the lock from every governor
+and races them: writes get refused, and the ledger still balances to the cent.
+
+**What happens when something fails.**
+
+- A governor that cannot get the lock within `lock_timeout` (30s) raises `StorageError`
+  and changes nothing.
+- A governor that stalls while holding the lock (a paused process, a hung host) is cut
+  off by the server after `idle_timeout` (60s), its writes rolled back and the lock
+  freed. One that is killed outright frees it at once.
+- A write whose commit fails, or whose answer is lost with the connection, is reported
+  as a `StorageError`, and the governor re-reads the whole ledger, under the lock, before
+  it acts again. A lost answer is never retried blind: the ledger holds the write once
+  or not at all.
+- A governor that reads an entry that does not verify stops writing. Every later write
+  raises `LedgerIntegrityError`; reads keep serving what it last verified.
+
+**What to know before relying on it.**
+
+- **Reads are as of this governor's last write.** `available()`, `is_halted()` and the
+  rest are served from memory; call `refresh()` first when the answer must be current.
+  Writes always catch up first.
+- **The runaway-loop velocity window is per governor**, not fleet-wide: eight governors
+  with a 1000/s limit admit up to 8000/s between them.
+- **One global chain serializes every write in the fleet, and it is slower than
+  SQLite.** Measured on one laptop against PostgreSQL 16 in Docker, `spend()` ran at
+  about 500 a second from one governor and about 180 a second in total with eight
+  contending, against about 4,500 a second for a single SQLite governor on the same
+  machine. Each write is a dozen round trips, and must first read what the others wrote.
+  That is the price of one authoritative balance; a chain per root scope is how it would
+  scale out.
+- **Tested on PostgreSQL 14 and 16, connected directly.** Not yet tested behind a
+  connection pooler.
+- **The CLI does not read PostgreSQL yet.** Use `open_postgres(..., read_only=True)` and
+  `verify_integrity()` for an audit.
+
+[`tests/test_postgres_store.py`](tests/test_postgres_store.py) pins the store's contract:
+install, restart, tamper evidence, least privilege, and every failure above.
+[`tests/test_fleet_concurrency.py`](tests/test_fleet_concurrency.py) races 64 workers
+across 8 governors, and 8 separate processes, against one envelope.
+
 ## Core primitives
 
 - **Authorize → Hold → Settle.** `BudgetManager.authorize()` places an encumbering hold
@@ -756,11 +838,12 @@ Every claim on this page is measured, and the boundaries of what was measured ma
 much as the numbers. This section states them plainly rather than leaving them to be
 discovered in production.
 
-### Single-writer by design: one process, one host
+### SQLite is single-writer by design: one process, one host
 
 `BudgetManager.open_sqlite()` takes an exclusive advisory lock on the database. **One
-process governs one ledger.** A second process is refused at open with
+process governs one SQLite ledger.** A second process is refused at open with
 `ConcurrentGovernorError` naming the holding PID; it is not silently allowed to diverge.
+For a fleet, see [A ledger shared by a fleet](#a-ledger-shared-by-a-fleet-postgresql).
 
 Measured throughput on that single writer, all of it behind one global mutex:
 
@@ -776,13 +859,16 @@ worth having. `pip install agentgov` with zero runtime dependencies and a local 
 what makes the thing adoptable in an afternoon. The cost of that choice is that
 AgentGov v0.1 governs *a process*, not a fleet.
 
-**The roadmap fix is already seamed for.** `agentgov.storage.PersistenceStore` is a
-Protocol, and `SqliteStore` is one implementation of it. A **Postgres or Redis
-`PersistenceStore`** puts the ledger in a shared transactional store, making the
-database the serialization point so N processes across N hosts share one authoritative
-view of every balance. Fleet-wide consensus without a bespoke consensus cluster, and
-without touching the ledger, the budget DAG, or the breaker. SQLite stays the default so
-the zero-dependency install is unaffected.
+**The fleet path is PostgreSQL, behind an extra.** `agentgov.storage.SharedStore`
+extends the `PersistenceStore` seam to a ledger several governors write, and
+`agentgov.postgres.PostgresStore` implements it: the database is the serialization
+point, so N processes across N hosts share one authoritative view of every balance,
+without a bespoke consensus cluster. It did need more than a new store: a governor over
+a shared ledger has to catch up with the others, under their shared lock, before every
+check, which is what `BudgetManager` now does when its store is shared. The ledger's
+rules, the budget DAG and the breaker are unchanged. SQLite stays the default, so the
+zero-dependency install is unaffected, and so does its throughput: the shared ledger is
+several times slower (see the measurements in that section).
 
 ### A guardrail inside a process, not a sandbox around it
 
@@ -844,11 +930,10 @@ SQLite file, with financial and cognitive breakers on the same actuator. Beyond 
   intervention ladder ordered by prompt-cache invalidation cost, and a budgeted stopping
   rule over the breaker's own novelty signal. See
   [`ARCHITECTURE.md`, Part B](ARCHITECTURE.md#part-b-the-what-then-protocol-v02-state-recovery-roadmap).
-- **Distributed multi-node consensus.** `agentgov.storage.PersistenceStore` is already the
-  seam a replicated backend would implement. Move the ledger off one host's disk onto a
-  store shared across a fleet, so multiple machines share one authoritative view of every
-  scope's balance without reintroducing the double-spend race this design eliminates
-  locally.
+- **Scaling the shared ledger out.** A fleet can now share one ledger through PostgreSQL
+  (see [A ledger shared by a fleet](#a-ledger-shared-by-a-fleet-postgresql)), but one
+  global chain serializes every write. Next: fewer round trips per catch-up, then a chain
+  per root scope, so unrelated envelopes stop contending for one lock.
 - **x402 / AP2 settlement integration.** Use AgentGov's authorize/capture holds as the
   enforcement point those protocols gesture at but don't enforce at runtime, settling
   real sub-cent agent transactions through a payment rail instead of a simulated ledger.

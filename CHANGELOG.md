@@ -8,6 +8,54 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **A ledger shared by a fleet: `BudgetManager.open_postgres()`.** Any number of
+  governors, in any number of processes on any number of hosts, can now write
+  one ledger, kept in PostgreSQL (`pip install 'agentgov[postgres]'`; the core
+  package and the SQLite store keep zero runtime dependencies). Every mutation
+  is one transaction: take a fleet-wide `pg_advisory_xact_lock`, read and
+  verify everything the other governors committed since, then check the
+  balance or breaker, write, and commit. A hold placed by one governor
+  encumbers the funds for all of them; a breaker one of them trips halts the
+  subtree for all of them and latches once; a hold placed on one host can be
+  captured on another. New module `agentgov.postgres` (`PostgresStore`).
+- **`agentgov.storage.SharedStore`,** the `PersistenceStore` seam extended to
+  a store several governors write: a re-entrant writer session that serializes
+  writers, and the committed head, so an up-to-date governor catches up in one
+  query. `PersistenceStore` itself is unchanged, and so is `SqliteStore`.
+- **The database keeps the chain linear on its own.** A `BEFORE INSERT` trigger
+  admits an entry only if it links, by sequence and hash, to the committed
+  head; entries refuse `UPDATE`, `DELETE` and `TRUNCATE`. Both are enabled
+  `ALWAYS`. A governor with a stale view, or one that skipped the lock, is
+  refused rather than allowed to fork the chain; the lock only turns those
+  refusals into waiting.
+
+### Changed
+
+- **`BudgetManager.refresh()` now follows other writers for a writable
+  manager too, when its store is shared.** It was, and for a SQLite writer
+  still is, a no-op, since a single writer is always current. A writable
+  manager over a shared store also catches up, under the writer lock, before
+  every mutation, and one whose last write did not commit (a failed or lost
+  `COMMIT`) re-reads the whole ledger before it acts again. One that reads an
+  entry it cannot verify refuses every later write.
+- **Every `BudgetManager` mutation now runs through one path** that, on a
+  shared store, takes the writer lock and catches up first. Over a SQLite or
+  in-memory ledger it is the same mutex as before.
+
+### Known limitations
+
+- One global chain serializes every write in the fleet. Measured on one
+  laptop against PostgreSQL 16 in Docker: about 500 `spend()` calls a second
+  from one governor, about 180 a second in total with eight governors
+  contending, against about 4,500 for a single SQLite governor on the same
+  machine.
+- A shared-ledger governor serves reads from its last write or `refresh()`,
+  and counts runaway-loop velocity for itself, not the fleet.
+- Not yet tested behind a connection pooler. The CLI does not read
+  PostgreSQL yet.
+
 ## [0.2.1] - 2026-09-26
 
 ### Fixed

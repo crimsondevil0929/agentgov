@@ -39,6 +39,10 @@ ui = ["streamlit>=1.63"]
 sign = [
     "cryptography>=42",
 ]
+# The shared-ledger backend (agentgov.postgres). Optional, like every other
+# extra: the core package, and the SQLite store, keep zero runtime
+# dependencies.
+postgres = ["psycopg[binary]>=3.2"]
 
 [project.scripts]
 agentgov = "agentgov.cli:main"
@@ -65,6 +69,9 @@ dev = [
     # keeps its zero-runtime-dependency guarantee.
     "anthropic>=1.0.0",
     "cryptography>=42",
+    # The PostgreSQL store's integration tests. The runtime dependency is the
+    # `postgres` extra; this puts the driver in every dev environment.
+    "psycopg[binary]>=3.2",
 ]
 
 [tool.pytest.ini_options]
