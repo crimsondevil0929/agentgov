@@ -1,5 +1,5 @@
 [project]
-name = "agentgov"
+name = "interlock-agentgov"
 version = "0.3.0"
 description = "Runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets."
 readme = "README.md"
@@ -54,8 +54,8 @@ Issues = "https://github.com/crimsondevil0929/agentgov/issues"
 Changelog = "https://github.com/crimsondevil0929/agentgov/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["uv_build>=0.12.10,<0.13.0"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
@@ -108,3 +108,15 @@ strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 show_error_codes = true
+
+# Explicitly tell the build system where the module is, 
+# overriding the PyPI package name auto-discovery.
+[tool.uv_build]
+packages = ["src/agentgov"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentgov"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agentgov*"]
