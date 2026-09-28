@@ -7,11 +7,12 @@ that same lock, so a governor's ledger, topology, control events, and open
 authorizations survive a restart without changing any of the concurrency or
 atomicity guarantees the in-memory design already provides.
 
-:class:`PersistenceStore` is the seam: :class:`SqliteStore` is the only
-implementation today, built on the standard library's ``sqlite3`` (so
-persistence adds zero runtime dependencies), but the interface is the natural
-place a future distributed backend — the multi-node consensus store the
-project roadmap describes — would plug in instead.
+:class:`PersistenceStore` is the seam. :class:`SqliteStore` is built on the
+standard library's ``sqlite3`` (so persistence adds zero runtime
+dependencies) and has exactly one writer. :class:`SharedStore` extends the
+seam to a ledger many governors write at once, on many hosts; its
+implementation, :class:`agentgov.postgres.PostgresStore`, lives in its own
+module behind the ``postgres`` extra.
 
 Two properties every implementation must provide, and :class:`SqliteStore`
 does:
@@ -44,12 +45,12 @@ import sqlite3
 import sys
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from agentgov.core import (
     Authorization,
@@ -58,6 +59,7 @@ from agentgov.core import (
     Direction,
     EntryType,
     LedgerEntry,
+    SettlementClaim,
     WriteBatch,
     _iso,
     _parse_iso,
@@ -70,12 +72,15 @@ from agentgov.exceptions import (
 )
 
 __all__ = [
+    "JoinableStore",
     "PersistedAuthorization",
     "PersistedNode",
     "PersistenceStore",
+    "SharedStore",
     "SqliteStore",
     "StoreDelta",
     "StoreImage",
+    "WriterSession",
 ]
 
 _SCHEMA_VERSION = "2"
@@ -169,11 +174,12 @@ class PersistenceStore(Protocol):
     """The durability seam a :class:`~agentgov.core.Ledger` and
     :class:`~agentgov.core.BudgetManager` write through to.
 
-    Every write is called with the manager's own lock held, so an
-    implementation never needs to provide its own concurrency control — it
-    only needs to make each :meth:`commit` durable as a whole. A distributed
-    backend (the Phase 2 multi-node consensus store) implements this same
-    interface with a replicated write in place of a local file.
+    Every write is called with the manager's own lock held, so a store that
+    only one governor writes never needs to provide its own concurrency
+    control — it only needs to make each :meth:`commit` durable as a whole.
+    A store several governors write at once is a :class:`SharedStore`, which
+    adds the fleet-wide writer lock that process-local mutex cannot provide
+    (:class:`agentgov.postgres.PostgresStore`).
     """
 
     @property
@@ -217,6 +223,88 @@ class PersistenceStore(Protocol):
 
     def close(self) -> None:
         """Release any underlying connection. Safe to call more than once."""
+        ...
+
+
+class WriterSession(Protocol):
+    """One governor's turn to write a shared ledger.
+
+    :attr:`committed` is ``True`` only once the session's transaction has
+    committed. Anything else — an error before the commit, a commit that
+    failed, a commit whose outcome was lost with the connection — leaves it
+    ``False``, and a governor that made writes during the session must then
+    stop trusting its memory and re-read the ledger.
+    """
+
+    @property
+    def committed(self) -> bool:
+        """Whether the session's transaction committed."""
+        ...
+
+    @property
+    def wrote(self) -> bool:
+        """Whether :meth:`PersistenceStore.commit` was called in the session."""
+        ...
+
+
+@runtime_checkable
+class SharedStore(PersistenceStore, Protocol):
+    """A :class:`PersistenceStore` that several governors write at once.
+
+    A single-writer store (:class:`SqliteStore`) is only ever written by the
+    governor that holds it, so that governor's memory *is* the ledger. Here it
+    is not: another governor, on another host, may have appended since. A
+    governor over a shared store therefore does every mutation inside
+    :meth:`writer`, which serializes writers across the fleet, and catches up
+    with everything committed since its last look before it checks a balance
+    or a breaker. :meth:`PersistenceStore.commit` and
+    :meth:`PersistenceStore.rebuild_caches` are refused outside a session.
+    """
+
+    def writer(self) -> AbstractContextManager[WriterSession]:
+        """Take the fleet-wide writer lock for one unit of mutation.
+
+        Reads made inside the session see every commit made before the lock
+        was granted. The session commits when the block exits, whether it
+        exits normally or by an exception raised *after* a successful write
+        (a breaker trip recorded before its error is raised must survive the
+        error). A write that failed rolls the whole session back.
+
+        Re-entrant: a session opened inside another is the same session, and
+        only the outermost one commits.
+        """
+        ...
+
+    def head(self) -> tuple[int, str]:
+        """The ledger's length and head hash, as committed now.
+
+        A governor whose view has the same length and head is current and need
+        not read anything else: the head hash commits to every entry before it.
+        """
+        ...
+
+
+@runtime_checkable
+class JoinableStore(SharedStore, Protocol):
+    """A :class:`SharedStore` that can also take part in a transaction the
+    caller owns, on the caller's connection: it holds the writer lock there,
+    and records settlement claims there, so a claim commits or rolls back
+    with the caller's own writes. The chain itself is never written in the
+    caller's transaction. See :meth:`agentgov.core.BudgetManager.joined`.
+    """
+
+    def join(self, connection: Any) -> AbstractContextManager[WriterSession]:
+        """Take the writer lock inside ``connection``'s open transaction, and
+        send the block's claims there. Never commits or rolls back: that
+        transaction is the caller's."""
+        ...
+
+    def claim(self, claim: SettlementClaim) -> None:
+        """Record ``claim`` in the joined transaction."""
+        ...
+
+    def pending_claims(self) -> tuple[SettlementClaim, ...]:
+        """Every committed claim not yet booked into the chain, oldest first."""
         ...
 
 
@@ -589,6 +677,11 @@ class SqliteStore:
         """Durably apply one unit of work in a single transaction."""
         if not batch:
             return
+        if batch.redeemed:
+            raise StorageError(
+                "a SQLite ledger holds no settlement claims; claims live in a ledger shared "
+                "through PostgreSQL"
+            )
 
         def work(conn: sqlite3.Connection) -> None:
             if batch.entries:

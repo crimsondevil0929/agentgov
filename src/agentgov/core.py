@@ -74,6 +74,7 @@ import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
@@ -97,10 +98,13 @@ if TYPE_CHECKING:
     # methods; guarding this import under TYPE_CHECKING avoids the cycle
     # while still giving mypy the real types for the `store=` parameters.
     from agentgov.storage import (
+        JoinableStore,
         PersistedAuthorization,
         PersistedNode,
         PersistenceStore,
+        SharedStore,
         StoreImage,
+        WriterSession,
     )
 
 __all__ = [
@@ -114,9 +118,11 @@ __all__ = [
     "Direction",
     "EntryType",
     "GovernancePolicy",
+    "JoinedTransaction",
     "Ledger",
     "LedgerEntry",
     "LedgerLine",
+    "SettlementClaim",
     "WriteBatch",
     "format_audit_line",
     "money",
@@ -944,6 +950,9 @@ class WriteBatch:
         chain entry.
     :ivar opened: Authorizations placed.
     :ivar closed: Authorization ids settled or voided.
+    :ivar redeemed: Settlement claims these entries book, removed from the
+        pending claims in the same transaction, so a claim is booked exactly
+        once. Only a store that holds claims accepts them.
     """
 
     entries: list[LedgerEntry] = field(default_factory=list)
@@ -951,9 +960,44 @@ class WriteBatch:
     control_events: list[ControlEvent] = field(default_factory=list)
     opened: list[Authorization] = field(default_factory=list)
     closed: list[uuid.UUID] = field(default_factory=list)
+    redeemed: list[uuid.UUID] = field(default_factory=list)
 
     def __bool__(self) -> bool:
-        return bool(self.entries or self.nodes or self.control_events or self.opened or self.closed)
+        return bool(
+            self.entries
+            or self.nodes
+            or self.control_events
+            or self.opened
+            or self.closed
+            or self.redeemed
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementClaim:
+    """A debt a caller's transaction owes the ledger, committed with it.
+
+    Written by :meth:`JoinedTransaction.claim` inside a transaction someone
+    else owns, and booked into the chain afterwards by
+    :meth:`BudgetManager.redeem`. A claim touches none of the chain, so
+    writing one cannot conflict with any other governor's writes; it exists
+    exactly when the caller's transaction committed, so redeeming every
+    pending claim is always correct, by any governor, at any time.
+
+    :ivar claim_id: Unique id of the claim.
+    :ivar hold_id: The hold placed for it beforehand, whose release and
+        capture redemption posts. ``None`` for a claim with nothing reserved.
+    :ivar scope_id: The scope that pays.
+    :ivar amount: What is owed. Zero books a zero-value ``ANCHOR``.
+    :ivar memo: The spend's (or anchor's) memo, typically another chain's
+        record the settlement names.
+    """
+
+    claim_id: uuid.UUID
+    hold_id: uuid.UUID | None
+    scope_id: str
+    amount: Decimal
+    memo: str
 
 
 class _Pending:
@@ -1728,6 +1772,62 @@ class _Governance:
             )
 
 
+class JoinedTransaction:
+    """A governor's part in a transaction someone else owns.
+
+    Yielded by :meth:`BudgetManager.joined`. The only thing it writes is a
+    :class:`SettlementClaim`, into the caller's transaction: nothing in the
+    chain, so nothing that depends on which ledger head the caller's
+    transaction can see.
+    """
+
+    __slots__ = ("_manager", "_store")
+
+    def __init__(self, manager: BudgetManager, store: JoinableStore) -> None:
+        self._manager = manager
+        self._store = store
+
+    def claim(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str,
+        hold: Authorization | None = None,
+    ) -> SettlementClaim:
+        """Owe ``amount`` from ``scope_id``, durably if the caller commits.
+
+        :param hold: The authorization placed for this beforehand. Redemption
+            releases it and settles against it; without one, redemption posts
+            the spend directly.
+        :returns: The claim, to redeem once the caller has committed
+            (:meth:`BudgetManager.redeem`).
+        :raises UnknownScopeError: If the scope is not in the ledger.
+        :raises ValueError: If ``amount`` is negative, or ``hold`` belongs to
+            another scope.
+        """
+        owed = _cost(amount)
+        if owed < ZERO:
+            raise ValueError(f"a claim cannot owe a negative amount, got {owed}")
+        if not memo:
+            raise ValueError("a claim must carry the memo its settlement will record")
+        if hold is not None and hold.scope_id != scope_id:
+            raise ValueError(
+                f"hold {hold.authorization_id} is on scope {hold.scope_id!r}, not {scope_id!r}"
+            )
+        with self._manager._lock:
+            self._manager._require_node(scope_id)
+        claim = SettlementClaim(
+            claim_id=uuid.uuid4(),
+            hold_id=None if hold is None else hold.authorization_id,
+            scope_id=scope_id,
+            amount=owed,
+            memo=memo,
+        )
+        self._store.claim(claim)
+        return claim
+
+
 @dataclass(slots=True)
 class _BreakerState:
     """Per-scope circuit-breaker and velocity state."""
@@ -1814,6 +1914,17 @@ class BudgetManager:
     :param repair: When the store's cache tables (topology, control events,
         open authorizations) disagree with the chain, rebuild them from the
         chain instead of refusing to open. Moves no money.
+
+    **A shared ledger.** Over a :class:`~agentgov.storage.SharedStore` (see
+    :meth:`open_postgres`) this manager is one of several governors writing
+    the same ledger, and its memory is a verified cache of it, not the ledger
+    itself. Every mutating call then takes the fleet-wide writer lock, reads
+    and verifies everything the other governors committed since its last
+    look, and only then checks a balance or a breaker and writes. Reads
+    (:meth:`available`, :meth:`is_halted`, ...) are served from the view as of
+    this governor's last write or :meth:`refresh`; call :meth:`refresh` first
+    for a current answer. The runaway-loop velocity window is counted per
+    governor, not across the fleet.
     """
 
     def __init__(
@@ -1824,44 +1935,52 @@ class BudgetManager:
         store: PersistenceStore | None = None,
         repair: bool = False,
     ) -> None:
-        image: StoreImage | None = None
-        if ledger is None:
-            if store is not None:
-                # One consistent read of every table: a live writer in another
-                # process cannot slip a commit between the entries and the
-                # caches that describe them.
-                image = store.load()
-                ledger = Ledger._from_entries(store, image.entries)
-            else:
-                ledger = Ledger()
-        self._ledger = ledger
-        self._policy = policy if policy is not None else GovernancePolicy()
-        # One mutex for the whole control plane. Sharing the ledger's lock
-        # (rather than nesting a second one under it) removes any possibility
-        # of a lock-ordering deadlock.
-        self._lock = self._ledger.lock
-        self._store: PersistenceStore | None = store
-        self._nodes: dict[str, BudgetNode] = {}
-        self._roots: list[str] = []
-        self._breakers: dict[str, _BreakerState] = {}
-        self._open_auths: dict[uuid.UUID, Authorization] = {}
-        self._control_events: list[ControlEvent] = []
-        self._legacy_events: tuple[ControlEvent, ...] = ()
-        self._governance: _Governance | None = None
-        self._repairs: tuple[str, ...] = ()
-        self._schema_version = ""
-        self._control_high_water = 0
-        self._unusable: str | None = None
+        shared = _shared_store(store) if store is not None and not store.read_only else None
+        # A shared ledger is opened under its writer lock: the entries and the
+        # caches are read in one pass no other governor can commit into, and a
+        # repair cannot erase rows another governor has just written.
+        with shared.writer() if shared is not None else nullcontext():
+            image: StoreImage | None = None
+            if ledger is None:
+                if store is not None:
+                    # One consistent read of every table: a live writer in
+                    # another process cannot slip a commit between the entries
+                    # and the caches that describe them.
+                    image = store.load()
+                    ledger = Ledger._from_entries(store, image.entries)
+                else:
+                    ledger = Ledger()
+            self._ledger = ledger
+            self._policy = policy if policy is not None else GovernancePolicy()
+            # One mutex for the whole control plane. Sharing the ledger's lock
+            # (rather than nesting a second one under it) removes any
+            # possibility of a lock-ordering deadlock.
+            self._lock = self._ledger.lock
+            self._store: PersistenceStore | None = store
+            self._shared: SharedStore | None = shared
+            self._writing = False
+            self._dirty = False
+            self._nodes: dict[str, BudgetNode] = {}
+            self._roots: list[str] = []
+            self._breakers: dict[str, _BreakerState] = {}
+            self._open_auths: dict[uuid.UUID, Authorization] = {}
+            self._control_events: list[ControlEvent] = []
+            self._legacy_events: tuple[ControlEvent, ...] = ()
+            self._governance: _Governance | None = None
+            self._repairs: tuple[str, ...] = ()
+            self._schema_version = ""
+            self._control_high_water = 0
+            self._unusable: str | None = None
 
-        if store is not None:
-            self._restore_from_store(
-                store, image if image is not None else store.load(), repair=repair
-            )
-        elif len(self._ledger):
-            self._adopt_governance(_Governance.from_chain(self._ledger.entries()))
-            self._open_auths = {
-                hold.entry_id: _authorization_for(hold) for hold in self._ledger.open_holds()
-            }
+            if store is not None:
+                self._restore_from_store(
+                    store, image if image is not None else store.load(), repair=repair
+                )
+            elif len(self._ledger):
+                self._adopt_governance(_Governance.from_chain(self._ledger.entries()))
+                self._open_auths = {
+                    hold.entry_id: _authorization_for(hold) for hold in self._ledger.open_holds()
+                }
 
     @classmethod
     def open_sqlite(
@@ -1920,6 +2039,61 @@ class BudgetManager:
         except BaseException:
             # Never leak the advisory claim if restore-and-verify rejects the
             # file: the next process to try must not be told it is contended.
+            store.close()
+            raise
+
+    @classmethod
+    def open_postgres(
+        cls,
+        conninfo: str,
+        *,
+        schema: str = "agentgov",
+        policy: GovernancePolicy | None = None,
+        read_only: bool = False,
+        repair: bool = False,
+        lock_timeout: float = 30.0,
+        idle_timeout: float = 60.0,
+    ) -> BudgetManager:
+        """Open one governor of a ledger shared through PostgreSQL.
+
+        Unlike :meth:`open_sqlite`, any number of governors, in any number of
+        processes on any number of hosts, may open the same ``schema`` for
+        writing at once. They share one ledger: a dollar one of them holds is
+        a dollar none of the others can spend. Each writes under a fleet-wide
+        lock, after verifying everything the others committed; see
+        :mod:`agentgov.postgres` for the protocol and what guarantees it.
+
+        The first governor to open a database creates the ledger's tables in
+        ``schema``. Requires ``pip install 'agentgov[postgres]'``.
+
+        :param conninfo: A libpq connection string or URI.
+        :param schema: The PostgreSQL schema the ledger lives in.
+        :param policy: Governance limits; defaults to :class:`GovernancePolicy`.
+            Like the SQLite store, the policy is not stored: every governor
+            supplies its own.
+        :param read_only: Open for audit; call :meth:`refresh` to follow.
+        :param repair: Rebuild cache tables that disagree with the chain.
+        :param lock_timeout: Seconds to wait for the writer lock before an
+            operation fails with :class:`~agentgov.exceptions.StorageError`.
+        :param idle_timeout: Seconds the server lets this governor idle inside
+            an open transaction, holding the lock, before ending its session.
+        :raises agentgov.exceptions.StorageError: If the database cannot be
+            reached.
+        :raises agentgov.exceptions.LedgerIntegrityError: If the shared chain,
+            balances, pairing or topology are inconsistent.
+        """
+        from agentgov.postgres import PostgresStore
+
+        store = PostgresStore(
+            conninfo,
+            schema=schema,
+            read_only=read_only,
+            lock_timeout=lock_timeout,
+            idle_timeout=idle_timeout,
+        )
+        try:
+            return cls(policy=policy, store=store, repair=repair)
+        except BaseException:
             store.close()
             raise
 
@@ -2138,7 +2312,7 @@ class BudgetManager:
     # -- refresh ----------------------------------------------------------
 
     def refresh(self) -> int:
-        """Catch a read-only view up with the process writing the ledger.
+        """Catch this view up with the other writers of its ledger.
 
         A read-only manager is a snapshot of the database at the moment it was
         opened. This reads everything committed since — entries, and any open
@@ -2147,8 +2321,14 @@ class BudgetManager:
         balances and hold pairing, exactly as a full open would), and applies
         them: balances, topology and breaker state all move forward.
 
-        A writable manager is the only writer of its store, so it is always
-        current; for it, and for a manager with no store, this is a no-op.
+        A writable manager over a shared ledger (:meth:`open_postgres`) is one
+        of several writers, and does the same. It already does it, under the
+        writer lock, before every mutation; call this for current *reads*. If
+        its last write did not commit, it re-reads the whole ledger instead.
+
+        A writable manager over a single-writer store is the only writer, so it
+        is always current; for it, and for a manager with no store, this is a
+        no-op.
 
         All or nothing: every new entry and cache row is verified against a
         staged copy of this view, and the view changes only once all of it
@@ -2157,17 +2337,25 @@ class BudgetManager:
         :returns: How many new entries were applied.
         :raises LedgerIntegrityError: If the ledger was rewritten under this
             view, or anything new fails verification. The view keeps serving
-            exactly what it last verified, and every later refresh fails the
-            same way: a view that cannot follow the chain never claims to.
+            exactly what it last verified, and every later refresh (and, for a
+            writer, every later write) fails the same way: a view that cannot
+            follow the chain never claims to.
         """
         store = self._store
-        if store is None or not store.read_only:
+        if store is None or (not store.read_only and self._shared is None):
             return 0
         with self._lock:
-            if self._unusable is not None:
-                raise LedgerIntegrityError(
-                    f"this read-only view stopped following the ledger: {self._unusable}"
-                )
+            self._require_following()
+            if self._shared is not None:
+                if self._writing:
+                    # Inside this governor's own mutation, or a transaction it
+                    # joined: it caught up when that began, and what it has
+                    # written since is not committed, so the ledger would look
+                    # shorter than memory. There is nothing to follow yet.
+                    return 0
+                before = len(self._ledger)
+                self._follow(self._shared)
+                return max(0, len(self._ledger) - before)
             try:
                 return self._catch_up(store)
             except BaseException as exc:
@@ -2178,6 +2366,258 @@ class BudgetManager:
                 # closed.
                 self._unusable = str(exc)
                 raise
+
+    def _require_following(self) -> None:
+        """Refuse to act on a view that could not follow its ledger. Lock held."""
+        if self._unusable is not None:
+            kind = "read-only view" if self._shared is None else "governor"
+            raise LedgerIntegrityError(
+                f"this {kind} stopped following the ledger: {self._unusable}"
+            )
+
+    @contextmanager
+    def _mutating(self) -> Iterator[None]:
+        """Hold this manager's lock for a mutation — and, on a shared ledger,
+        the fleet's writer lock too, with this view caught up under it.
+
+        Over a single-writer store this is the mutex and nothing else: this
+        manager's memory is the ledger. Over a shared one it is not, so the
+        writer lock is taken first, everything other governors committed since
+        is read and verified, and only then does the mutation check a balance or
+        a breaker and build its entries. The lock is held until its writes
+        commit, so no other governor can append between the check and the
+        write. A nested mutation (``spend`` is ``authorize`` then ``capture``)
+        joins the session it is already in.
+
+        A session that wrote and then did not commit may have left memory ahead
+        of the database, so the next mutation re-reads the ledger in full.
+        """
+        with self._lock:
+            shared = self._shared
+            if shared is None or self._writing:
+                yield
+                return
+            self._require_following()
+            session: WriterSession | None = None
+            self._writing = True
+            try:
+                with shared.writer() as session:
+                    self._follow(shared)
+                    yield
+            finally:
+                self._writing = False
+                if session is not None and session.wrote and not session.committed:
+                    self._dirty = True
+
+    @contextmanager
+    def joined(self, connection: object) -> Iterator[JoinedTransaction]:
+        """Join a transaction the caller owns, to claim what it owes the ledger.
+
+        For a caller whose own writes live in the same PostgreSQL database as
+        the ledger (an escrow committing a plan's effects, say) and must be
+        paid for exactly when they become durable. Place the hold first, in
+        this governor's own transaction; open the caller's transaction; then::
+
+            hold = governor.authorize(scope, cost)
+            ...                                   # the caller's own writes
+            with governor.joined(conn) as txn:
+                if governor.is_halted(scope):     # current, and stays so
+                    ...                           # roll back
+                claim = txn.claim(scope, cost, memo=digest, hold=hold)
+                conn.execute("COMMIT")
+            governor.redeem(claim)                # books it into the chain
+
+        On entry the writer lock is taken *inside* ``connection``'s
+        transaction, so no governor anywhere can write the ledger (trip a
+        breaker, say) until the caller commits or rolls back, and this governor
+        catches up, on its own connection, with everything already committed.
+        The block writes nothing to the chain: only
+        :meth:`JoinedTransaction.claim`, a row in the caller's transaction
+        that reads nothing of the chain. So a caller whose snapshot is older
+        than the ledger (``REPEATABLE READ``) conflicts with nothing, however
+        busy the ledger is. Commit, or roll back, inside the block.
+
+        A committed claim is owed until :meth:`redeem` books it; any governor
+        may, and a restarted one should (see :meth:`pending_claims`).
+
+        :param connection: A ``psycopg`` connection with an open transaction,
+            whose role was granted joined writes
+            (:meth:`agentgov.postgres.PostgresStore.grant_join`).
+        :raises TypeError: If this governor's store cannot join a transaction.
+        :raises agentgov.exceptions.LedgerConflictError: If the caller's
+            transaction did not get the writer lock within its own
+            ``lock_timeout``. Nothing was written.
+        """
+        store = self._joinable()
+        with self._lock:
+            if self._writing:
+                raise RuntimeError("a governor cannot join a transaction inside its own mutation")
+            self._require_following()
+            if self._dirty:
+                # Re-read before the caller's transaction holds the writer
+                # lock: the re-read takes it too, on this governor's own
+                # connection, and would wait on the caller forever.
+                self._follow(store)
+            self._writing = True
+            try:
+                with store.join(connection):
+                    self._follow(store)
+                    yield JoinedTransaction(self, store)
+            finally:
+                self._writing = False
+
+    def pending_claims(self) -> tuple[SettlementClaim, ...]:
+        """Every committed claim not yet booked into the chain, oldest first.
+
+        Read as committed now, on a writer or a read-only view alike: a claim
+        is owed from the moment the transaction that made it commits.
+
+        :raises TypeError: If this governor's store holds no claims.
+        """
+        from agentgov.storage import JoinableStore
+
+        store = self._store
+        if not isinstance(store, JoinableStore):
+            raise TypeError("only a ledger shared through PostgreSQL holds settlement claims")
+        return store.pending_claims()
+
+    def redeem(self, claim: SettlementClaim | None = None) -> tuple[LedgerEntry, ...]:
+        """Book committed settlement claims into the chain: ``claim``, or all.
+
+        Each claim becomes, in one unit of work that also removes it from the
+        pending claims: the release of its hold and the spend that settles
+        against it, or, when the hold is no longer open (an operator voided
+        it), a spend on its own; a zero claim becomes a zero-value ``ANCHOR``.
+        The spend is booked whatever the scope's state: what it pays for has
+        already happened. An overdraw trips the breaker, as a capture's does,
+        and is recorded rather than raised.
+
+        Idempotent and safe to race: under the writer lock, a claim another
+        governor has booked is gone, and booking one twice is refused by the
+        store.
+
+        :returns: The settling entry for each claim booked now, in claim
+            order. A claim already booked yields nothing.
+        :raises TypeError: If this governor's store holds no claims.
+        """
+        store = self._joinable()
+        with self._mutating():
+            pending = store.pending_claims()
+            if claim is not None:
+                pending = tuple(c for c in pending if c.claim_id == claim.claim_id)
+            return tuple(self._redeem_locked(c) for c in pending)
+
+    def _redeem_locked(self, claim: SettlementClaim) -> LedgerEntry:
+        """Book one claim. Writer lock held, view caught up."""
+        scope_id = claim.scope_id
+        self._require_node(scope_id)
+        hold = self._open_auths.get(claim.hold_id) if claim.hold_id is not None else None
+        pending = self._ledger._begin()
+        trip: LedgerEntry | None = None
+        if claim.amount == ZERO and hold is None:
+            (settling,) = pending.post(
+                [LedgerLine(EntryType.ANCHOR, Direction.NONE, scope_id, ZERO, memo=claim.memo)]
+            )
+        else:
+            lines: list[LedgerLine] = []
+            ref = None
+            if hold is not None:
+                ref = hold.entry.entry_id
+                lines.append(
+                    LedgerLine(
+                        EntryType.HOLD_VOID,
+                        Direction.CREDIT,
+                        scope_id,
+                        hold.amount,
+                        memo="authorization captured by settlement claim",
+                        ref=ref,
+                    )
+                )
+                pending.batch.closed.append(hold.authorization_id)
+            if claim.amount > ZERO:
+                lines.append(
+                    LedgerLine(
+                        EntryType.SPEND,
+                        Direction.DEBIT,
+                        scope_id,
+                        claim.amount,
+                        memo=claim.memo,
+                        ref=ref,
+                    )
+                )
+            *_, settling = pending.post(lines)
+            if settling.balance_after < ZERO:
+                trip = self._stage_trip(
+                    pending,
+                    scope_id,
+                    f"settled claim {claim.amount} overdrew the scope by {-settling.balance_after}",
+                )
+            elif hold is not None and self._exhausted(pending, scope_id, settling=hold):
+                trip = self._stage_trip(pending, scope_id, "spend envelope exhausted")
+        pending.batch.redeemed.append(claim.claim_id)
+        self._ledger._commit(pending)
+        if hold is not None:
+            self._open_auths.pop(hold.authorization_id, None)
+        if trip is not None:
+            self._apply_trip(trip)
+        return settling
+
+    def _joinable(self) -> JoinableStore:
+        from agentgov.storage import JoinableStore
+
+        store = self._shared
+        if not isinstance(store, JoinableStore):
+            raise TypeError(
+                "only a writable governor over a store that can join a transaction "
+                "(BudgetManager.open_postgres) can join one or hold settlement claims"
+            )
+        return store
+
+    def _follow(self, store: SharedStore) -> None:
+        """Bring this writer's view up to the shared ledger's head. Lock held.
+
+        A view whose length and head hash match the store's is current, since
+        the head hash commits to every entry before it; that is the common case
+        and costs one query. Otherwise the new entries are verified and applied
+        exactly as :meth:`refresh` does for a reader. A view left dirty by a
+        session that did not commit is rebuilt from a full, verified read.
+
+        :raises LedgerIntegrityError: If the ledger cannot be followed. The
+            governor then refuses every later write.
+        """
+        try:
+            if self._dirty:
+                self._reload(store)
+                self._dirty = False
+                return
+            length, head = store.head()
+            if length == len(self._ledger) and head == self._ledger.head_hash:
+                return
+            self._catch_up(store)
+        except LedgerIntegrityError as exc:
+            self._unusable = str(exc)
+            raise
+
+    def _governance_view(self) -> _Governance:
+        """The governance a writer serves, shaped for :meth:`_catch_up` to
+        stage new entries on.
+
+        A read-only view keeps its :class:`_Governance`; a writer keeps the same
+        facts in the structures it mutates directly (breakers, nodes, events),
+        so the view is assembled from those, aliasing rather than copying them.
+        A writer's pre-0.1.2 control events were sealed into the chain before
+        it could write, so nothing legacy remains to apply.
+        """
+        view = _Governance(self._legacy_events)
+        view._legacy_applied = True
+        view.nodes, view.roots, view.events = self._nodes, self._roots, self._control_events
+        view.tripped = {
+            scope_id: (state.tripped_at, state.reason)
+            for scope_id, state in self._breakers.items()
+            if state.tripped_at is not None
+        }
+        view.chain_events = [e for e in self._control_events if e.entry_id is not None]
+        return view
 
     def _catch_up(self, store: PersistenceStore) -> int:
         ledger = self._ledger
@@ -2193,9 +2633,9 @@ class BudgetManager:
                 f"the ledger was rewritten under this reader: entry {before} no longer "
                 f"carries the head this view verified"
             )
-        governance = self._governance
-        if governance is None:  # pragma: no cover - set for every read-only restore
-            raise RuntimeError("read-only manager has no governance view")
+        following = self._governance
+        base = following if following is not None else self._governance_view()
+        governance = base
         if delta.legacy_control_events and ledger._state.saw_v2:
             raise LedgerIntegrityError(
                 "control_events gained rows outside the chain after the ledger was sealed"
@@ -2231,8 +2671,9 @@ class BudgetManager:
             ledger._publish([*verified, *delta.entries], state)
         else:
             ledger._publish(verified, state)
-        if governance is not self._governance:
-            self._governance = governance
+        if governance is not base:
+            if following is not None:
+                self._governance = governance
             self._nodes, self._roots = governance.nodes, governance.roots
             self._control_events = governance.events
             self._sync_breakers(governance)
@@ -2243,15 +2684,20 @@ class BudgetManager:
         return len(delta.entries)
 
     def _reload(self, store: PersistenceStore) -> None:
-        """Rebuild this read-only view from a fresh, full, verified read.
+        """Rebuild this view from a fresh, full, verified read.
 
         The new view is built and verified on its own, exactly as a fresh open
-        would, and adopted whole only once it checks out.
+        would, and adopted whole only once it checks out. A writer keeps its
+        velocity windows: they are this process's own count, not the ledger's.
         """
         fresh = BudgetManager(policy=self._policy, store=store)
         self._ledger._publish(fresh._ledger._entries, fresh._ledger._state)
         self._nodes, self._roots = fresh._nodes, fresh._roots
         self._control_events = fresh._control_events
+        for scope_id, state in fresh._breakers.items():
+            previous = self._breakers.get(scope_id)
+            if previous is not None:
+                state.call_times = previous.call_times
         self._breakers = fresh._breakers
         self._open_auths = fresh._open_auths
         self._legacy_events = fresh._legacy_events
@@ -2387,7 +2833,7 @@ class BudgetManager:
             raise ValueError(f"envelope must be positive, got {amount}")
         _require_scope_id(scope_id)
 
-        with self._lock:
+        with self._mutating():
             if scope_id in self._nodes:
                 raise DuplicateScopeError(scope_id)
             pending = self._ledger._begin()
@@ -2443,7 +2889,7 @@ class BudgetManager:
         if credited <= ZERO:
             raise ValueError(f"funding must be positive, got {credited}")
 
-        with self._lock:
+        with self._mutating():
             node = self._require_node(scope_id)
             if node.parent_id is not None:
                 raise ValueError(f"scope {scope_id!r} is not a root; use delegate() to fund it")
@@ -2499,7 +2945,7 @@ class BudgetManager:
             raise ValueError(f"delegated amount must be positive, got {granted}")
         _require_scope_id(child_id)
 
-        with self._lock:
+        with self._mutating():
             parent = self._require_node(parent_id)
             if child_id in self._nodes:
                 raise DuplicateScopeError(child_id)
@@ -2575,7 +3021,7 @@ class BudgetManager:
         :raises ValueError: If ``scope_id`` is a root, or ``amount`` exceeds
             what is available.
         """
-        with self._lock:
+        with self._mutating():
             node = self._require_node(scope_id)
             if node.parent_id is None:
                 raise ValueError(f"root scope {scope_id!r} has no parent to release to")
@@ -2652,7 +3098,7 @@ class BudgetManager:
         if held <= ZERO:
             raise ValueError(f"authorization amount must be positive, got {held}")
 
-        with self._lock:
+        with self._mutating():
             self._require_node(scope_id)
             self._assert_not_halted(scope_id)
             self._record_velocity(scope_id)
@@ -2724,7 +3170,7 @@ class BudgetManager:
         if settled < ZERO:
             raise ValueError(f"actual cost must not be negative, got {settled}")
 
-        with self._lock:
+        with self._mutating():
             self._require_open_authorization(authorization, "was already settled")
 
             if settled == ZERO:
@@ -2795,7 +3241,7 @@ class BudgetManager:
         :returns: The committed :attr:`EntryType.HOLD_VOID` entry.
         :raises DoubleSpendError: If this authorization was already settled.
         """
-        with self._lock:
+        with self._mutating():
             self._require_open_authorization(authorization, "was already settled")
             return self._void_locked(authorization, memo or "authorization voided")
 
@@ -2818,7 +3264,7 @@ class BudgetManager:
         :param memo: Free-form audit context.
         :returns: The committed spend entry.
         """
-        with self._lock:
+        with self._mutating():
             auth = self.authorize(scope_id, amount, memo=memo)
             return self.capture(auth, amount, memo=memo)
 
@@ -2845,7 +3291,7 @@ class BudgetManager:
         if credited <= ZERO:
             raise ValueError(f"refund must be positive, got {credited}")
 
-        with self._lock:
+        with self._mutating():
             self._require_node(scope_id)
             entries = self._ledger.post(
                 [
@@ -2881,7 +3327,7 @@ class BudgetManager:
         """
         if not memo:
             raise ValueError("an anchor must carry the record it commits to")
-        with self._lock:
+        with self._mutating():
             self._require_node(scope_id)
             (entry,) = self._ledger.post(
                 [
@@ -2961,9 +3407,10 @@ class BudgetManager:
         note = memo or "stale hold released by operator"
         voided: list[Authorization] = []
         for auth in self.stale_authorizations(older_than, scope_id=scope_id):
-            with self._lock:
+            with self._mutating():
                 # Re-check under the lock: a settlement may have landed
-                # between the survey above and this release.
+                # between the survey above and this release — on a shared
+                # ledger, by another governor, which the catch-up has read.
                 if auth.authorization_id not in self._open_auths:
                     continue
                 self._void_locked(auth, note)
@@ -3003,7 +3450,7 @@ class BudgetManager:
         :param reason: Why it was halted; recorded in the audit trail.
         :raises UnknownScopeError: If no such scope is registered.
         """
-        with self._lock:
+        with self._mutating():
             self._require_node(scope_id)
             self._trip(scope_id, reason)
 
@@ -3018,7 +3465,7 @@ class BudgetManager:
         :param scope_id: The scope to re-arm.
         :raises UnknownScopeError: If no such scope is registered.
         """
-        with self._lock:
+        with self._mutating():
             self._require_node(scope_id)
             state = self._breakers[scope_id]
             if state.tripped_at is None:
@@ -3308,6 +3755,13 @@ class BudgetManager:
 def _require_scope_id(scope_id: str) -> None:
     if not scope_id:
         raise ValueError("a scope id must not be empty")
+
+
+def _shared_store(store: PersistenceStore) -> SharedStore | None:
+    """``store``, if other governors write it too."""
+    from agentgov.storage import SharedStore  # deferred: storage imports this module
+
+    return store if isinstance(store, SharedStore) else None
 
 
 def _authorization_for(hold: LedgerEntry) -> Authorization:
