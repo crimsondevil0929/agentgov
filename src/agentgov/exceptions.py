@@ -41,6 +41,7 @@ __all__ = [
     "DenialOfWalletException",
     "DoubleSpendError",
     "DuplicateScopeError",
+    "LedgerConflictError",
     "LedgerError",
     "LedgerIntegrityError",
     "MalformedReceiptError",
@@ -288,6 +289,18 @@ class ReadOnlyLedgerError(StorageError):
     def __init__(self, operation: str) -> None:
         self.operation = operation
         super().__init__(f"cannot {operation}: this governor was opened read-only for audit access")
+
+
+class LedgerConflictError(StorageError):
+    """Raised when a joined transaction's snapshot is older than the ledger.
+
+    A governor that writes inside a transaction someone else owns
+    (:meth:`~agentgov.core.BudgetManager.joined`) writes through that
+    transaction's snapshot. When the transaction runs at ``REPEATABLE READ``
+    and another governor committed to the ledger after its snapshot was taken,
+    an entry built on the committed head cannot be written in it. Nothing was
+    written: roll the transaction back and run it again.
+    """
 
 
 # --------------------------------------------------------------------------

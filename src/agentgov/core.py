@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     # methods; guarding this import under TYPE_CHECKING avoids the cycle
     # while still giving mypy the real types for the `store=` parameters.
     from agentgov.storage import (
+        JoinableStore,
         PersistedAuthorization,
         PersistedNode,
         PersistenceStore,
@@ -117,9 +118,11 @@ __all__ = [
     "Direction",
     "EntryType",
     "GovernancePolicy",
+    "JoinedTransaction",
     "Ledger",
     "LedgerEntry",
     "LedgerLine",
+    "SettlementClaim",
     "WriteBatch",
     "format_audit_line",
     "money",
@@ -947,6 +950,9 @@ class WriteBatch:
         chain entry.
     :ivar opened: Authorizations placed.
     :ivar closed: Authorization ids settled or voided.
+    :ivar redeemed: Settlement claims these entries book, removed from the
+        pending claims in the same transaction, so a claim is booked exactly
+        once. Only a store that holds claims accepts them.
     """
 
     entries: list[LedgerEntry] = field(default_factory=list)
@@ -954,9 +960,44 @@ class WriteBatch:
     control_events: list[ControlEvent] = field(default_factory=list)
     opened: list[Authorization] = field(default_factory=list)
     closed: list[uuid.UUID] = field(default_factory=list)
+    redeemed: list[uuid.UUID] = field(default_factory=list)
 
     def __bool__(self) -> bool:
-        return bool(self.entries or self.nodes or self.control_events or self.opened or self.closed)
+        return bool(
+            self.entries
+            or self.nodes
+            or self.control_events
+            or self.opened
+            or self.closed
+            or self.redeemed
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementClaim:
+    """A debt a caller's transaction owes the ledger, committed with it.
+
+    Written by :meth:`JoinedTransaction.claim` inside a transaction someone
+    else owns, and booked into the chain afterwards by
+    :meth:`BudgetManager.redeem`. A claim touches none of the chain, so
+    writing one cannot conflict with any other governor's writes; it exists
+    exactly when the caller's transaction committed, so redeeming every
+    pending claim is always correct, by any governor, at any time.
+
+    :ivar claim_id: Unique id of the claim.
+    :ivar hold_id: The hold placed for it beforehand, whose release and
+        capture redemption posts. ``None`` for a claim with nothing reserved.
+    :ivar scope_id: The scope that pays.
+    :ivar amount: What is owed. Zero books a zero-value ``ANCHOR``.
+    :ivar memo: The spend's (or anchor's) memo, typically another chain's
+        record the settlement names.
+    """
+
+    claim_id: uuid.UUID
+    hold_id: uuid.UUID | None
+    scope_id: str
+    amount: Decimal
+    memo: str
 
 
 class _Pending:
@@ -1731,6 +1772,62 @@ class _Governance:
             )
 
 
+class JoinedTransaction:
+    """A governor's part in a transaction someone else owns.
+
+    Yielded by :meth:`BudgetManager.joined`. The only thing it writes is a
+    :class:`SettlementClaim`, into the caller's transaction: nothing in the
+    chain, so nothing that depends on which ledger head the caller's
+    transaction can see.
+    """
+
+    __slots__ = ("_manager", "_store")
+
+    def __init__(self, manager: BudgetManager, store: JoinableStore) -> None:
+        self._manager = manager
+        self._store = store
+
+    def claim(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str,
+        hold: Authorization | None = None,
+    ) -> SettlementClaim:
+        """Owe ``amount`` from ``scope_id``, durably if the caller commits.
+
+        :param hold: The authorization placed for this beforehand. Redemption
+            releases it and settles against it; without one, redemption posts
+            the spend directly.
+        :returns: The claim, to redeem once the caller has committed
+            (:meth:`BudgetManager.redeem`).
+        :raises UnknownScopeError: If the scope is not in the ledger.
+        :raises ValueError: If ``amount`` is negative, or ``hold`` belongs to
+            another scope.
+        """
+        owed = _cost(amount)
+        if owed < ZERO:
+            raise ValueError(f"a claim cannot owe a negative amount, got {owed}")
+        if not memo:
+            raise ValueError("a claim must carry the memo its settlement will record")
+        if hold is not None and hold.scope_id != scope_id:
+            raise ValueError(
+                f"hold {hold.authorization_id} is on scope {hold.scope_id!r}, not {scope_id!r}"
+            )
+        with self._manager._lock:
+            self._manager._require_node(scope_id)
+        claim = SettlementClaim(
+            claim_id=uuid.uuid4(),
+            hold_id=None if hold is None else hold.authorization_id,
+            scope_id=scope_id,
+            amount=owed,
+            memo=memo,
+        )
+        self._store.claim(claim)
+        return claim
+
+
 @dataclass(slots=True)
 class _BreakerState:
     """Per-scope circuit-breaker and velocity state."""
@@ -2250,6 +2347,12 @@ class BudgetManager:
         with self._lock:
             self._require_following()
             if self._shared is not None:
+                if self._writing:
+                    # Inside this governor's own mutation, or a transaction it
+                    # joined: it caught up when that began, and what it has
+                    # written since is not committed, so the ledger would look
+                    # shorter than memory. There is nothing to follow yet.
+                    return 0
                 before = len(self._ledger)
                 self._follow(self._shared)
                 return max(0, len(self._ledger) - before)
@@ -2305,6 +2408,170 @@ class BudgetManager:
                 self._writing = False
                 if session is not None and session.wrote and not session.committed:
                     self._dirty = True
+
+    @contextmanager
+    def joined(self, connection: object) -> Iterator[JoinedTransaction]:
+        """Join a transaction the caller owns, to claim what it owes the ledger.
+
+        For a caller whose own writes live in the same PostgreSQL database as
+        the ledger (an escrow committing a plan's effects, say) and must be
+        paid for exactly when they become durable. Place the hold first, in
+        this governor's own transaction; open the caller's transaction; then::
+
+            hold = governor.authorize(scope, cost)
+            ...                                   # the caller's own writes
+            with governor.joined(conn) as txn:
+                if governor.is_halted(scope):     # current, and stays so
+                    ...                           # roll back
+                claim = txn.claim(scope, cost, memo=digest, hold=hold)
+                conn.execute("COMMIT")
+            governor.redeem(claim)                # books it into the chain
+
+        On entry the writer lock is taken *inside* ``connection``'s
+        transaction, so no governor anywhere can write the ledger (trip a
+        breaker, say) until the caller commits or rolls back, and this governor
+        catches up, on its own connection, with everything already committed.
+        The block writes nothing to the chain: only
+        :meth:`JoinedTransaction.claim`, a row in the caller's transaction
+        that reads nothing of the chain. So a caller whose snapshot is older
+        than the ledger (``REPEATABLE READ``) conflicts with nothing, however
+        busy the ledger is. Commit, or roll back, inside the block.
+
+        A committed claim is owed until :meth:`redeem` books it; any governor
+        may, and a restarted one should (see :meth:`pending_claims`).
+
+        :param connection: A ``psycopg`` connection with an open transaction,
+            whose role was granted joined writes
+            (:meth:`agentgov.postgres.PostgresStore.grant_join`).
+        :raises TypeError: If this governor's store cannot join a transaction.
+        :raises agentgov.exceptions.LedgerConflictError: If the caller's
+            transaction did not get the writer lock within its own
+            ``lock_timeout``. Nothing was written.
+        """
+        store = self._joinable()
+        with self._lock:
+            if self._writing:
+                raise RuntimeError("a governor cannot join a transaction inside its own mutation")
+            self._require_following()
+            if self._dirty:
+                # Re-read before the caller's transaction holds the writer
+                # lock: the re-read takes it too, on this governor's own
+                # connection, and would wait on the caller forever.
+                self._follow(store)
+            self._writing = True
+            try:
+                with store.join(connection):
+                    self._follow(store)
+                    yield JoinedTransaction(self, store)
+            finally:
+                self._writing = False
+
+    def pending_claims(self) -> tuple[SettlementClaim, ...]:
+        """Every committed claim not yet booked into the chain, oldest first.
+
+        Read as committed now, on a writer or a read-only view alike: a claim
+        is owed from the moment the transaction that made it commits.
+
+        :raises TypeError: If this governor's store holds no claims.
+        """
+        from agentgov.storage import JoinableStore
+
+        store = self._store
+        if not isinstance(store, JoinableStore):
+            raise TypeError("only a ledger shared through PostgreSQL holds settlement claims")
+        return store.pending_claims()
+
+    def redeem(self, claim: SettlementClaim | None = None) -> tuple[LedgerEntry, ...]:
+        """Book committed settlement claims into the chain: ``claim``, or all.
+
+        Each claim becomes, in one unit of work that also removes it from the
+        pending claims: the release of its hold and the spend that settles
+        against it, or, when the hold is no longer open (an operator voided
+        it), a spend on its own; a zero claim becomes a zero-value ``ANCHOR``.
+        The spend is booked whatever the scope's state: what it pays for has
+        already happened. An overdraw trips the breaker, as a capture's does,
+        and is recorded rather than raised.
+
+        Idempotent and safe to race: under the writer lock, a claim another
+        governor has booked is gone, and booking one twice is refused by the
+        store.
+
+        :returns: The settling entry for each claim booked now, in claim
+            order. A claim already booked yields nothing.
+        :raises TypeError: If this governor's store holds no claims.
+        """
+        store = self._joinable()
+        with self._mutating():
+            pending = store.pending_claims()
+            if claim is not None:
+                pending = tuple(c for c in pending if c.claim_id == claim.claim_id)
+            return tuple(self._redeem_locked(c) for c in pending)
+
+    def _redeem_locked(self, claim: SettlementClaim) -> LedgerEntry:
+        """Book one claim. Writer lock held, view caught up."""
+        scope_id = claim.scope_id
+        self._require_node(scope_id)
+        hold = self._open_auths.get(claim.hold_id) if claim.hold_id is not None else None
+        pending = self._ledger._begin()
+        trip: LedgerEntry | None = None
+        if claim.amount == ZERO and hold is None:
+            (settling,) = pending.post(
+                [LedgerLine(EntryType.ANCHOR, Direction.NONE, scope_id, ZERO, memo=claim.memo)]
+            )
+        else:
+            lines: list[LedgerLine] = []
+            ref = None
+            if hold is not None:
+                ref = hold.entry.entry_id
+                lines.append(
+                    LedgerLine(
+                        EntryType.HOLD_VOID,
+                        Direction.CREDIT,
+                        scope_id,
+                        hold.amount,
+                        memo="authorization captured by settlement claim",
+                        ref=ref,
+                    )
+                )
+                pending.batch.closed.append(hold.authorization_id)
+            if claim.amount > ZERO:
+                lines.append(
+                    LedgerLine(
+                        EntryType.SPEND,
+                        Direction.DEBIT,
+                        scope_id,
+                        claim.amount,
+                        memo=claim.memo,
+                        ref=ref,
+                    )
+                )
+            *_, settling = pending.post(lines)
+            if settling.balance_after < ZERO:
+                trip = self._stage_trip(
+                    pending,
+                    scope_id,
+                    f"settled claim {claim.amount} overdrew the scope by {-settling.balance_after}",
+                )
+            elif hold is not None and self._exhausted(pending, scope_id, settling=hold):
+                trip = self._stage_trip(pending, scope_id, "spend envelope exhausted")
+        pending.batch.redeemed.append(claim.claim_id)
+        self._ledger._commit(pending)
+        if hold is not None:
+            self._open_auths.pop(hold.authorization_id, None)
+        if trip is not None:
+            self._apply_trip(trip)
+        return settling
+
+    def _joinable(self) -> JoinableStore:
+        from agentgov.storage import JoinableStore
+
+        store = self._shared
+        if not isinstance(store, JoinableStore):
+            raise TypeError(
+                "only a writable governor over a store that can join a transaction "
+                "(BudgetManager.open_postgres) can join one or hold settlement claims"
+            )
+        return store
 
     def _follow(self, store: SharedStore) -> None:
         """Bring this writer's view up to the shared ledger's head. Lock held.

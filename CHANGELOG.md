@@ -30,6 +30,31 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
   `ALWAYS`. A governor with a stale view, or one that skipped the lock, is
   refused rather than allowed to fork the chain; the lock only turns those
   refusals into waiting.
+- **Settlement claims: `BudgetManager.joined(connection)` and `redeem()`.** A
+  caller whose own writes live in the ledger's database (interlock's escrow)
+  can make what it owes the ledger commit exactly when its writes do. The
+  governor places a hold beforehand, in its own transaction; joins the
+  caller's transaction at its end, taking the writer lock inside it (so no
+  governor can write, or trip a breaker, until the caller commits) and
+  catching up on its own connection; and records a `SettlementClaim` there
+  (`JoinedTransaction.claim()`). After the caller commits, `redeem()` books
+  the claim into the chain, the hold's release and the spend, and removes it
+  from the pending claims in the same transaction, so it is booked exactly
+  once, by whichever governor gets there first; `pending_claims()` lists what
+  is owed. The claim reads nothing of the chain, so a caller's `REPEATABLE
+  READ` snapshot, however old, conflicts with no other governor's commits. A
+  claim whose hold was voided meanwhile is booked as a spend on its own; one
+  that overdraws is booked and trips the breaker. `LedgerConflictError` (new)
+  is raised only when the caller's transaction does not get the writer lock
+  within its own `lock_timeout`.
+- **The caller's role cannot write the ledger or claim anything.**
+  `PostgresStore.grant_join(role)` grants `EXECUTE` on one `SECURITY DEFINER`
+  function, `claim`, and nothing on any table. It admits a claim only with
+  `sha256(secret || the transaction's id)`: the secret (the new `join_key`
+  table, from the OS's CSPRNG at install) is readable by the ledger's owner
+  and governors, never by the joined role, so nothing else running in the
+  caller's transaction can claim anything, and a token is good for one
+  transaction. Claims live in the new `claims` table until redeemed.
 
 ### Changed
 

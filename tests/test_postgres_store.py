@@ -101,7 +101,15 @@ def test_a_fresh_database_starts_empty_and_installs_its_schema(pg_dsn: str) -> N
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'agentgov'"
             )
         }
-    assert tables == {"schema_meta", "entries", "nodes", "control_events", "open_authorizations"}
+    assert tables == {
+        "schema_meta",
+        "entries",
+        "nodes",
+        "control_events",
+        "open_authorizations",
+        "join_key",
+        "claims",
+    }
 
 
 def test_state_survives_every_governor_closing(pg_dsn: str) -> None:

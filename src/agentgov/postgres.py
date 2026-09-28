@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import secrets
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from decimal import Decimal
@@ -83,11 +84,17 @@ from agentgov.core import (
     Direction,
     EntryType,
     LedgerEntry,
+    SettlementClaim,
     WriteBatch,
     _iso,
     _parse_iso,
 )
-from agentgov.exceptions import LedgerIntegrityError, ReadOnlyLedgerError, StorageError
+from agentgov.exceptions import (
+    LedgerConflictError,
+    LedgerIntegrityError,
+    ReadOnlyLedgerError,
+    StorageError,
+)
 from agentgov.storage import PersistedAuthorization, PersistedNode, StoreDelta, StoreImage
 
 try:
@@ -136,11 +143,19 @@ def _millis(seconds: float, label: str) -> int:
 
 
 class _Session:
-    """One writer session. See :class:`~agentgov.storage.WriterSession`."""
+    """One writer session. See :class:`~agentgov.storage.WriterSession`.
 
-    __slots__ = ("committed", "failed", "wrote")
+    :ivar conn: The connection the session's writes go to: this store's own,
+        or, for a joined session, the caller's.
+    :ivar token: For a joined session, what proves to the database that a
+        governor of this ledger joined that transaction. ``None`` otherwise.
+    """
 
-    def __init__(self) -> None:
+    __slots__ = ("committed", "conn", "failed", "token", "wrote")
+
+    def __init__(self, conn: psycopg.Connection[Any], *, token: bytes | None = None) -> None:
+        self.conn = conn
+        self.token = token
         self.committed = False
         self.wrote = False
         self.failed = False
@@ -200,6 +215,7 @@ class PostgresStore:
         self._lock_timeout_ms = _millis(lock_timeout, "lock_timeout")
         self._idle_timeout_ms = _millis(idle_timeout, "idle_timeout")
         self._session: _Session | None = None
+        self._key: bytes | None = None
         self._sql = _Statements(schema, _lock_keys(schema), self._lock_timeout_ms)
         self._conn = self._connect()
         try:
@@ -231,12 +247,17 @@ class PostgresStore:
     def _live(self) -> psycopg.Connection[tuple[Any, ...]]:
         """The connection, reopened if the server ended the last one.
 
-        Only ever between sessions: a session whose connection died is over,
-        and its governor re-reads the ledger rather than carrying on.
+        Never under a session of its own: a session whose connection died is
+        over, and its governor re-reads the ledger rather than carrying on. A
+        joined session writes on the caller's connection, not this one.
         """
-        if self._conn.closed and self._session is None:
+        if self._conn.closed and not self._in_own_session():
             self._conn = self._connect()
         return self._conn
+
+    def _in_own_session(self) -> bool:
+        """Whether a session's transaction is open on this store's connection."""
+        return self._session is not None and self._session.conn is self._conn
 
     # -- properties -------------------------------------------------------
 
@@ -293,6 +314,11 @@ class PostgresStore:
                 with self._errors(f"create the ledger schema {self._schema!r}"):
                     for statement in self._sql.install:
                         conn.execute(statement)
+                    # The secret joined transactions are authorized by. From
+                    # the OS's CSPRNG, not the server's random(); readable by
+                    # the ledger's owner and the governors it grants, never by
+                    # a role that only carries joined writes.
+                    conn.execute(self._sql.set_join_key, (secrets.token_bytes(32),))
                     conn.execute(self._sql.set_version, (_SCHEMA_VERSION,))
                 version = _SCHEMA_VERSION
         return version
@@ -328,10 +354,15 @@ class PostgresStore:
         """
         self._require_writable("write the ledger")
         if self._session is not None:
+            if self._session.token is not None:
+                raise StorageError(
+                    "cannot open a writer session inside a joined transaction: the joined "
+                    "transaction holds the writer lock, so this would wait on itself"
+                )
             yield self._session
             return
-        session = _Session()
         self._begin()
+        session = _Session(self._conn)
         self._session = session
         try:
             yield session
@@ -407,6 +438,10 @@ class PostgresStore:
         """
         try:
             yield
+        except psycopg.errors.SerializationFailure as exc:
+            if self._session is not None:
+                self._session.failed = True
+            raise LedgerConflictError(f"cannot {operation}: {exc}") from exc
         except psycopg.errors.IntegrityError as exc:
             if self._session is not None:
                 self._session.failed = True
@@ -424,11 +459,14 @@ class PostgresStore:
     def _reading(self) -> Iterator[None]:
         """One consistent read.
 
-        Inside a writer session the reads are the session's own: no other
-        writer can commit while it holds the lock. Outside one, a read-only
-        ``REPEATABLE READ`` transaction, so several SELECTs see one snapshot.
+        Inside a writer session on this store's connection the reads are the
+        session's own: no other writer can commit while it holds the lock.
+        Otherwise, including under a joined session, whose transaction is the
+        caller's and whose snapshot may be older than the ledger, a read-only
+        ``REPEATABLE READ`` transaction on this store's own connection, so
+        several SELECTs see one snapshot of what is committed.
         """
-        if self._session is not None:
+        if self._in_own_session():
             yield
             return
         conn = self._live()
@@ -455,6 +493,12 @@ class PostgresStore:
             return
         self._require_writable("commit a transaction")
         session = self._require_session("commit a transaction")
+        if session.token is not None:
+            raise StorageError(
+                "the chain is not written inside a joined transaction, whose snapshot may be "
+                "older than the ledger: record a settlement claim there, and redeem it after "
+                "the transaction commits"
+            )
         session.wrote = True
         conn = self._conn
         count = len(batch.entries)
@@ -483,6 +527,17 @@ class PostgresStore:
                 cur.execute(self._sql.insert_authorization, _authorization_row(auth))
             for authorization_id in batch.closed:
                 cur.execute(self._sql.delete_authorization, (authorization_id,))
+            if batch.redeemed:
+                # Booked exactly once: the claims leave in the same
+                # transaction as the entries that book them, and every one of
+                # them must still be pending.
+                cur.execute(self._sql.delete_claims, (list(batch.redeemed),))
+                if cur.rowcount != len(batch.redeemed):
+                    session.failed = True
+                    raise LedgerIntegrityError(
+                        f"cannot book {len(batch.redeemed)} settlement claim(s): only "
+                        f"{cur.rowcount} were still pending; a claim is booked once"
+                    )
 
     def rebuild_caches(
         self,
@@ -498,6 +553,8 @@ class PostgresStore:
         """
         self._require_writable("repair cache tables")
         session = self._require_session("repair cache tables")
+        if session.token is not None:
+            raise StorageError("cannot repair cache tables inside a joined transaction")
         session.wrote = True
         conn = self._conn
         with self._errors("repair cache tables"), conn.cursor() as cur:
@@ -510,6 +567,126 @@ class PostgresStore:
             cur.execute(self._sql.clear_authorizations)
             for auth in authorizations:
                 cur.execute(self._sql.insert_authorization, _authorization_row(auth))
+
+    # -- joined transactions ----------------------------------------------
+
+    @contextmanager
+    def join(self, connection: psycopg.Connection[Any]) -> Iterator[_Session]:
+        """Take part in ``connection``'s open transaction.
+
+        See :meth:`agentgov.core.BudgetManager.joined`, which is how a
+        governor joins. The writer lock is taken *inside* that transaction,
+        so it is held until the caller commits or rolls back, and the block's
+        settlement claims (:meth:`claim`) are written into it. This never
+        commits or rolls back, and never writes the chain there.
+
+        ``connection`` needs no privilege on the ledger's tables, only
+        ``EXECUTE`` on the claim function (:meth:`grant_join`). That function
+        is ``SECURITY DEFINER`` and admits a claim only with a token derived
+        from a secret the caller's role cannot read and from that
+        transaction's own id, so nothing else that runs in the caller's
+        transaction can claim anything, and no token outlives it.
+
+        :raises StorageError: If a session is already open on this store, or
+            ``connection`` has no open transaction.
+        :raises LedgerConflictError: If the writer lock was not granted within
+            the transaction's own ``lock_timeout``.
+        """
+        self._require_writable("join a transaction")
+        if self._session is not None:
+            raise StorageError("cannot join a transaction inside another writer session")
+        status = connection.info.transaction_status
+        if status is not psycopg.pq.TransactionStatus.INTRANS:
+            raise StorageError(
+                f"a governor joins an open transaction, and this connection's is {status.name}"
+            )
+        key = self._join_key()
+        try:
+            connection.execute(self._sql.lock_in_transaction)
+            row = connection.execute("SELECT pg_current_xact_id()::text").fetchone()
+        except psycopg.errors.LockNotAvailable as exc:
+            raise LedgerConflictError(
+                f"the joined transaction was not granted the writer lock of ledger schema "
+                f"{self._schema!r} within its lock_timeout; another governor holds it"
+            ) from exc
+        except psycopg.Error as exc:
+            raise StorageError(f"cannot join the transaction: {exc}") from exc
+        assert row is not None
+        token = hashlib.sha256(key + str(row[0]).encode()).digest()
+        session = _Session(connection, token=token)
+        self._session = session
+        try:
+            yield session
+        finally:
+            self._session = None
+
+    def claim(self, claim: SettlementClaim) -> None:
+        """Record ``claim`` in the joined transaction.
+
+        The claim function reads nothing of the chain, only the join key
+        (written at install), so the transaction's snapshot, however old,
+        makes no difference to it: no conflict with any other governor.
+
+        :raises StorageError: Outside a joined transaction.
+        """
+        session = self._session
+        if session is None or session.token is None:
+            raise StorageError("a settlement claim is written in a joined transaction only")
+        with self._errors("record a settlement claim in the joined transaction"):
+            session.conn.execute(
+                self._sql.claim,
+                (
+                    session.token,
+                    claim.claim_id,
+                    claim.hold_id,
+                    claim.scope_id,
+                    str(claim.amount),
+                    claim.memo,
+                ),
+            )
+        session.wrote = True
+
+    def pending_claims(self) -> tuple[SettlementClaim, ...]:
+        """Every committed claim not yet booked into the chain, oldest first."""
+        with self._reading(), self._errors("read the pending settlement claims"):
+            rows = self._conn.execute(self._sql.select_claims).fetchall()
+        return tuple(
+            SettlementClaim(
+                claim_id=row[0],
+                hold_id=row[1],
+                scope_id=row[2],
+                amount=Decimal(row[3]),
+                memo=row[4],
+            )
+            for row in rows
+        )
+
+    def grant_join(self, *roles: str) -> None:
+        """Let ``roles`` settle with the ledger in transactions of their own.
+
+        Grants ``USAGE`` on the schema and ``EXECUTE`` on the claim function,
+        and nothing on any table: those roles can neither read nor write the
+        ledger, and can record a claim only through a governor that joins
+        their transaction. Run as the ledger's owner.
+
+        :raises ValueError: On a role name that is not a plain identifier.
+        """
+        for role in roles:
+            if not _SCHEMA_NAME.match(role):
+                raise ValueError(f"role name {role!r} is not a plain lowercase identifier")
+        with self._errors("grant joined writes"):
+            for role in roles:
+                for statement in self._sql.grant_join(role):
+                    self._live().execute(statement)
+
+    def _join_key(self) -> bytes:
+        if self._key is None:
+            with self._errors("read the ledger's join key"):
+                row = self._live().execute(self._sql.get_join_key).fetchone()
+            if row is None:
+                raise StorageError(f"ledger schema {self._schema!r} has no join key")
+            self._key = bytes(row[0])
+        return self._key
 
     # -- reading ----------------------------------------------------------
 
@@ -768,6 +945,33 @@ class _Statements:
         self.install = _install_statements(schema)
         self._insert_entries: dict[int, sql.Composed] = {}
 
+        # Joined transactions. The lock is the same key as begin_locked's,
+        # taken inside a transaction the caller opened.
+        self.lock_in_transaction = sql.SQL("SELECT pg_advisory_xact_lock({k1}, {k2})").format(
+            k1=sql.Literal(keys[0]), k2=sql.Literal(keys[1])
+        )
+        join_key = table("join_key")
+        self.get_join_key = sql.SQL("SELECT k FROM {}").format(join_key)
+        self.set_join_key = sql.SQL("INSERT INTO {} (k) VALUES (%s)").format(join_key)
+        claims = table("claims")
+        self.claim = sql.SQL("SELECT {}(%s, %s, %s, %s, %s, %s)").format(table("claim"))
+        self.select_claims = sql.SQL(
+            "SELECT claim_id, hold_id, scope_id, amount, memo FROM {} ORDER BY seq"
+        ).format(claims)
+        self.delete_claims = sql.SQL("DELETE FROM {} WHERE claim_id = ANY(%s)").format(claims)
+        self._schema = sql.Identifier(schema)
+        self._claim_fn = table("claim")
+
+    def grant_join(self, role: str) -> tuple[sql.Composed, ...]:
+        """What :meth:`PostgresStore.grant_join` grants ``role``, and no more."""
+        who = sql.Identifier(role)
+        return (
+            sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(self._schema, who),
+            sql.SQL(
+                "GRANT EXECUTE ON FUNCTION {}(bytea, uuid, uuid, text, text, text) TO {}"
+            ).format(self._claim_fn, who),
+        )
+
     def insert_entries(self, count: int) -> sql.Composed:
         """One INSERT of ``count`` entries, in chain order. Composed once per size."""
         statement = self._insert_entries.get(count)
@@ -906,4 +1110,76 @@ def _install_statements(schema: str) -> tuple[sql.Composed, ...]:
             "ALTER TABLE {} ENABLE ALWAYS TRIGGER extend_chain, "
             "ENABLE ALWAYS TRIGGER append_only, ENABLE ALWAYS TRIGGER append_only_truncate"
         ).format(entries),
+        *_join_statements(schema),
+    )
+
+
+def _join_statements(schema: str) -> tuple[sql.Composed, ...]:
+    """What lets a caller's transaction owe the ledger, and nothing more.
+
+    That transaction runs as the caller's role, and so does everything else
+    in it (an agent's statements, for an escrow), so the role gets no
+    privilege on the ledger's tables at all: only ``EXECUTE`` on ``claim``, a
+    ``SECURITY DEFINER`` function that records one settlement claim. It admits
+    it only with ``sha256(key || the transaction's own id)``. The key is
+    readable by the ledger's owner and governors, never by the caller's role,
+    so nothing but a governor can compute a token, and a token is good for one
+    transaction.
+
+    ``claim`` reads nothing of the chain: only the key, written at install.
+    So a caller whose ``REPEATABLE READ`` snapshot is older than the ledger
+    records its claim all the same, whatever other governors committed
+    since. A hold is claimed at most once (``hold_id`` is unique).
+    """
+
+    def table(name: str) -> sql.Identifier:
+        return sql.Identifier(schema, name)
+
+    key, claims, fn = table("join_key"), table("claims"), table("claim")
+    return (
+        sql.SQL(
+            "CREATE TABLE {} (singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), "
+            "k bytea NOT NULL CHECK (length(k) >= 32))"
+        ).format(key),
+        sql.SQL(
+            """
+            CREATE TABLE {} (
+                seq        bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
+                claim_id   uuid PRIMARY KEY,
+                hold_id    uuid UNIQUE,
+                scope_id   text NOT NULL,
+                amount     text NOT NULL,
+                memo       text NOT NULL,
+                claimed_by xid8 NOT NULL DEFAULT pg_current_xact_id(),
+                claimed_at timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        ).format(claims),
+        sql.SQL(
+            """
+            CREATE FUNCTION {fn}(
+                p_token bytea, p_claim uuid, p_hold uuid, p_scope text, p_amount text,
+                p_memo text
+            ) RETURNS void LANGUAGE plpgsql SECURITY DEFINER
+            SET search_path = pg_catalog, pg_temp AS $agentgov$
+            DECLARE
+                expected bytea;
+            BEGIN
+                SELECT sha256(j.k || convert_to(pg_current_xact_id()::text, 'UTF8'))
+                  INTO expected FROM {key} AS j;
+                IF expected IS NULL OR p_token IS DISTINCT FROM expected THEN
+                    RAISE EXCEPTION 'agentgov: no governor of this ledger joined this transaction'
+                        USING ERRCODE = 'insufficient_privilege';
+                END IF;
+                INSERT INTO {claims} (claim_id, hold_id, scope_id, amount, memo)
+                VALUES (p_claim, p_hold, p_scope, p_amount, p_memo);
+            END
+            $agentgov$
+            """
+        ).format(fn=fn, key=key, claims=claims),
+        # Functions are EXECUTE-able by PUBLIC unless revoked; this one is
+        # granted only to the roles grant_join() names.
+        sql.SQL(
+            "REVOKE ALL ON FUNCTION {}(bytea, uuid, uuid, text, text, text) FROM PUBLIC"
+        ).format(fn),
     )

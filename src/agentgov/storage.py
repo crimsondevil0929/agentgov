@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from agentgov.core import (
     Authorization,
@@ -59,6 +59,7 @@ from agentgov.core import (
     Direction,
     EntryType,
     LedgerEntry,
+    SettlementClaim,
     WriteBatch,
     _iso,
     _parse_iso,
@@ -71,6 +72,7 @@ from agentgov.exceptions import (
 )
 
 __all__ = [
+    "JoinableStore",
     "PersistedAuthorization",
     "PersistedNode",
     "PersistenceStore",
@@ -279,6 +281,30 @@ class SharedStore(PersistenceStore, Protocol):
         A governor whose view has the same length and head is current and need
         not read anything else: the head hash commits to every entry before it.
         """
+        ...
+
+
+@runtime_checkable
+class JoinableStore(SharedStore, Protocol):
+    """A :class:`SharedStore` that can also take part in a transaction the
+    caller owns, on the caller's connection: it holds the writer lock there,
+    and records settlement claims there, so a claim commits or rolls back
+    with the caller's own writes. The chain itself is never written in the
+    caller's transaction. See :meth:`agentgov.core.BudgetManager.joined`.
+    """
+
+    def join(self, connection: Any) -> AbstractContextManager[WriterSession]:
+        """Take the writer lock inside ``connection``'s open transaction, and
+        send the block's claims there. Never commits or rolls back: that
+        transaction is the caller's."""
+        ...
+
+    def claim(self, claim: SettlementClaim) -> None:
+        """Record ``claim`` in the joined transaction."""
+        ...
+
+    def pending_claims(self) -> tuple[SettlementClaim, ...]:
+        """Every committed claim not yet booked into the chain, oldest first."""
         ...
 
 
@@ -651,6 +677,11 @@ class SqliteStore:
         """Durably apply one unit of work in a single transaction."""
         if not batch:
             return
+        if batch.redeemed:
+            raise StorageError(
+                "a SQLite ledger holds no settlement claims; claims live in a ledger shared "
+                "through PostgreSQL"
+            )
 
         def work(conn: sqlite3.Connection) -> None:
             if batch.entries:

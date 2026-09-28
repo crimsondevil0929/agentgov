@@ -797,6 +797,31 @@ install, restart, tamper evidence, least privilege, and every failure above.
 [`tests/test_fleet_concurrency.py`](tests/test_fleet_concurrency.py) races 64 workers
 across 8 governors, and 8 separate processes, against one envelope.
 
+**Settling with someone else's commit.** When the ledger shares a database with what an
+agent changes, a governor can make what the change owes the ledger commit exactly when the
+change does. It places a hold first, joins the transaction that makes the change, records
+a settlement claim there, and books the claim into the chain after the commit. This is how
+Interlock settles a plan's cost with the plan's effects:
+
+<!-- readme-test: skip reason="needs a live PostgreSQL server" -->
+```python
+gov.store.grant_join("app_writer")  # once, as the ledger's owner
+hold = gov.authorize("orchestrator", money("0.02"))  # before the caller's transaction
+# ... app_writer opens a transaction on conn and makes its own writes, then:
+with gov.joined(conn) as txn:  # the writer lock is taken inside conn's transaction
+    claim = txn.claim("orchestrator", money("0.013"), memo="order 42", hold=hold)
+    conn.execute("COMMIT")  # the claim commits with the caller's writes, or not at all
+gov.redeem(claim)  # the hold's release and the spend, booked into the chain
+```
+
+The claim reads nothing of the chain, so a `REPEATABLE READ` transaction whose snapshot is
+older than other governors' commits claims all the same: however busy the ledger, nothing
+conflicts. A claim left pending by a process that died is booked by any governor's
+`redeem()`. The joined role gets no privilege on the ledger's tables; its one function
+admits a claim only with a token derived from a secret the role cannot read and from that
+transaction's own id, so nothing else running in the transaction can claim anything.
+See [`tests/test_postgres_joined.py`](tests/test_postgres_joined.py).
+
 ## Core primitives
 
 - **Authorize → Hold → Settle.** `BudgetManager.authorize()` places an encumbering hold
