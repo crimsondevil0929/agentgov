@@ -31,8 +31,10 @@ from pathlib import Path
 from typing import Any
 
 from agentgov.receipts import (
+    ActionBinding,
     ActionReceipt,
     Anchors,
+    Attestation,
     Authority,
     Capability,
     ChainAnchor,
@@ -42,6 +44,9 @@ from agentgov.receipts import (
     Cost,
     Coverage,
     Decision,
+    DeliveredRequest,
+    Delivery,
+    DeliveryReceipt,
     Ed25519Signer,
     Effect,
     FileWitness,
@@ -63,6 +68,7 @@ from agentgov.receipts.merkle import leaf_hash
 from agentgov.receipts.schema import Signature
 
 LOG_ID = "arc1-vectors"
+DELIVERY_LOG_ID = "arc1-vectors-delivery"
 WITNESS_ID = "arc1-vectors-witness"
 _NAMESPACE = uuid.UUID("5f3c9b1e-0a4d-4e6b-9c2f-7d1e8a0b3c4d")
 _BASE = datetime(2026, 9, 25, 14, 0, 0, tzinfo=UTC)
@@ -102,6 +108,7 @@ format is specified in [`docs/RECEIPTS.md`](../../docs/RECEIPTS.md).
   Size 5 was never shown to it.
 - `valid/`: bundles and row disclosures that verify.
 - `invalid/`: each one broken in exactly one way.
+- `delivery/`: ARC1 v1.1 delivery receipts, in a log of their own (below).
 - `manifest.json`: every command-line case, and the exit code it must produce.
 
 ## The receipts
@@ -121,6 +128,25 @@ capability for one tenant:
 6. `halted-scope`: admitted by every check, and refused because the scope was
    halted.
 
+## Delivery receipts (ARC1 v1.1)
+
+`delivery/` is a second log, `arc1-vectors-delivery`, of two leaves:
+
+0. `refund-call`: an action receipt. The support agent refunds an order, and
+   the plan commits, beside its rows, a request to a payment API: the row of
+   `interlock.outbox` it commits names the message, the sink, the operation
+   and the payload's hash. `valid/refund-call.rows.json` discloses that row,
+   and `payload.json` is the payload itself.
+1. `refund-delivered`: the delivery receipt. The relay sent the request, the
+   payment API answered 200, and the relay signed what it saw with its own key
+   (`keys/relay.pub`). The log signed the receipt that carries the
+   attestation, bound to leaf 0 by its leaf hash.
+
+`delivery/invalid/` breaks it one way each: an attestation by a key that
+claims the relay's id, a payload hash the relay never attested, a binding to
+another receipt, a status edited after signing, and a delivery placed before
+the action it follows from.
+
 ## Running the cases
 
 From this directory:
@@ -133,8 +159,8 @@ $ agentgov verify-receipt valid/committed-refund.bundle.json --pubkey keys/issue
 
 Each case in `manifest.json` gives the arguments, as paths relative to this
 directory, and the exit code: 0 pass, 3 malformed, 4 receipt signature, 5 log
-inclusion, 6 witness, 8 rows. A conforming verifier produces the same code
-for every case.
+inclusion, 6 witness, 8 rows, 9 relay attestation, 10 action binding. A
+conforming verifier produces the same code for every case.
 """
 
 
@@ -849,7 +875,145 @@ def generate(out: Path) -> None:
     unknown["receipt"]["effect"]["confidence"] = "high"
     _write_json(invalid / "unknown-field.bundle.json", unknown)
 
+    _delivery_vectors(out / "delivery", issuer, witness_key, attacker)
     _write_json(out / "manifest.json", _manifest())
+
+
+_REFUND_PAYLOAD = {"amount": 48000, "payment_intent": "pi_3Pq1VectorCharge"}
+
+
+def _delivery_vectors(
+    out: Path, issuer: Ed25519Signer, witness_key: Ed25519Signer, attacker: Ed25519Signer
+) -> None:
+    """ARC1 v1.1: an action receipt that committed a request, and the
+    delivery receipt the relay's answer became."""
+    relay = Ed25519Signer(seed("relay"))
+    keys = out / "keys"
+    keys.mkdir(parents=True)
+    (keys / "relay.pub").write_text(relay.public_key().spec() + "\n")
+    (keys / "relay.seed").write_text(seed("relay").hex() + "\n")
+    _write_json(out / "payload.json", _REFUND_PAYLOAD)
+
+    payload_hash = hashlib.sha256(canonical_bytes(_REFUND_PAYLOAD)).hexdigest()
+    message_id = _uuid("message:refund-call")
+    outbox_row = {
+        "message_id": message_id,
+        "effect_id": "pay_refund",
+        "sink": "payments",
+        "operation": "refunds.create",
+        "payload_hash": payload_hash,
+        "idempotency_key": _digest("outbound:refund-call:pay_refund"),
+    }
+    rows = [
+        *_refund_rows(),
+        RowChange.from_values("interlock.outbox", message_id, before=None, after=outbox_row),
+    ]
+    commitment = commit_rows(rows, secret=seed("row-secret:refund-call"))
+    draft = _receipt(
+        "refund-call",
+        60,
+        commitment,
+        scope="support-agent",
+        tenants=("acme",),
+        admitted=True,
+        status=OutcomeStatus.COMMITTED,
+        cost="0.00349500",
+        calls=1,
+        stated_rows=4,
+        escrow_seq=81,
+    )
+    request = DeliveredRequest(
+        message_id=message_id,
+        effect_id="pay_refund",
+        sink="payments",
+        operation="refunds.create",
+        payload_hash=payload_hash,
+        idempotency_key=outbox_row["idempotency_key"],
+    )
+    delivery = Delivery(
+        attempt=1,
+        status_code=200,
+        response_digest=_digest("payments: refund re_3Pq1VectorRefund created"),
+        remote_ref="re_3Pq1VectorRefund",
+        delivered_at=_BASE + timedelta(minutes=70, microseconds=123456),
+        log_seq=2,
+        log_hash=_digest("delivery-log:refund-call:row 2"),
+    )
+    attested = Attestation(request=request, outcome=delivery.outcome()).sign(relay)
+    assert attested.signature is not None
+
+    with tempfile.TemporaryDirectory() as scratch:
+        work = Path(scratch)
+        witness = FileWitness(
+            work / "cosignatures.jsonl",
+            witness_key,
+            witness_id=WITNESS_ID,
+            logs={DELIVERY_LOG_ID: issuer.public_key()},
+            clock=_Clock(_BASE + timedelta(hours=2), timedelta(minutes=5)),
+        )
+        log = ReceiptLog(
+            DELIVERY_LOG_ID,
+            issuer,
+            path=work / "receipts.jsonl",
+            witnesses=[witness],
+            policy=CheckpointPolicy(every_receipts=10**6, every_seconds=10**9),
+            clock=_Clock(_BASE + timedelta(minutes=119), timedelta(minutes=1)),
+        )
+        action = log.issue(draft)
+        delivered = log.issue(
+            DeliveryReceipt(
+                receipt_id=_uuid("receipt:refund-delivered"),
+                issued_at=_BASE + timedelta(minutes=71),
+                issuer="interlock/0.4.0 support-eu-1",
+                action=ActionBinding.of(action),
+                request=request,
+                delivery=delivery,
+                attestation=attested.signature,
+            )
+        )
+        checkpoint = log.publish()
+        action_bundle = log.bundle(0, checkpoint)
+        delivery_bundle = log.bundle(1, checkpoint)
+        log.close()
+        (out / "log").mkdir()
+        shutil.copy(work / "receipts.jsonl", out / "log" / "receipts.jsonl")
+        shutil.copy(work / "receipts.jsonl.checkpoints", out / "log" / "receipts.jsonl.checkpoints")
+        (out / "witness").mkdir()
+        shutil.copy(work / "cosignatures.jsonl", out / "witness" / "cosignatures.jsonl")
+
+    valid = out / "valid"
+    _write_json(valid / "refund-call.bundle.json", action_bundle.to_json())
+    _write_json(valid / "refund-delivered.bundle.json", delivery_bundle.to_json())
+    _write_json(
+        valid / "refund-call.rows.json",
+        commitment.disclose([len(rows) - 1], receipt_id=action.receipt_id).to_json(),
+    )
+
+    invalid = out / "invalid"
+    unsigned = replace(delivered, signature=None)
+    forged = Attestation(request=request, outcome=delivery.outcome()).sign(attacker)
+    assert forged.signature is not None
+    claimed = Signature(forged.signature.alg, relay.key_id, forged.signature.value)
+    _write_json(
+        invalid / "attestation-forged.receipt.json",
+        replace(unsigned, attestation=claimed).sign(issuer).to_json(),
+    )
+    swapped = replace(request, payload_hash=_digest("a payload the relay never sent"))
+    _write_json(
+        invalid / "payload-swapped.receipt.json",
+        replace(unsigned, request=swapped).sign(issuer).to_json(),
+    )
+    elsewhere = replace(delivered.action, leaf_hash=_digest("another receipt's leaf"))
+    _write_json(
+        invalid / "wrong-action.receipt.json",
+        replace(unsigned, action=elsewhere).sign(issuer).to_json(),
+    )
+    edited = delivery_bundle.to_json()
+    edited["receipt"]["delivery"]["status_code"] = 500
+    _write_json(invalid / "status-modified.bundle.json", edited)
+    early = delivery_bundle.to_json()
+    early["receipt"]["anchors"]["log"]["leaf_index"] = 0
+    _write_json(invalid / "delivered-before-action.bundle.json", early)
 
 
 def _manifest() -> dict[str, Any]:
@@ -862,13 +1026,27 @@ def _manifest() -> dict[str, Any]:
         "keys/witness.pub",
     ]
 
+    delivery_witnessed = [
+        *issuer,
+        "--witness",
+        "delivery/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+    ]
+    bound = [
+        "--relay-key",
+        "delivery/keys/relay.pub",
+        "--action",
+        "delivery/valid/refund-call.bundle.json",
+    ]
+
     def case(name: str, exit_code: int, args: list[str], what: str) -> dict[str, Any]:
         return {"name": name, "exit": exit_code, "args": args, "description": what}
 
     return {
         "description": "Run `agentgov verify-receipt` with 'args' (paths relative to this "
         "directory) and expect 'exit'. 0 pass, 3 malformed, 4 receipt signature, 5 log "
-        "inclusion, 6 witness, 8 rows.",
+        "inclusion, 6 witness, 8 rows, 9 relay attestation, 10 action binding.",
         "cases": [
             case(
                 "committed-refund",
@@ -1015,6 +1193,64 @@ def _manifest() -> dict[str, Any]:
                 3,
                 ["invalid/unknown-field.bundle.json", *issuer],
                 "a field the schema does not define",
+            ),
+            case(
+                "refund-call",
+                0,
+                [
+                    "delivery/valid/refund-call.bundle.json",
+                    *delivery_witnessed,
+                    "--rows",
+                    "delivery/valid/refund-call.rows.json",
+                ],
+                "the action receipt, with the outbox row of the request it committed disclosed",
+            ),
+            case(
+                "refund-delivered",
+                0,
+                ["delivery/valid/refund-delivered.bundle.json", *delivery_witnessed, *bound],
+                "the delivery receipt: witnessed, attested by the relay, bound to the action",
+            ),
+            case(
+                "attestation-forged",
+                9,
+                ["delivery/invalid/attestation-forged.receipt.json", *issuer, *bound],
+                "an attestation signed by another key that claims the relay's key id",
+            ),
+            case(
+                "payload-swapped",
+                9,
+                ["delivery/invalid/payload-swapped.receipt.json", *issuer, *bound],
+                "a payload hash the relay never attested, re-signed by the log",
+            ),
+            case(
+                "unknown-relay",
+                9,
+                [
+                    "delivery/valid/refund-delivered.bundle.json",
+                    *issuer,
+                    "--relay-key",
+                    "keys/witness.pub",
+                ],
+                "a real delivery, checked against a key that is not its relay's",
+            ),
+            case(
+                "wrong-action",
+                10,
+                ["delivery/invalid/wrong-action.receipt.json", *issuer, *bound],
+                "a delivery re-bound to another receipt's leaf hash, re-signed by the log",
+            ),
+            case(
+                "status-modified",
+                4,
+                ["delivery/invalid/status-modified.bundle.json", *issuer, *bound],
+                "the sink's answer edited after signing",
+            ),
+            case(
+                "delivered-before-action",
+                3,
+                ["delivery/invalid/delivered-before-action.bundle.json", *issuer],
+                "a delivery that claims a place before the action it follows from",
             ),
         ],
     }

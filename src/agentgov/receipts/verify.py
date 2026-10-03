@@ -16,7 +16,13 @@ code   failure     meaning
 6      WITNESS     the checkpoint is not witnessed, or was forked
 7      LEDGER      the receipt disagrees with the AgentGov ledger
 8      ROWS        a disclosed row is not one the receipt committed to
+9      ATTESTED    a delivery's relay attestation does not verify
+10     BINDING     a delivery does not follow from the action receipt given
 =====  ==========  =====================================================
+
+A delivery receipt (ARC1 v1.1) is checked for its schema, the log's
+signature, its relay's attestation, inclusion and witness, and, given the
+action receipt's bundle, the binding between the two.
 
 (``2`` is reserved for usage errors, as with every ``argparse`` program.)
 """
@@ -24,7 +30,7 @@ code   failure     meaning
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import IntEnum
@@ -42,8 +48,11 @@ from agentgov.receipts.rows import verify_disclosure
 from agentgov.receipts.schema import (
     ActionReceipt,
     Cosignature,
+    DeliveryReceipt,
+    LogDocument,
     ReceiptBundle,
     RowDisclosure,
+    instant,
     money_text,
 )
 from agentgov.receipts.signing import Verifier
@@ -64,6 +73,8 @@ class Failure(IntEnum):
     WITNESS = 6
     LEDGER = 7
     ROWS = 8
+    ATTESTED = 9
+    BINDING = 10
 
 
 Status = Literal["pass", "fail", "skip"]
@@ -92,7 +103,7 @@ class VerificationReport:
     """Every check that ran, and the receipt they ran on (if it decoded)."""
 
     checks: tuple[Check, ...]
-    receipt: ActionReceipt | None
+    receipt: LogDocument | None
 
     @property
     def passed(self) -> bool:
@@ -125,6 +136,8 @@ def verify_bundle(
     witness_key: Verifier | None = None,
     ledger: BudgetManager | None = None,
     rows: RowDisclosure | None = None,
+    relay_keys: Iterable[Verifier] | None = None,
+    action: ReceiptBundle | str | bytes | None = None,
 ) -> VerificationReport:
     """Verify a receipt bundle against the keys and records the caller trusts.
 
@@ -138,6 +151,10 @@ def verify_bundle(
     :param ledger: An AgentGov ledger the receipt's agentgov anchor and cost
         must agree with.
     :param rows: Disclosed rows that must be in the receipt's row commitment.
+    :param relay_keys: For a delivery receipt: the relays' keys, one of which
+        must have signed its attestation.
+    :param action: For a delivery receipt: the bundle of the action receipt it
+        follows from, which it must bind.
     """
     checks: list[Check] = []
     if isinstance(bundle, (str, bytes)):
@@ -148,6 +165,10 @@ def verify_bundle(
                 (Check("ARC1 schema", "fail", str(exc), Failure.MALFORMED),), None
             )
     receipt = bundle.receipt
+    if isinstance(receipt, DeliveryReceipt):
+        return _verify_delivery(
+            bundle, receipt, issuer_key, log_key, cosignatures, witness_key, relay_keys, action
+        )
     checks.append(
         Check(
             "ARC1 schema",
@@ -164,7 +185,112 @@ def verify_bundle(
     return VerificationReport(tuple(checks), receipt)
 
 
-def _check_signature(receipt: ActionReceipt, key: Verifier) -> Check:
+def _verify_delivery(
+    bundle: ReceiptBundle,
+    receipt: DeliveryReceipt,
+    issuer_key: Verifier,
+    log_key: Verifier | None,
+    cosignatures: Sequence[Cosignature] | None,
+    witness_key: Verifier | None,
+    relay_keys: Iterable[Verifier] | None,
+    action: ReceiptBundle | str | bytes | None,
+) -> VerificationReport:
+    delivery = receipt.delivery
+    status = "no status" if delivery.status_code is None else f"HTTP {delivery.status_code}"
+    checks = [
+        Check(
+            "ARC1 schema",
+            "pass",
+            f"delivery {receipt.receipt_id} of message {receipt.request.message_id} "
+            f"(attempt {delivery.attempt}, {status}, delivered "
+            f"{instant(delivery.delivered_at)}; issued by {receipt.issuer})",
+        ),
+        _check_signature(receipt, issuer_key),
+        _check_attestation(receipt, relay_keys),
+        _check_inclusion(bundle, log_key or issuer_key),
+        _check_witness(bundle, cosignatures, witness_key),
+        _check_binding(bundle, receipt, action, issuer_key, log_key),
+    ]
+    return VerificationReport(tuple(checks), receipt)
+
+
+def _check_attestation(receipt: DeliveryReceipt, keys: Iterable[Verifier] | None) -> Check:
+    name = "relay attestation"
+    if keys is None:
+        return Check(name, "skip", "no relay key given")
+    claimed = receipt.attestation.key_id
+    key = next((k for k in keys if k.key_id == claimed), None)
+    if key is None:
+        return Check(
+            name,
+            "fail",
+            f"the attestation is signed by key {claimed}, which is none of the relay keys given",
+            Failure.ATTESTED,
+        )
+    try:
+        receipt.attested().verify(key)
+    except ReceiptSignatureError as exc:
+        return Check(name, "fail", str(exc), Failure.ATTESTED)
+    return Check(
+        name,
+        "pass",
+        f"the relay's {key.alg} key {key.key_id} attests {receipt.request.sink}."
+        f"{receipt.request.operation} answered "
+        + ("" if receipt.delivery.status_code is None else f"{receipt.delivery.status_code}"),
+    )
+
+
+def _check_binding(
+    bundle: ReceiptBundle,
+    receipt: DeliveryReceipt,
+    action: ReceiptBundle | str | bytes | None,
+    issuer_key: Verifier,
+    log_key: Verifier | None,
+) -> Check:
+    name = "action binding"
+    if action is None:
+        return Check(name, "skip", "no action receipt given")
+    if isinstance(action, (str, bytes)):
+        try:
+            action = ReceiptBundle.loads(action)
+        except MalformedReceiptError as exc:
+            return Check(name, "fail", f"the action bundle: {exc}", Failure.MALFORMED)
+    committed = action.receipt
+    if not isinstance(committed, ActionReceipt):
+        return Check(name, "fail", "the action bundle holds no action receipt", Failure.BINDING)
+    problem = receipt.action.problem(committed)
+    if problem is not None:
+        return Check(name, "fail", f"the delivery does not bind: {problem}", Failure.BINDING)
+    signed = _check_signature(committed, issuer_key)
+    if signed.status == "fail":
+        return Check(name, "fail", f"the action receipt: {signed.detail}", Failure.BINDING)
+    if action.checkpoint is not None:
+        included = _check_inclusion(action, log_key or issuer_key)
+        if included.status == "fail":
+            return Check(name, "fail", f"the action receipt: {included.detail}", Failure.BINDING)
+    if (
+        bundle.checkpoint is not None
+        and action.checkpoint is not None
+        and bundle.checkpoint.log_id == action.checkpoint.log_id
+        and bundle.checkpoint.tree_size == action.checkpoint.tree_size
+        and bundle.checkpoint.root_hash != action.checkpoint.root_hash
+    ):
+        return Check(
+            name,
+            "fail",
+            "the two receipts are proven against different roots of one log at one size: "
+            "the log was forked",
+            Failure.BINDING,
+        )
+    return Check(
+        name,
+        "pass",
+        f"follows action receipt {committed.receipt_id} at leaf {receipt.action.leaf_index} "
+        f"of log {receipt.action.log_id!r} (leaf hash {receipt.action.leaf_hash[:16]})",
+    )
+
+
+def _check_signature(receipt: LogDocument, key: Verifier) -> Check:
     try:
         receipt.verify(key)
     except ReceiptSignatureError as exc:

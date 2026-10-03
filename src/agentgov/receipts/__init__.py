@@ -4,6 +4,10 @@ Every agent action that reaches a system of record can leave an
 :class:`ActionReceipt` that an outsider can verify offline: who authorized
 it, what the agent said it would do, what it measurably did (and what the
 measurement could not see), what was decided, what it cost, and how it ended.
+From ARC1 v1.1, a request the action committed for an external system can
+leave a :class:`DeliveryReceipt` too: what was sent, what the system
+answered, attested by the relay that made the call, and bound to the action
+receipt it follows from.
 
 The pieces, each in its own module:
 
@@ -31,8 +35,11 @@ from agentgov.receipts.log import CheckpointPolicy, ReceiptLog
 from agentgov.receipts.merkle import MerkleTree, verify_consistency, verify_inclusion
 from agentgov.receipts.rows import RowCommitment, commit_rows, verify_disclosure
 from agentgov.receipts.schema import (
+    ActionBinding,
     ActionReceipt,
     Anchors,
+    Attestation,
+    AttestedOutcome,
     Authority,
     Capability,
     ChainAnchor,
@@ -42,6 +49,9 @@ from agentgov.receipts.schema import (
     Cost,
     Coverage,
     Decision,
+    DeliveredRequest,
+    Delivery,
+    DeliveryReceipt,
     Effect,
     EffectSummary,
     InclusionProof,
@@ -53,6 +63,7 @@ from agentgov.receipts.schema import (
     RowChange,
     RowDisclosure,
     StatedFootprint,
+    document_from_json,
 )
 from agentgov.receipts.signing import (
     Ed25519PublicKey,
@@ -66,8 +77,11 @@ from agentgov.receipts.verify import Check, Failure, VerificationReport, verify_
 from agentgov.receipts.witness import FileWitness, Witness, find_cosignature, load_cosignatures
 
 __all__ = [
+    "ActionBinding",
     "ActionReceipt",
     "Anchors",
+    "Attestation",
+    "AttestedOutcome",
     "Authority",
     "Capability",
     "ChainAnchor",
@@ -79,6 +93,9 @@ __all__ = [
     "Cost",
     "Coverage",
     "Decision",
+    "DeliveredRequest",
+    "Delivery",
+    "DeliveryReceipt",
     "Ed25519PublicKey",
     "Ed25519Signer",
     "Effect",
@@ -104,6 +121,7 @@ __all__ = [
     "Witness",
     "canonical_bytes",
     "commit_rows",
+    "document_from_json",
     "find_cosignature",
     "load_cosignatures",
     "loads_strict",

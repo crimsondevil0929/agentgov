@@ -1,0 +1,31 @@
+{
+  "v": "ARC1-rows",
+  "receipt_id": "b52049dd-c336-5a9b-8238-58ebee9f4052",
+  "row_root": "c1101d62a62ec9e13722d71525fcd678471ef8d2597d9506690579f730b59832",
+  "row_count": 4,
+  "rows": [
+    {
+      "index": 3,
+      "salt": "a93aed5d33a82bfc4c279725b1beedc064495e17dcc6333331a1a66f20c85396",
+      "row": {
+        "table": "interlock.outbox",
+        "pk": "fe9966c0-5971-5359-9578-b2e9f544304a",
+        "op": "insert",
+        "tenant": null,
+        "before": null,
+        "after": {
+          "message_id": "fe9966c0-5971-5359-9578-b2e9f544304a",
+          "effect_id": "pay_refund",
+          "sink": "payments",
+          "operation": "refunds.create",
+          "payload_hash": "e8d3a00e7ae1765d466dd4af35a29a3cdbee10970f92525c747c735a588ebf87",
+          "idempotency_key": "302ca4b9795625117df88e8aac4536e7074dcff758836fc39d48ace44e03ac0e"
+        }
+      },
+      "audit_path": [
+        "f4b6df343b02e8fae3cf900458a453904c53407bbe07da62b46f24883225468e",
+        "0f2e692fa86c75b3965024839644c10c8e44e4a530ab7a57855906b58a4a9436"
+      ]
+    }
+  ]
+}

@@ -6,7 +6,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
-## [Unreleased]
+## [Unreleased] (0.4.0)
+
+### Added
+
+- **ARC1 1.1: delivery receipts and relay attestations** (`docs/RECEIPTS.md`
+  section 13). `Attestation` (`ARC1-attestation`): a relay's Ed25519 statement of
+  a call's outcome, made when the answer arrived. `DeliveryReceipt`
+  (`ARC1-delivery`): the log's signed record that a committed request was
+  delivered, carrying the relay's attestation and bound to the action receipt
+  it follows from by that receipt's leaf hash (`ActionBinding`). A
+  `ReceiptLog` holds both kinds, and accepts a delivery that names one of its
+  own action receipts only bound to it, after it. Every 1.0 document,
+  signature, leaf and root is unchanged.
+- **`verify_bundle(relay_keys=..., action=...)`** verifies a delivery bundle:
+  schema, the log's signature, the relay's attestation, inclusion, witness, and
+  the binding to the action receipt's bundle. Two new failure classes, 9
+  `ATTESTED` and 10 `BINDING`. `agentgov verify-receipt` takes `--relay-key`
+  and `--action`.
+- **`vectors/arc1/delivery/`:** a second log with an action receipt and its
+  delivery, and a case for each failure. Every existing vector is unchanged.
+- `ReceiptBundle.action_receipt` and `.delivery_receipt`: the receipt, narrowed
+  to the kind expected.
+
+### Changed
+
+- **Typing:** `ReceiptLog.receipt()`, `.receipts()`, `.issue()` and
+  `ReceiptBundle.receipt` are `ActionReceipt | DeliveryReceipt`
+  (`LogDocument`). A log of action receipts behaves exactly as before; typed
+  code narrows with `isinstance`, or `bundle.action_receipt`.
+
+## [0.3.0] - 2026-09-27
 
 ### Added
 

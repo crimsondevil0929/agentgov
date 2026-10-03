@@ -1,6 +1,8 @@
 # ARC1: verifiable action receipts
 
-**Status:** draft 1, shipping unreleased on the v0.2 line (`agentgov.receipts`).
+**Status:** draft 1.1 (`agentgov.receipts`, from agentgov 0.4.0). Version 1.1
+adds delivery receipts and relay attestations (section 13); every version 1.0
+document, signature, leaf and root is unchanged, and means what it meant.
 Every ARC1 document names its version in its `v` field, and every signature
 names its document type in a domain string. A breaking change will get a new
 version. ARC1 documents will never be reinterpreted.
@@ -38,6 +40,7 @@ against them.
 - [10. Verification](#10-verification)
 - [11. Test vectors](#11-test-vectors)
 - [12. Security considerations](#12-security-considerations)
+- [13. Delivery receipts (1.1)](#13-delivery-receipts-11)
 
 ## 1. What a receipt proves
 
@@ -483,12 +486,15 @@ $ agentgov verify-receipt BUNDLE --pubkey KEY
       [--witness FILE --witness-pubkey KEY]  # the witness's cosignatures, and its key
       [--ledger DB]                          # an AgentGov SQLite ledger, opened read-only
       [--rows FILE]                          # an ARC1-rows disclosure
+      [--relay-key KEY ...]                  # a delivery receipt's relays (section 13)
+      [--action BUNDLE]                      # the action a delivery follows from
       [--json]                               # the report as JSON
 ```
 
 A `KEY` is a key spec (section 4.3) or a file holding one. The exit code is 0
 when every requested check passes. Otherwise it is the first failure's code
-(3 to 8), or 2 for a usage error or a file that cannot be read.
+(3 to 10), or 2 for a usage error or a file that cannot be read. A delivery
+receipt is verified as section 13.5 describes.
 
 ## 11. Test vectors
 
@@ -530,3 +536,130 @@ conformance suite for any other verifier.
   record of what happened, such as the AgentGov ledger's transactions or the
   escrow chain. Refusals are logged exactly like commits, so the log also
   records what was *not* allowed.
+
+## 13. Delivery receipts (1.1)
+
+An action receipt proves what was authorized and committed. Some actions
+commit a *request* to an external system, a payment API or a mail service,
+sent after the commit by a relay that holds the credentials. A delivery
+receipt proves what was sent, and what the system answered.
+
+Two parties see those two things, so a delivery receipt carries two
+signatures: the relay's attestation of the answer, made when the answer
+arrived, with the relay's own key; and the log's signature of the receipt that
+carries it.
+
+### 13.1 The attestation
+
+An attestation (`v: "ARC1-attestation"`) is signed under the domain
+`ARC1/attestation/v1\n`, as section 4.1 describes:
+
+| Field | Type |
+|---|---|
+| `v` | `"ARC1-attestation"` |
+| `request` | object, below |
+| `outcome` | object, below |
+| `sig` | object (4.1) |
+
+`request`:
+
+| Field | Type |
+|---|---|
+| `message_id` | *uuid*: the request's identifier |
+| `effect_id` | *text*: the effect of the plan that committed it |
+| `sink`, `operation` | *text*: where it was sent, and what was asked |
+| `payload_hash` | *hash*: SHA-256 of the exact bytes sent |
+| `idempotency_key` | *text* |
+
+`outcome`:
+
+| Field | Type |
+|---|---|
+| `attempt` | *int*, from 1: which call this was |
+| `result` | `"delivered"`, `"retryable"`, `"permanent"` or `"unknown"` |
+| `status_code` | *int* 100 to 599, or `null` (no answer) |
+| `response_digest` | *hash* of the answer's body, or `null` |
+| `remote_ref` | *text* or `null`: what the system said it created |
+
+A relay may attest every outcome it records. A delivery receipt carries only
+the attestation of a `delivered` one, and only its `sig`: the attested
+document is rebuilt from the receipt (13.2).
+
+### 13.2 The delivery receipt
+
+A delivery receipt (`v: "ARC1-delivery"`) is signed by the log, under the
+domain `ARC1/delivery/v1\n`:
+
+| Field | Type |
+|---|---|
+| `v` | `"ARC1-delivery"` |
+| `receipt_id` | *uuid* |
+| `issued_at` | *instant* |
+| `issuer` | *text* |
+| `action` | `{receipt_id, log_id, leaf_index, leaf_hash}`: the action receipt it follows from |
+| `request` | as 13.1 |
+| `delivery` | `{attempt, status_code, response_digest, remote_ref, delivered_at, log_seq, log_hash}` |
+| `attestation` | `{alg, key_id, signature}`: the relay's |
+| `anchors` | as 5.9 |
+| `sig` | object (4.1) or `null` |
+
+`delivery.log_seq` and `log_hash` name the record of the delivery in the
+issuer's own delivery log (for Interlock, the message's hash-linked
+`outbox_attempts` row). The attestation it carries is the signature of
+
+```
+{"v": "ARC1-attestation", "request": <request>,
+ "outcome": {"attempt": <delivery.attempt>, "result": "delivered",
+             "status_code": <delivery.status_code>,
+             "response_digest": <delivery.response_digest>,
+             "remote_ref": <delivery.remote_ref>}}
+```
+
+### 13.3 The binding
+
+`action.leaf_hash` is `SHA-256(0x00 || canonical(receipt))` of the action
+receipt it follows from: its leaf hash (7.1), which binds its exact signed
+bytes. `action.log_id` and `leaf_index` are that receipt's `anchors.log`.
+
+- A delivery receipt whose `anchors.log` names the same log as `action`
+  claims a later `leaf_index`. One that does not is malformed: nothing is
+  delivered before it is committed.
+- A log accepts a delivery receipt that names one of its own action receipts
+  only if the leaf at `action.leaf_index` is an action receipt with that
+  `receipt_id` and that leaf hash.
+- `request.effect_id` and `payload_hash` are those of the request the action
+  receipt's row commitment covers: disclosing that row (section 6) proves the
+  payload delivered is the payload adjudicated.
+
+### 13.4 In the log
+
+A receipt log's leaves are action receipts and delivery receipts, each its own
+canonical bytes (7.1); the two are told apart by `v`. Checkpoints, witnesses
+and bundles are unchanged: a bundle's `receipt` is either kind. A 1.0
+verifier refuses an `ARC1-delivery` document as malformed, as it refuses
+anything it does not understand.
+
+### 13.5 Verification
+
+A delivery bundle is verified in this order:
+
+| # | Check | Passes when | Needs | Fails with |
+|---|---|---|---|---|
+| 1 | ARC1 schema | as for an action receipt, and 13.3's ordering rule holds | the bundle | 3 `MALFORMED` |
+| 2 | receipt signature | section 4.4, over the delivery receipt | the log's key | 4 `SIGNATURE` |
+| 3 | relay attestation | the attestation rebuilt as 13.2 verifies (4.4) under the given relay key whose `key_id` it names | the relays' keys | 9 `ATTESTED` |
+| 4 | log inclusion | as for an action receipt | a bundle with a checkpoint | 5 `INCLUSION` |
+| 5 | witnessed | as for an action receipt | the witness's file and key | 6 `WITNESS` |
+| 6 | action binding | the action bundle holds an action receipt whose `receipt_id`, place and leaf hash are `action`'s; it verifies under the issuer's key; if its bundle has a checkpoint, its audit path verifies; and two checkpoints of one log at one size have one root | the action receipt's bundle | 10 `BINDING` |
+
+### 13.6 Security considerations
+
+- **Relay keys.** An attestation is worth the relay key's custody. A relay key
+  signs nothing but attestations; keep it on the relay, and register its
+  public half where verifiers find it.
+- **What an attestation does not prove.** That the system acted as it said.
+  It proves what the relay saw it say, signed by the party that saw it, which
+  an operator of the log or of the database cannot produce on their own.
+- **Undelivered requests.** A log records the deliveries its issuer saw. A
+  request committed and never delivered has an action receipt and no
+  delivery receipt; comparing the two is how it is found.

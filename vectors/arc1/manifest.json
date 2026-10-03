@@ -1,5 +1,5 @@
 {
-  "description": "Run `agentgov verify-receipt` with 'args' (paths relative to this directory) and expect 'exit'. 0 pass, 3 malformed, 4 receipt signature, 5 log inclusion, 6 witness, 8 rows.",
+  "description": "Run `agentgov verify-receipt` with 'args' (paths relative to this directory) and expect 'exit'. 0 pass, 3 malformed, 4 receipt signature, 5 log inclusion, 6 witness, 8 rows, 9 relay attestation, 10 action binding.",
   "cases": [
     {
       "name": "committed-refund",
@@ -238,6 +238,118 @@
         "keys/issuer.pub"
       ],
       "description": "a field the schema does not define"
+    },
+    {
+      "name": "refund-call",
+      "exit": 0,
+      "args": [
+        "delivery/valid/refund-call.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "delivery/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+        "--rows",
+        "delivery/valid/refund-call.rows.json"
+      ],
+      "description": "the action receipt, with the outbox row of the request it committed disclosed"
+    },
+    {
+      "name": "refund-delivered",
+      "exit": 0,
+      "args": [
+        "delivery/valid/refund-delivered.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "delivery/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+        "--relay-key",
+        "delivery/keys/relay.pub",
+        "--action",
+        "delivery/valid/refund-call.bundle.json"
+      ],
+      "description": "the delivery receipt: witnessed, attested by the relay, bound to the action"
+    },
+    {
+      "name": "attestation-forged",
+      "exit": 9,
+      "args": [
+        "delivery/invalid/attestation-forged.receipt.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--relay-key",
+        "delivery/keys/relay.pub",
+        "--action",
+        "delivery/valid/refund-call.bundle.json"
+      ],
+      "description": "an attestation signed by another key that claims the relay's key id"
+    },
+    {
+      "name": "payload-swapped",
+      "exit": 9,
+      "args": [
+        "delivery/invalid/payload-swapped.receipt.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--relay-key",
+        "delivery/keys/relay.pub",
+        "--action",
+        "delivery/valid/refund-call.bundle.json"
+      ],
+      "description": "a payload hash the relay never attested, re-signed by the log"
+    },
+    {
+      "name": "unknown-relay",
+      "exit": 9,
+      "args": [
+        "delivery/valid/refund-delivered.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--relay-key",
+        "keys/witness.pub"
+      ],
+      "description": "a real delivery, checked against a key that is not its relay's"
+    },
+    {
+      "name": "wrong-action",
+      "exit": 10,
+      "args": [
+        "delivery/invalid/wrong-action.receipt.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--relay-key",
+        "delivery/keys/relay.pub",
+        "--action",
+        "delivery/valid/refund-call.bundle.json"
+      ],
+      "description": "a delivery re-bound to another receipt's leaf hash, re-signed by the log"
+    },
+    {
+      "name": "status-modified",
+      "exit": 4,
+      "args": [
+        "delivery/invalid/status-modified.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--relay-key",
+        "delivery/keys/relay.pub",
+        "--action",
+        "delivery/valid/refund-call.bundle.json"
+      ],
+      "description": "the sink's answer edited after signing"
+    },
+    {
+      "name": "delivered-before-action",
+      "exit": 3,
+      "args": [
+        "delivery/invalid/delivered-before-action.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "a delivery that claims a place before the action it follows from"
     }
   ]
 }

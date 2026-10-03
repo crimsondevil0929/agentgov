@@ -1,0 +1,69 @@
+{
+  "v": "ARC1-bundle",
+  "receipt": {
+    "v": "ARC1-delivery",
+    "receipt_id": "5d2179bc-4115-5945-8f30-080558ca255f",
+    "issued_at": "2026-09-25T15:11:00.000000Z",
+    "issuer": "interlock/0.4.0 support-eu-1",
+    "action": {
+      "receipt_id": "b52049dd-c336-5a9b-8238-58ebee9f4052",
+      "log_id": "arc1-vectors-delivery",
+      "leaf_index": 0,
+      "leaf_hash": "f41aa46ff199542f4f61745200f1acafa1b52fdaaca2e3b2bd813521937371c8"
+    },
+    "request": {
+      "message_id": "fe9966c0-5971-5359-9578-b2e9f544304a",
+      "effect_id": "pay_refund",
+      "sink": "payments",
+      "operation": "refunds.create",
+      "payload_hash": "e8d3a00e7ae1765d466dd4af35a29a3cdbee10970f92525c747c735a588ebf87",
+      "idempotency_key": "302ca4b9795625117df88e8aac4536e7074dcff758836fc39d48ace44e03ac0e"
+    },
+    "delivery": {
+      "attempt": 1,
+      "status_code": 200,
+      "response_digest": "3dd3f89c46ba34f215f18e0ca6e7dc734324d2b1f268d4f9a28b758fc09b3a95",
+      "remote_ref": "re_3Pq1VectorRefund",
+      "delivered_at": "2026-09-25T15:10:00.123456Z",
+      "log_seq": 2,
+      "log_hash": "d95fe83a1c91479856be2f4608a663ab65fead7ce3bd1b15ab7bf294fddd2579"
+    },
+    "attestation": {
+      "alg": "ed25519",
+      "key_id": "5814defc9fb8eae5",
+      "signature": "1c3d3a9cb0fee8cc87634145a65dbd8903aa460f275e39d7b94122e3bb95b71e1e970854c088eff45629721176fe9e2cf9596dede2d0679a9789a12e81f0860e"
+    },
+    "anchors": {
+      "agentgov": null,
+      "escrow": null,
+      "log": {
+        "log_id": "arc1-vectors-delivery",
+        "leaf_index": 1
+      }
+    },
+    "sig": {
+      "alg": "ed25519",
+      "key_id": "bcc542d53c8c1a1f",
+      "signature": "440c0750bef4f08a75c7d2f34a65b2b15ca6764959101e191425949392ecd479af8f86ddcbd58b3bf64898641f0282bb15acd928f13d6b100867b3cec3d4140a"
+    }
+  },
+  "inclusion": {
+    "leaf_index": 1,
+    "tree_size": 2,
+    "audit_path": [
+      "f41aa46ff199542f4f61745200f1acafa1b52fdaaca2e3b2bd813521937371c8"
+    ]
+  },
+  "checkpoint": {
+    "v": "ARC1-checkpoint",
+    "log_id": "arc1-vectors-delivery",
+    "tree_size": 2,
+    "root_hash": "9f6739b9b6411104e89f13f858ddf84d37d6264f4736958619bd35375ed67791",
+    "issued_at": "2026-09-25T15:59:00.000000Z",
+    "sig": {
+      "alg": "ed25519",
+      "key_id": "bcc542d53c8c1a1f",
+      "signature": "4ea9a87ed3271e2ff4903133831a4f4ede734a8536a2f5ef91e6a8924cf1f6664dea9d80d54cd78e4e1c9af2b2fadcf9aa65b81d7589fa531b9314d4f64be00f"
+    }
+  }
+}

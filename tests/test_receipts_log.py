@@ -51,7 +51,7 @@ from agentgov.receipts.schema import Signature
 VECTORS = Path(__file__).resolve().parent.parent / "vectors" / "arc1"
 TEMPLATE = ReceiptBundle.loads(
     (VECTORS / "valid" / "committed-refund.bundle.json").read_bytes()
-).receipt
+).action_receipt
 LOG_ID = "support-eu-1"
 NEVER = CheckpointPolicy(every_receipts=10**6, every_seconds=10**9)
 
