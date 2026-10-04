@@ -301,6 +301,8 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
         issuer = _read_key(args.pubkey)
         log_key = _read_key(args.log_pubkey) if args.log_pubkey else None
         witness_key = _read_key(args.witness_pubkey) if args.witness_pubkey else None
+        relay_keys = [_read_key(key) for key in args.relay_key] if args.relay_key else None
+        action = Path(args.action).read_bytes() if args.action else None
         bundle = Path(args.bundle).read_bytes()
     except (OSError, MalformedReceiptError) as exc:
         out.write(f"error: {exc}\n")
@@ -350,6 +352,8 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
             witness_key=witness_key,
             ledger=ledger,
             rows=rows,
+            relay_keys=relay_keys,
+            action=action,
         )
     finally:
         if ledger is not None:
@@ -454,8 +458,9 @@ def build_parser() -> argparse.ArgumentParser:
     receipt = subcommands.add_parser(
         "verify-receipt",
         help="verify an ARC1 receipt offline; exit 0 on PASS, 3-8 naming what failed",
-        description="Verify an ARC1 receipt bundle offline. Exit codes: 0 pass, 2 usage, "
-        "3 malformed, 4 receipt signature, 5 log inclusion, 6 witness, 7 ledger, 8 rows.",
+        description="Verify an ARC1 receipt bundle offline: an action receipt, or a delivery "
+        "receipt. Exit codes: 0 pass, 2 usage, 3 malformed, 4 receipt signature, 5 log "
+        "inclusion, 6 witness, 7 ledger, 8 rows, 9 relay attestation, 10 action binding.",
     )
     receipt.add_argument("bundle", help="receipt bundle, or bare receipt, as JSON")
     receipt.add_argument(
@@ -479,6 +484,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     receipt.add_argument(
         "--rows", default="", help="a row disclosure to check against the row commitment"
+    )
+    receipt.add_argument(
+        "--relay-key",
+        action="append",
+        default=[],
+        help="for a delivery receipt: a relay's key that may have signed its attestation; "
+        "repeat for each relay",
+    )
+    receipt.add_argument(
+        "--action",
+        default="",
+        help="for a delivery receipt: the bundle of the action receipt it must follow from",
     )
     receipt.add_argument("--json", action="store_true", help="print the report as JSON")
     receipt.set_defaults(handler=_command_verify_receipt)

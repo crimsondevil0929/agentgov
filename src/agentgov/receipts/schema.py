@@ -40,8 +40,11 @@ from agentgov.receipts.merkle import leaf_hash
 from agentgov.receipts.signing import ALG_ED25519, ALG_HMAC_SHA256, Signer, Verifier
 
 __all__ = [
+    "ActionBinding",
     "ActionReceipt",
     "Anchors",
+    "Attestation",
+    "AttestedOutcome",
     "Authority",
     "Capability",
     "ChainAnchor",
@@ -51,12 +54,16 @@ __all__ = [
     "Cost",
     "Coverage",
     "Decision",
+    "DeliveredRequest",
+    "Delivery",
+    "DeliveryReceipt",
     "DisclosedRow",
     "Effect",
     "EffectSummary",
     "InclusionProof",
     "Intent",
     "LogAnchor",
+    "LogDocument",
     "Outcome",
     "OutcomeStatus",
     "ReceiptBundle",
@@ -64,15 +71,20 @@ __all__ = [
     "RowDisclosure",
     "Signature",
     "StatedFootprint",
+    "document_from_json",
 ]
 
 RECEIPT_VERSION = "ARC1"
+DELIVERY_VERSION = "ARC1-delivery"
+ATTESTATION_VERSION = "ARC1-attestation"
 CHECKPOINT_VERSION = "ARC1-checkpoint"
 COSIGNATURE_VERSION = "ARC1-cosignature"
 BUNDLE_VERSION = "ARC1-bundle"
 ROWS_VERSION = "ARC1-rows"
 
 RECEIPT_DOMAIN = b"ARC1/receipt/v1\n"
+DELIVERY_DOMAIN = b"ARC1/delivery/v1\n"
+ATTESTATION_DOMAIN = b"ARC1/attestation/v1\n"
 CHECKPOINT_DOMAIN = b"ARC1/checkpoint/v1\n"
 COSIGNATURE_DOMAIN = b"ARC1/cosignature/v1\n"
 
@@ -887,6 +899,438 @@ class ActionReceipt:
 
 
 # --------------------------------------------------------------------------
+# Deliveries (ARC1 v1.1)
+#
+# An action receipt proves what was authorized and committed. A delivery
+# receipt proves what was then sent to an external system, and what that
+# system answered. Two parties see those two things: the relay that made the
+# call signs an attestation of the answer the moment it arrives; the log that
+# holds the action receipt signs the delivery receipt that carries it.
+# --------------------------------------------------------------------------
+
+DELIVERY_RESULTS = ("delivered", "retryable", "permanent", "unknown")
+
+
+@dataclass(frozen=True)
+class DeliveredRequest:
+    """The request a relay sent: the outbox row the action receipt's row
+    commitment covers, as the relay read it."""
+
+    message_id: str
+    effect_id: str
+    sink: str
+    operation: str
+    payload_hash: str
+    idempotency_key: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "message_id": self.message_id,
+            "effect_id": self.effect_id,
+            "sink": self.sink,
+            "operation": self.operation,
+            "payload_hash": self.payload_hash,
+            "idempotency_key": self.idempotency_key,
+        }
+
+    @classmethod
+    def from_json(cls, f: _Fields) -> DeliveredRequest:
+        return cls(
+            message_id=f.uuid("message_id"),
+            effect_id=f.text("effect_id"),
+            sink=f.text("sink"),
+            operation=f.text("operation"),
+            payload_hash=f.hex64("payload_hash"),
+            idempotency_key=f.text("idempotency_key"),
+        )
+
+
+_REQUEST_FIELDS = (
+    "message_id",
+    "effect_id",
+    "sink",
+    "operation",
+    "payload_hash",
+    "idempotency_key",
+)
+
+
+def _check_status(value: int | None, path: str) -> int | None:
+    if value is not None and not 100 <= value <= 599:
+        raise MalformedReceiptError(f"{path} is an HTTP status, 100 to 599")
+    return value
+
+
+@dataclass(frozen=True)
+class AttestedOutcome:
+    """What a call returned, as the relay that made it saw it."""
+
+    attempt: int
+    result: str
+    status_code: int | None = None
+    response_digest: str | None = None
+    remote_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.result not in DELIVERY_RESULTS:
+            raise MalformedReceiptError(
+                f"an outcome's result is one of {', '.join(DELIVERY_RESULTS)}, not {self.result!r}"
+            )
+        if self.attempt < 1:
+            raise MalformedReceiptError("an outcome's attempt counts from 1")
+        _check_status(self.status_code, "outcome.status_code")
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "result": self.result,
+            "status_code": self.status_code,
+            "response_digest": self.response_digest,
+            "remote_ref": self.remote_ref,
+        }
+
+    @classmethod
+    def from_json(cls, f: _Fields) -> AttestedOutcome:
+        digest = f.raw("response_digest")
+        return cls(
+            attempt=f.integer("attempt", minimum=1),
+            result=f.text("result"),
+            status_code=f.optional_integer("status_code"),
+            response_digest=None if digest is None else f.hex64("response_digest"),
+            remote_ref=f.optional_text("remote_ref"),
+        )
+
+
+@dataclass(frozen=True)
+class Attestation:
+    """``ARC1-attestation``: a relay's signed statement of one call's outcome,
+    made when the answer arrived, with the relay's own key.
+
+    It travels as its signature alone: a delivery receipt carries the request
+    and the outcome it covers, and :meth:`DeliveryReceipt.attested` rebuilds
+    it to verify.
+    """
+
+    request: DeliveredRequest
+    outcome: AttestedOutcome
+    signature: Signature | None = None
+
+    def body(self) -> dict[str, Any]:
+        return {
+            "v": ATTESTATION_VERSION,
+            "request": self.request.to_json(),
+            "outcome": self.outcome.to_json(),
+        }
+
+    def to_json(self) -> dict[str, Any]:
+        return {**self.body(), "sig": self.signature.to_json() if self.signature else None}
+
+    def signing_input(self, alg: str, key_id: str) -> bytes:
+        return _signing_input(ATTESTATION_DOMAIN, self.body(), alg, key_id)
+
+    def sign(self, signer: Signer) -> Attestation:
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
+
+    def verify(self, verifier: Verifier) -> None:
+        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this."""
+        _check_signature("attestation", self.signature, verifier, self.signing_input)
+
+    @classmethod
+    def from_json(cls, value: object, path: str = "attestation") -> Attestation:
+        f = _Fields(value, path, ("v", "request", "outcome", "sig"))
+        f.version(ATTESTATION_VERSION)
+        sig = f.optional_child("sig", _SIG_FIELDS)
+        return cls(
+            request=DeliveredRequest.from_json(f.child("request", _REQUEST_FIELDS)),
+            outcome=AttestedOutcome.from_json(f.child("outcome", _OUTCOME_FIELDS)),
+            signature=Signature.from_json(sig) if sig else None,
+        )
+
+
+_OUTCOME_FIELDS = ("attempt", "result", "status_code", "response_digest", "remote_ref")
+
+
+@dataclass(frozen=True)
+class ActionBinding:
+    """The action receipt a delivery follows from: its id, its place in a
+    receipt log, and its leaf hash, ``SHA-256(0x00 || canonical(receipt))``,
+    which binds its exact signed bytes."""
+
+    receipt_id: str
+    log_id: str
+    leaf_index: int
+    leaf_hash: str
+
+    @classmethod
+    def of(cls, receipt: ActionReceipt) -> ActionBinding:
+        """The binding to ``receipt``, which must already have its place in a log.
+
+        :raises MalformedReceiptError: If it is unsigned or has no place.
+        """
+        anchor = receipt.anchors.log
+        if anchor is None or receipt.signature is None:
+            raise MalformedReceiptError(
+                "a delivery binds to a signed action receipt with its place in a log"
+            )
+        return cls(
+            receipt_id=receipt.receipt_id,
+            log_id=anchor.log_id,
+            leaf_index=anchor.leaf_index,
+            leaf_hash=receipt.leaf_hash().hex(),
+        )
+
+    def problem(self, receipt: ActionReceipt) -> str | None:
+        """Why ``receipt`` is not the one bound, or ``None`` if it is."""
+        anchor = receipt.anchors.log
+        if receipt.receipt_id != self.receipt_id:
+            return f"it binds receipt {self.receipt_id}, not {receipt.receipt_id}"
+        if anchor is None or (anchor.log_id, anchor.leaf_index) != (self.log_id, self.leaf_index):
+            placed = f"{anchor.log_id}#{anchor.leaf_index}" if anchor else "no place"
+            return (
+                f"it binds leaf {self.leaf_index} of log {self.log_id!r}; the receipt is at "
+                f"{placed}"
+            )
+        if receipt.leaf_hash().hex() != self.leaf_hash:
+            return (
+                f"it binds leaf hash {self.leaf_hash[:16]}; the receipt hashes to "
+                f"{receipt.leaf_hash().hex()[:16]}: a different or altered receipt"
+            )
+        return None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "log_id": self.log_id,
+            "leaf_index": self.leaf_index,
+            "leaf_hash": self.leaf_hash,
+        }
+
+    @classmethod
+    def from_json(cls, f: _Fields) -> ActionBinding:
+        return cls(
+            receipt_id=f.uuid("receipt_id"),
+            log_id=f.text("log_id"),
+            leaf_index=f.integer("leaf_index"),
+            leaf_hash=f.hex64("leaf_hash"),
+        )
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """The call that delivered: its attempt, the sink's answer, and the row
+    of the message's delivery log that recorded it."""
+
+    attempt: int
+    status_code: int | None
+    response_digest: str | None
+    remote_ref: str | None
+    delivered_at: datetime
+    log_seq: int
+    log_hash: str
+
+    def __post_init__(self) -> None:
+        if self.attempt < 1 or self.log_seq < 1:
+            raise MalformedReceiptError("a delivery's attempt and log_seq count from 1")
+        _check_status(self.status_code, "delivery.status_code")
+
+    def outcome(self) -> AttestedOutcome:
+        return AttestedOutcome(
+            attempt=self.attempt,
+            result="delivered",
+            status_code=self.status_code,
+            response_digest=self.response_digest,
+            remote_ref=self.remote_ref,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "status_code": self.status_code,
+            "response_digest": self.response_digest,
+            "remote_ref": self.remote_ref,
+            "delivered_at": instant(self.delivered_at),
+            "log_seq": self.log_seq,
+            "log_hash": self.log_hash,
+        }
+
+    @classmethod
+    def from_json(cls, f: _Fields) -> Delivery:
+        digest = f.raw("response_digest")
+        return cls(
+            attempt=f.integer("attempt", minimum=1),
+            status_code=f.optional_integer("status_code"),
+            response_digest=None if digest is None else f.hex64("response_digest"),
+            remote_ref=f.optional_text("remote_ref"),
+            delivered_at=f.instant("delivered_at"),
+            log_seq=f.integer("log_seq", minimum=1),
+            log_hash=f.hex64("log_hash"),
+        )
+
+
+_DELIVERY_FIELDS = (
+    "v",
+    "receipt_id",
+    "issued_at",
+    "issuer",
+    "action",
+    "request",
+    "delivery",
+    "attestation",
+    "anchors",
+    "sig",
+)
+
+
+@dataclass(frozen=True)
+class DeliveryReceipt:
+    """``ARC1-delivery``: a signed record that a committed request was
+    delivered, bound to the action receipt that committed it.
+
+    :ivar action: The action receipt of the plan that committed the request.
+    :ivar request: The request sent, as the outbox committed it.
+    :ivar delivery: The call that delivered, and the delivery-log row that
+        recorded it.
+    :ivar attestation: The relay's signature over ``request`` and the
+        delivery's outcome (:meth:`attested`).
+    :raises MalformedReceiptError: If it claims a place in the action
+        receipt's log at or before the action receipt's.
+    """
+
+    receipt_id: str
+    issued_at: datetime
+    issuer: str
+    action: ActionBinding
+    request: DeliveredRequest
+    delivery: Delivery
+    attestation: Signature
+    anchors: Anchors = field(default_factory=Anchors)
+    signature: Signature | None = None
+
+    domain: ClassVar[bytes] = DELIVERY_DOMAIN
+
+    def __post_init__(self) -> None:
+        placed = self.anchors.log
+        if (
+            placed is not None
+            and placed.log_id == self.action.log_id
+            and placed.leaf_index <= self.action.leaf_index
+        ):
+            raise MalformedReceiptError(
+                f"a delivery at leaf {placed.leaf_index} cannot follow from the action receipt "
+                f"at leaf {self.action.leaf_index} of the same log: it was delivered after it "
+                f"was committed"
+            )
+
+    def attested(self) -> Attestation:
+        """The relay's attestation this receipt carries, rebuilt to verify."""
+        return Attestation(
+            request=self.request, outcome=self.delivery.outcome(), signature=self.attestation
+        )
+
+    # -- encoding ---------------------------------------------------------
+
+    def body(self) -> dict[str, Any]:
+        return {
+            "v": DELIVERY_VERSION,
+            "receipt_id": self.receipt_id,
+            "issued_at": instant(self.issued_at),
+            "issuer": self.issuer,
+            "action": self.action.to_json(),
+            "request": self.request.to_json(),
+            "delivery": self.delivery.to_json(),
+            "attestation": self.attestation.to_json(),
+            "anchors": self.anchors.to_json(),
+        }
+
+    def to_json(self) -> dict[str, Any]:
+        return {**self.body(), "sig": self.signature.to_json() if self.signature else None}
+
+    def canonical(self) -> bytes:
+        """The canonical encoding, signature included: its leaf data in a log."""
+        return canonical_bytes(self.to_json())
+
+    def leaf_hash(self) -> bytes:
+        return leaf_hash(self.canonical())
+
+    def signing_input(self, alg: str, key_id: str) -> bytes:
+        return _signing_input(DELIVERY_DOMAIN, self.body(), alg, key_id)
+
+    # -- signing ----------------------------------------------------------
+
+    def sign(self, signer: Signer) -> DeliveryReceipt:
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
+
+    def verify(self, verifier: Verifier) -> None:
+        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this."""
+        _check_signature("delivery receipt", self.signature, verifier, self.signing_input)
+
+    def with_log_anchor(self, log_id: str, leaf_index: int) -> DeliveryReceipt:
+        """An unsigned copy that claims a position in a receipt log."""
+        anchors = replace(self.anchors, log=LogAnchor(log_id=log_id, leaf_index=leaf_index))
+        return replace(self, anchors=anchors, signature=None)
+
+    # -- decoding ---------------------------------------------------------
+
+    @classmethod
+    def from_json(cls, value: object, path: str = "delivery") -> DeliveryReceipt:
+        """Decode and validate one delivery receipt.
+
+        :raises MalformedReceiptError: On anything the schema does not allow.
+        """
+        f = _Fields(value, path, _DELIVERY_FIELDS)
+        f.version(DELIVERY_VERSION)
+        sig = f.optional_child("sig", _SIG_FIELDS)
+        return cls(
+            receipt_id=f.uuid("receipt_id"),
+            issued_at=f.instant("issued_at"),
+            issuer=f.text("issuer"),
+            action=ActionBinding.from_json(
+                f.child("action", ("receipt_id", "log_id", "leaf_index", "leaf_hash"))
+            ),
+            request=DeliveredRequest.from_json(f.child("request", _REQUEST_FIELDS)),
+            delivery=Delivery.from_json(
+                f.child(
+                    "delivery",
+                    (
+                        "attempt",
+                        "status_code",
+                        "response_digest",
+                        "remote_ref",
+                        "delivered_at",
+                        "log_seq",
+                        "log_hash",
+                    ),
+                )
+            ),
+            attestation=Signature.from_json(f.child("attestation", _SIG_FIELDS)),
+            anchors=Anchors.from_json(f.child("anchors", ("agentgov", "escrow", "log"))),
+            signature=Signature.from_json(sig) if sig else None,
+        )
+
+    @classmethod
+    def loads(cls, text: str | bytes) -> DeliveryReceipt:
+        return cls.from_json(loads_strict(text))
+
+
+LogDocument = ActionReceipt | DeliveryReceipt
+"""What a receipt log's leaves are: action receipts and, from ARC1 v1.1,
+delivery receipts."""
+
+
+def document_from_json(value: object, path: str = "receipt") -> LogDocument:
+    """Decode a log leaf of either kind, by its ``v``.
+
+    :raises MalformedReceiptError: If it is neither.
+    """
+    kind = value.get("v") if isinstance(value, dict) else None
+    if kind == DELIVERY_VERSION:
+        return DeliveryReceipt.from_json(value, path)
+    return ActionReceipt.from_json(value, path)
+
+
+# --------------------------------------------------------------------------
 # Log checkpoints and witness cosignatures
 # --------------------------------------------------------------------------
 
@@ -1029,10 +1473,11 @@ class InclusionProof:
 
 @dataclass(frozen=True)
 class ReceiptBundle:
-    """What a verifier is handed: a receipt, and optionally the checkpoint and
-    audit path proving the receipt is in that log."""
+    """What a verifier is handed: a receipt (an action receipt, or from ARC1
+    v1.1 a delivery receipt), and optionally the checkpoint and audit path
+    proving the receipt is in that log."""
 
-    receipt: ActionReceipt
+    receipt: LogDocument
     inclusion: InclusionProof | None = None
     checkpoint: Checkpoint | None = None
 
@@ -1041,6 +1486,30 @@ class ReceiptBundle:
             raise MalformedReceiptError(
                 "a bundle carries an inclusion proof and its checkpoint together, or neither"
             )
+
+    @property
+    def action_receipt(self) -> ActionReceipt:
+        """The receipt, which must be an action receipt.
+
+        :raises MalformedReceiptError: If it is a delivery receipt.
+        """
+        if not isinstance(self.receipt, ActionReceipt):
+            raise MalformedReceiptError(
+                "the bundle holds a delivery receipt, not an action receipt"
+            )
+        return self.receipt
+
+    @property
+    def delivery_receipt(self) -> DeliveryReceipt:
+        """The receipt, which must be a delivery receipt.
+
+        :raises MalformedReceiptError: If it is an action receipt.
+        """
+        if not isinstance(self.receipt, DeliveryReceipt):
+            raise MalformedReceiptError(
+                "the bundle holds an action receipt, not a delivery receipt"
+            )
+        return self.receipt
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1057,7 +1526,7 @@ class ReceiptBundle:
         inclusion = f.optional_child("inclusion", ("leaf_index", "tree_size", "audit_path"))
         checkpoint = f.raw("checkpoint")
         return cls(
-            receipt=ActionReceipt.from_json(f.raw("receipt"), "bundle.receipt"),
+            receipt=document_from_json(f.raw("receipt"), "bundle.receipt"),
             inclusion=InclusionProof.from_json(inclusion) if inclusion else None,
             checkpoint=Checkpoint.from_json(checkpoint, "bundle.checkpoint")
             if checkpoint is not None
@@ -1066,10 +1535,11 @@ class ReceiptBundle:
 
     @classmethod
     def loads(cls, text: str | bytes) -> ReceiptBundle:
-        """Decode a bundle, or a bare receipt as a bundle without a proof."""
+        """Decode a bundle, or a bare receipt of either kind as a bundle
+        without a proof."""
         value = loads_strict(text)
-        if isinstance(value, dict) and value.get("v") == RECEIPT_VERSION:
-            return cls(receipt=ActionReceipt.from_json(value))
+        if isinstance(value, dict) and value.get("v") in (RECEIPT_VERSION, DELIVERY_VERSION):
+            return cls(receipt=document_from_json(value))
         return cls.from_json(value)
 
 

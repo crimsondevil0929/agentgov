@@ -43,7 +43,7 @@ from agentgov.receipts.schema import Signature, instant, money_text
 
 VECTORS = Path(__file__).resolve().parent.parent / "vectors" / "arc1"
 BUNDLE = ReceiptBundle.loads((VECTORS / "valid" / "committed-refund.bundle.json").read_bytes())
-RECEIPT = BUNDLE.receipt
+RECEIPT = BUNDLE.action_receipt
 ISSUER = parse_key((VECTORS / "keys" / "issuer.pub").read_text())
 RECEIPT_JSON: dict[str, Any] = RECEIPT.to_json()
 

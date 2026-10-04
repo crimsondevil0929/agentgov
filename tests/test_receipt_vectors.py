@@ -129,7 +129,7 @@ def test_the_manifest_covers_every_failure_class_the_vectors_can_show() -> None:
     codes = {case["exit"] for case in MANIFEST["cases"]}
     # 7 needs a SQLite ledger, which is not a portable vector; the ledger
     # check is exercised against a real ledger in test_receipts_verify.
-    assert codes == {0, 3, 4, 5, 6, 8}
+    assert codes == {0, 3, 4, 5, 6, 8, 9, 10}
     names = [case["name"] for case in MANIFEST["cases"]]
     assert len(names) == len(set(names))
     for case in MANIFEST["cases"]:
@@ -305,4 +305,4 @@ def test_the_valid_disclosures_verify_directly() -> None:
     for name in ("committed-refund", "refused-tenant-wipe"):
         bundle = ReceiptBundle.loads((VECTORS / "valid" / f"{name}.bundle.json").read_bytes())
         disclosure = RowDisclosure.loads((VECTORS / "valid" / f"{name}.rows.json").read_bytes())
-        verify_disclosure(disclosure, bundle.receipt)
+        verify_disclosure(disclosure, bundle.action_receipt)

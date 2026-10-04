@@ -1,7 +1,10 @@
 """The receipt log: an append-only RFC 9162 Merkle log of ARC1 receipts.
 
-Each leaf is one signed receipt's canonical bytes. The log signs checkpoints
-(its size and root) and hands them to witnesses, and hands a verifier a
+Each leaf is one signed document's canonical bytes: an action receipt, or
+(ARC1 v1.1) a delivery receipt. A delivery receipt that names an action
+receipt of the same log is accepted only after it, bound to its exact bytes.
+The log signs checkpoints (its size and root) and hands them to witnesses,
+and hands a verifier a
 :class:`~agentgov.receipts.schema.ReceiptBundle`: the receipt, a checkpoint,
 and the audit path proving the one is in the other.
 
@@ -30,6 +33,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 
 from agentgov.exceptions import (
     ConcurrentGovernorError,
@@ -45,9 +49,12 @@ from agentgov.receipts.merkle import MerkleTree
 from agentgov.receipts.schema import (
     ActionReceipt,
     Checkpoint,
+    DeliveryReceipt,
     InclusionProof,
+    LogDocument,
     ReceiptBundle,
     _check_text,
+    document_from_json,
 )
 from agentgov.receipts.signing import Signer
 from agentgov.receipts.witness import Witness
@@ -55,6 +62,8 @@ from agentgov.receipts.witness import Witness
 __all__ = ["CheckpointPolicy", "ReceiptLog"]
 
 logger = logging.getLogger("agentgov.receipts")
+
+D = TypeVar("D", ActionReceipt, DeliveryReceipt)
 
 
 @dataclass(frozen=True)
@@ -109,7 +118,7 @@ class ReceiptLog:
         self._fsync = fsync
         self._lock = threading.RLock()
         self._tree = MerkleTree()
-        self._receipts: list[ActionReceipt] = []
+        self._receipts: list[LogDocument] = []
         self._index_of: dict[str, int] = {}
         self._checkpoints: list[Checkpoint] = []
         self._pending = 0
@@ -135,13 +144,19 @@ class ReceiptLog:
         with self._lock:
             return len(self._receipts)
 
-    def receipt(self, index: int) -> ActionReceipt:
+    def receipt(self, index: int) -> LogDocument:
         with self._lock:
             return self._receipts[index]
 
-    def receipts(self) -> tuple[ActionReceipt, ...]:
+    def receipts(self) -> tuple[LogDocument, ...]:
+        """Every leaf, in order: action receipts and delivery receipts."""
         with self._lock:
             return tuple(self._receipts)
+
+    def deliveries(self) -> tuple[DeliveryReceipt, ...]:
+        """The delivery receipts alone, in order."""
+        with self._lock:
+            return tuple(r for r in self._receipts if isinstance(r, DeliveryReceipt))
 
     def index_of(self, receipt_id: str) -> int | None:
         """The position of the receipt with this id, or ``None``."""
@@ -171,7 +186,7 @@ class ReceiptLog:
 
     # -- writing ----------------------------------------------------------
 
-    def issue(self, draft: ActionReceipt) -> ActionReceipt:
+    def issue(self, draft: D) -> D:
         """Place ``draft`` as the next leaf, sign it, and append it.
 
         If the append makes a checkpoint due under the log's policy, the log
@@ -181,15 +196,17 @@ class ReceiptLog:
 
         :returns: The signed receipt, naming this log and its index.
         :raises ReceiptLogError: If a receipt with this id is already in the
-            log, or the log is closed.
+            log, the log is closed, or a delivery receipt names an action
+            receipt of this log that is not the one at the place it names.
         """
         with self._lock:
             self._check_new(draft)
             receipt = draft.with_log_anchor(self._log_id, len(self._receipts)).sign(self._signer)
+            self._check_binding(receipt)
             self._append(receipt)
             return receipt
 
-    def append(self, receipt: ActionReceipt) -> int:
+    def append(self, receipt: LogDocument) -> int:
         """Append a receipt someone else signed for this log's next index.
 
         :raises ReceiptLogError: If it is unsigned, names another log or
@@ -300,7 +317,7 @@ class ReceiptLog:
 
     # -- internals --------------------------------------------------------
 
-    def _check_new(self, receipt: ActionReceipt) -> None:
+    def _check_new(self, receipt: LogDocument) -> None:
         seen = self._index_of.get(receipt.receipt_id)
         if seen is not None:
             raise ReceiptLogError(
@@ -308,7 +325,7 @@ class ReceiptLog:
                 f"{seen}; a receipt enters a log once"
             )
 
-    def _check_position(self, receipt: ActionReceipt, index: int) -> None:
+    def _check_position(self, receipt: LogDocument, index: int) -> None:
         self._check_new(receipt)
         if receipt.signature is None:
             raise ReceiptLogError("an unsigned receipt cannot enter a log")
@@ -319,8 +336,25 @@ class ReceiptLog:
                 f"receipt {receipt.receipt_id} claims {claimed}; this is log "
                 f"{self._log_id!r} at index {index}"
             )
+        self._check_binding(receipt)
 
-    def _append(self, receipt: ActionReceipt) -> None:
+    def _check_binding(self, receipt: LogDocument) -> None:
+        """A delivery that names an action receipt of this log follows it,
+        bound to its exact bytes."""
+        if not isinstance(receipt, DeliveryReceipt) or receipt.action.log_id != self._log_id:
+            return
+        index = receipt.action.leaf_index
+        action = self._receipts[index] if index < len(self._receipts) else None
+        if not isinstance(action, ActionReceipt):
+            raise ReceiptLogError(
+                f"delivery {receipt.receipt_id} follows from leaf {index} of log "
+                f"{self._log_id!r}, which is not an action receipt this log holds"
+            )
+        problem = receipt.action.problem(action)
+        if problem is not None:
+            raise ReceiptLogError(f"delivery {receipt.receipt_id} does not bind: {problem}")
+
+    def _append(self, receipt: LogDocument) -> None:
         if self._claim is None and self._path is not None:
             raise ReceiptLogError(f"receipt log {self._path} is closed")
         if self._path is not None:
@@ -355,7 +389,7 @@ class ReceiptLog:
         path.parent.mkdir(parents=True, exist_ok=True)
         for number, line in enumerate(read_complete_lines(path, repair=True), start=1):
             try:
-                receipt = ActionReceipt.from_json(loads_strict(line), f"{path}:{number}")
+                receipt = document_from_json(loads_strict(line), f"{path}:{number}")
             except MalformedReceiptError as exc:
                 raise ReceiptLogError(f"{path} line {number} is not a receipt: {exc}") from exc
             self._check_position(receipt, len(self._receipts))

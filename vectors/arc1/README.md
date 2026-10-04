@@ -31,6 +31,7 @@ format is specified in [`docs/RECEIPTS.md`](../../docs/RECEIPTS.md).
   Size 5 was never shown to it.
 - `valid/`: bundles and row disclosures that verify.
 - `invalid/`: each one broken in exactly one way.
+- `delivery/`: ARC1 v1.1 delivery receipts, in a log of their own (below).
 - `manifest.json`: every command-line case, and the exit code it must produce.
 
 ## The receipts
@@ -50,6 +51,25 @@ capability for one tenant:
 6. `halted-scope`: admitted by every check, and refused because the scope was
    halted.
 
+## Delivery receipts (ARC1 v1.1)
+
+`delivery/` is a second log, `arc1-vectors-delivery`, of two leaves:
+
+0. `refund-call`: an action receipt. The support agent refunds an order, and
+   the plan commits, beside its rows, a request to a payment API: the row of
+   `interlock.outbox` it commits names the message, the sink, the operation
+   and the payload's hash. `valid/refund-call.rows.json` discloses that row,
+   and `payload.json` is the payload itself.
+1. `refund-delivered`: the delivery receipt. The relay sent the request, the
+   payment API answered 200, and the relay signed what it saw with its own key
+   (`keys/relay.pub`). The log signed the receipt that carries the
+   attestation, bound to leaf 0 by its leaf hash.
+
+`delivery/invalid/` breaks it one way each: an attestation by a key that
+claims the relay's id, a payload hash the relay never attested, a binding to
+another receipt, a status edited after signing, and a delivery placed before
+the action it follows from.
+
 ## Running the cases
 
 From this directory:
@@ -62,5 +82,5 @@ $ agentgov verify-receipt valid/committed-refund.bundle.json --pubkey keys/issue
 
 Each case in `manifest.json` gives the arguments, as paths relative to this
 directory, and the exit code: 0 pass, 3 malformed, 4 receipt signature, 5 log
-inclusion, 6 witness, 8 rows. A conforming verifier produces the same code
-for every case.
+inclusion, 6 witness, 8 rows, 9 relay attestation, 10 action binding. A
+conforming verifier produces the same code for every case.
