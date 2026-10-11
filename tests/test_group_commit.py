@@ -27,7 +27,6 @@ from agentgov.exceptions import (
 )
 from agentgov.postgres import PostgresStore
 
-pytestmark = pytest.mark.usefixtures("pg_dsn")
 UNLIMITED = GovernancePolicy(max_calls_per_window=0)
 
 
@@ -236,3 +235,60 @@ def test_a_checkpoint_come_due_waits_for_the_units_callers_to_have_their_results
     finally:
         release.set()
         gov.close()
+
+
+def test_sqlite_callers_share_one_transaction_and_its_sync(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On SQLite the unit of work is one transaction: one commit, one sync
+    of the file, for every caller queued."""
+    from agentgov.storage import SqliteStore
+
+    gov = BudgetManager.open_sqlite(str(tmp_path / "l.db"), policy=UNLIMITED, auditor=False)
+    try:
+        gov.open_root("root", money("100"))
+        for name in "abcd":
+            gov.delegate("root", name, money("10"))
+        units = [0]
+        original = SqliteStore.unit
+
+        def counted(self: SqliteStore) -> Any:
+            units[0] += 1
+            return original(self)
+
+        monkeypatch.setattr(SqliteStore, "unit", counted)
+        runs = _queued(gov, [functools.partial(gov.authorize, s, money("1")) for s in "abcd"])
+        assert all(run.outcome().scope_id in "abcd" for run in runs)  # type: ignore[attr-defined]
+        assert units[0] == 1
+    finally:
+        gov.close()
+    with BudgetManager.open_sqlite(str(tmp_path / "l.db"), read_only=True) as view:
+        assert [view.available(s) for s in "abcd"] == [money("9")] * 4
+
+
+def test_a_sqlite_commit_that_fails_fails_every_mutation_and_is_re_read(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentgov.storage import SqliteStore
+
+    gov = BudgetManager.open_sqlite(str(tmp_path / "l.db"), policy=UNLIMITED, auditor=False)
+    try:
+        gov.open_root("root", money("100"))
+        for name in "abc":
+            gov.delegate("root", name, money("10"))
+
+        def full(self: SqliteStore) -> None:
+            raise StorageError("database or disk is full")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(SqliteStore, "_commit_unit", full)
+            runs = _queued(gov, [functools.partial(gov.spend, s, money("1")) for s in "abc"])
+            outcomes = [run.outcome() for run in runs]
+        assert all(isinstance(o, StorageError) for o in outcomes), outcomes
+        assert [gov.available(s) for s in "abc"] == [money("10")] * 3, "re-read: nothing committed"
+        gov.verify_integrity()
+        gov.spend("a", money("1"))
+    finally:
+        gov.close()
+    with BudgetManager.open_sqlite(str(tmp_path / "l.db"), read_only=True) as view:
+        assert view.available("a") == money("9") and view.available("b") == money("10")

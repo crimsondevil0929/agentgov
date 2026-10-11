@@ -41,6 +41,7 @@ __all__ = [
     "DenialOfWalletException",
     "DoubleSpendError",
     "DuplicateScopeError",
+    "IdempotencyConflictError",
     "LedgerConflictError",
     "LedgerError",
     "LedgerIntegrityError",
@@ -490,6 +491,32 @@ class DoubleSpendError(LedgerError):
         super().__init__(
             f"Double-spend rejected for scope {scope_id!r}: "
             f"authorization {authorization_id} {detail}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Caller errors
+# --------------------------------------------------------------------------
+
+
+class IdempotencyConflictError(AgentGovError):
+    """Raised when an idempotency key already used for one call comes with another.
+
+    A call retried under its key, with the same arguments, returns the first
+    call's result and writes nothing. A different call under the key is
+    refused before anything is written: a key names one call, so reusing it
+    for another is a bug in the caller, not a retry.
+
+    :param key: The idempotency key.
+    :param operation: The operation the key was first used for.
+    """
+
+    def __init__(self, key: str, operation: str) -> None:
+        self.key = key
+        self.operation = operation
+        super().__init__(
+            f"idempotency key {key!r} was used for a different call ({operation}); a retry "
+            f"repeats the call its key names, with the same arguments"
         )
 
 

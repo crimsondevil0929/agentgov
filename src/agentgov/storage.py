@@ -38,11 +38,13 @@ floating-point column type.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import socket
 import sqlite3
 import sys
+import threading
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, suppress
@@ -50,7 +52,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar, runtime_checkable
 
 from agentgov.core import (
     _CHECKPOINT_MEMO,
@@ -59,6 +61,7 @@ from agentgov.core import (
     BudgetNode,
     ControlEvent,
     EntryType,
+    IdempotencyRecord,
     LedgerEntry,
     SettlementClaim,
     WriteBatch,
@@ -235,9 +238,23 @@ class PersistenceStore(Protocol):
     Every write is called with the manager's own lock held, so a store that
     only one governor writes never needs to provide its own concurrency
     control — it only needs to make each :meth:`commit` durable as a whole.
-    A store several governors write at once is a :class:`SharedStore`, which
-    adds the fleet-wide writer lock that process-local mutex cannot provide
-    (:class:`agentgov.postgres.PostgresStore`).
+    Reads of history are not: a store whose transactions belong to one
+    connection must keep each one whole against other threads (the stores
+    here hold a guard around each). A store several governors write at once
+    is a :class:`SharedStore`, which adds the fleet-wide writer lock that
+    process-local mutex cannot provide (:class:`agentgov.postgres.PostgresStore`).
+
+    Two capabilities are optional, found by name:
+
+    - ``idempotency(keys) -> dict[str, IdempotencyRecord]``: the calls
+      recorded under ``keys``, written with :attr:`WriteBatch.idempotency`.
+      Without it a governor refuses ``idempotency_key=``.
+    - ``unit()``: a context manager under which every :meth:`commit` joins one
+      transaction, committed when it ends (and rolled back, with
+      :class:`StorageError`, if a write in it failed). A single-writer store
+      with it shares units of work among concurrent callers, as a shared
+      store's writer session does, and makes
+      :meth:`~agentgov.core.BudgetManager.transaction` one transaction.
     """
 
     @property
@@ -305,6 +322,11 @@ class WriterSession(Protocol):
     @property
     def wrote(self) -> bool:
         """Whether :meth:`PersistenceStore.commit` was called in the session."""
+        ...
+
+    def abandon(self) -> None:
+        """Roll the session back when it ends, whatever it wrote: the unit of
+        work it carried failed as a whole (:meth:`BudgetManager.transaction`)."""
         ...
 
 
@@ -497,6 +519,56 @@ else:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _guarded(method: Callable[Concatenate[Any, _P], _R]) -> Callable[Concatenate[Any, _P], _R]:
+    """Run a store method holding the store's guard.
+
+    A store has one connection, and a transaction on it is the connection's,
+    not the calling thread's: a read made from one thread while another holds
+    a write transaction open would read inside it (and, on SQLite, see its
+    uncommitted rows; on PostgreSQL, end it). So each transaction on the
+    connection, a write, a read or a writer's whole session, is made holding
+    the store's re-entrant guard. A governor's own lock is always taken
+    before it, never after, so the two cannot deadlock.
+    """
+
+    @functools.wraps(method)
+    def guarded(self: Any, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with self._guard:
+            return method(self, *args, **kwargs)
+
+    return guarded
+
+
+class _SqliteUnit:
+    """One SQLite transaction carrying many commits: see :meth:`SqliteStore.unit`."""
+
+    __slots__ = ("abandoned", "committed", "failed", "wrote")
+
+    def __init__(self) -> None:
+        self.wrote = False
+        self.committed = False
+        self.failed = False
+        self.abandoned = False
+
+    def abandon(self) -> None:
+        """Roll the unit back when it ends, whatever it wrote."""
+        self.abandoned = True
+
+
+def _idempotency_record(row: Sequence[Any]) -> IdempotencyRecord:
+    return IdempotencyRecord(
+        key=str(row[0]),
+        request=str(row[1]),
+        outcome=str(row[2]),
+        sequence=int(row[3]),
+        created_at=_parse_iso(str(row[4])),
+    )
+
+
 class SqliteStore:
     """A :class:`PersistenceStore` backed by a local SQLite database file.
 
@@ -533,6 +605,8 @@ class SqliteStore:
         self._path = str(path)
         self._read_only = read_only
         self._lock: _AdvisoryLock | None = None
+        self._unit: _SqliteUnit | None = None
+        self._guard = threading.RLock()  # one transaction on the connection at a time
 
         if read_only:
             # No exclusive claim: read-only exists precisely so an operator can
@@ -725,10 +799,25 @@ class SqliteStore:
 
     # -- writing ----------------------------------------------------------
 
+    @_guarded
     def _write(self, operation: str, work: Callable[[sqlite3.Connection], None]) -> None:
-        """Run ``work`` as one immediate transaction, committed or rolled back."""
+        """Run ``work`` as one immediate transaction, committed or rolled back;
+        inside a :meth:`unit`, as part of the unit's transaction."""
         self._require_writable(operation)
         conn = self._conn
+        unit = self._unit
+        if unit is not None:
+            if unit.failed:
+                raise StorageError(
+                    f"cannot {operation}: an earlier write in this transaction failed"
+                )
+            unit.wrote = True
+            try:
+                work(conn)
+            except BaseException:
+                unit.failed = True  # partly written: the unit can only roll back
+                raise
+            return
         conn.execute("BEGIN IMMEDIATE")
         try:
             work(conn)
@@ -758,6 +847,73 @@ class SqliteStore:
             raise StorageError(f"cannot {operation}: {exc}") from exc
         finally:
             conn.close()
+
+    @contextmanager
+    def unit(self) -> Iterator[_SqliteUnit]:
+        """Make every commit in the block part of one transaction, committed
+        when the block ends: all of it durable, or none of it.
+
+        Rolled back instead if the block raises, the unit is abandoned, or a
+        write in it failed (and then :class:`StorageError` is raised, so a
+        caller that caught the write's own error still learns nothing was
+        committed).
+        """
+        self._require_writable("write the ledger")
+        with self._guard:
+            if self._unit is not None:
+                raise StorageError("a unit of work does not nest")
+            unit = _SqliteUnit()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise StorageError(f"cannot begin a ledger transaction: {exc}") from exc
+            self._unit = unit
+            try:
+                yield unit
+            except BaseException:
+                self._unit = None
+                self._rollback_unit()
+                raise
+            self._unit = None
+            if unit.abandoned or unit.failed:
+                self._rollback_unit()
+                if unit.failed:
+                    raise StorageError(
+                        "a write in this transaction failed, so none of it was committed"
+                    )
+                return
+            try:
+                self._commit_unit()
+            except BaseException:
+                self._rollback_unit()
+                raise
+            unit.committed = True
+
+    def _commit_unit(self) -> None:
+        try:
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            raise StorageError(f"the ledger transaction did not commit: {exc}") from exc
+
+    def _rollback_unit(self) -> None:
+        with suppress(sqlite3.Error):
+            self._conn.rollback()
+
+    @_guarded
+    def idempotency(self, keys: Sequence[str]) -> dict[str, IdempotencyRecord]:
+        """The calls recorded under ``keys``: those of them that were made."""
+        if not keys:
+            return {}
+        marks = ", ".join("?" * len(keys))
+        try:
+            rows = self._conn.execute(
+                "SELECT key, request, outcome, sequence, created_at FROM idempotency "  # noqa: S608
+                f"WHERE key IN ({marks})",
+                list(keys),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"cannot read the calls recorded under keys: {exc}") from exc
+        return {str(row[0]): _idempotency_record(row) for row in rows}
 
     def commit(self, batch: WriteBatch) -> None:
         """Durably apply one unit of work in a single transaction."""
@@ -800,6 +956,18 @@ class SqliteStore:
                 conn.execute(
                     "DELETE FROM open_authorizations WHERE authorization_id = ?",
                     (str(authorization_id),),
+                )
+            for record in batch.idempotency:
+                conn.execute(
+                    "INSERT INTO idempotency (key, request, outcome, sequence, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        record.key,
+                        record.request,
+                        record.outcome,
+                        record.sequence,
+                        _iso(record.created_at),
+                    ),
                 )
 
         count = len(batch.entries)
@@ -897,17 +1065,19 @@ class SqliteStore:
 
     @contextmanager
     def _read_transaction(self) -> Iterator[None]:
-        """Hold one read transaction, so several SELECTs see one snapshot."""
-        conn = self._conn
-        if conn.in_transaction:
-            yield
-            return
-        conn.execute("BEGIN")
-        try:
-            yield
-        finally:
-            with suppress(sqlite3.Error):
-                conn.rollback()
+        """Hold one read transaction, so several SELECTs see one snapshot.
+        Inside this thread's own write (a unit), the reads are the write's."""
+        with self._guard:
+            conn = self._conn
+            if conn.in_transaction:
+                yield
+                return
+            conn.execute("BEGIN")
+            try:
+                yield
+            finally:
+                with suppress(sqlite3.Error):
+                    conn.rollback()
 
     def load(self, *, from_checkpoint: bool = False) -> StoreImage:
         """Read every table in one consistent read.
@@ -945,6 +1115,7 @@ class SqliteStore:
             base=base,
         )
 
+    @_guarded
     def snapshot(
         self, *, after_sequence: int, after_control_row: int, authorizations: bool = True
     ) -> StoreDelta:
@@ -1055,6 +1226,7 @@ class SqliteStore:
                 return None
             return self._select_snapshot(sequence)
 
+    @_guarded
     def checkpoints(self) -> tuple[tuple[int, int, str], ...]:
         """Every well-formed CHECKPOINT entry: its own sequence, the sequence
         its snapshot is of, and the snapshot's digest, oldest first."""
@@ -1072,6 +1244,7 @@ class SqliteStore:
 
     # -- history ----------------------------------------------------------
 
+    @_guarded
     def head(self) -> tuple[int, str]:
         """The committed length and head hash."""
         with self._read_transaction():
@@ -1142,6 +1315,7 @@ class SqliteStore:
                 "WHERE " + " AND ".join(clauses), tuple(params), limit=limit
             )
 
+    @_guarded
     def released(self, hold_id: uuid.UUID) -> bool:
         """Whether an entry released the hold ``hold_id`` by name."""
         with self._read_transaction():
@@ -1158,6 +1332,7 @@ class SqliteStore:
         with self._read_transaction():
             return tuple(event for _, event in self._select_control_rows(after=0))
 
+    @_guarded
     def _control_high_water(self) -> int:
         row = self._conn.execute("SELECT max(id) FROM control_events").fetchone()
         return int(row[0]) if row is not None and row[0] is not None else 0
@@ -1191,6 +1366,7 @@ class SqliteStore:
         (it records its marks through :meth:`record_audit`)."""
         return SqliteStore(self._path, read_only=True)
 
+    @_guarded
     def audit_marks(self) -> tuple[AuditMark, ...]:
         """Every audit mark, oldest first."""
         with self._read_transaction():
@@ -1202,6 +1378,7 @@ class SqliteStore:
             ).fetchall()
         return tuple(_audit_mark(row) for row in rows)
 
+    @_guarded
     def audit_failure(self) -> AuditMark | None:
         """The newest audit mark, if it is a failure. A later mark that
         verified the chain supersedes an earlier failure."""
@@ -1314,6 +1491,7 @@ class SqliteStore:
 
     # -- lifecycle --------------------------------------------------------
 
+    @_guarded
     def close(self) -> None:
         try:
             self._conn.close()

@@ -76,7 +76,7 @@ import uuid
 import warnings
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import (
@@ -99,8 +99,11 @@ from agentgov.exceptions import (
     DenialOfWalletError,
     DoubleSpendError,
     DuplicateScopeError,
+    IdempotencyConflictError,
     LedgerIntegrityError,
+    ReadOnlyLedgerError,
     RunawayLoopDetectedError,
+    StorageError,
     SubBudgetAllocationError,
     UnknownScopeError,
 )
@@ -2371,6 +2374,30 @@ def _check_root(root: object, nodes: dict[str, BudgetNode]) -> str:
 # --------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class IdempotencyRecord:
+    """A call made under an idempotency key, and where its result was written.
+
+    Recorded in the same store transaction as the entries the call wrote, so
+    a key is recorded exactly when its call took effect. The record is not
+    part of the chain: what it vouches for is the entry it names, which is.
+
+    :ivar key: The caller's idempotency key.
+    :ivar request: The call: canonical JSON of its operation and arguments.
+    :ivar outcome: What the call returned, read back from :attr:`sequence`:
+        ``"authorization"`` (the hold placed there), ``"entry"`` (the entry)
+        or ``"node"`` (the scope the entry delegated to).
+    :ivar sequence: The entry the result is read back from.
+    :ivar created_at: When the call was made: that entry's timestamp.
+    """
+
+    key: str
+    request: str
+    outcome: str
+    sequence: int
+    created_at: datetime
+
+
 @dataclass(slots=True)
 class WriteBatch:
     """Every durable write one governor operation makes.
@@ -2390,6 +2417,8 @@ class WriteBatch:
     :ivar redeemed: Settlement claims these entries book, removed from the
         pending claims in the same transaction, so a claim is booked exactly
         once. Only a store that holds claims accepts them.
+    :ivar idempotency: The calls made under an idempotency key that these
+        entries are the result of.
     """
 
     entries: list[LedgerEntry] = field(default_factory=list)
@@ -2398,6 +2427,7 @@ class WriteBatch:
     opened: list[Authorization] = field(default_factory=list)
     closed: list[uuid.UUID] = field(default_factory=list)
     redeemed: list[uuid.UUID] = field(default_factory=list)
+    idempotency: list[IdempotencyRecord] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return bool(
@@ -2407,6 +2437,7 @@ class WriteBatch:
             or self.opened
             or self.closed
             or self.redeemed
+            or self.idempotency
         )
 
 
@@ -2632,6 +2663,9 @@ class Ledger:
         self._state = _ChainState()
         self._open_auths: dict[uuid.UUID, Authorization] = {}
         self._legacy_auth_ids: dict[uuid.UUID, uuid.UUID] = {}
+        # Calls made under an idempotency key, for a ledger with no store to
+        # record them in: kept as long as the entries are.
+        self._keys: dict[str, IdempotencyRecord] = {}
         if store is not None:
             # Fail closed: a database that has been tampered with, or that
             # was corrupted by a crash mid-write, must never be trusted
@@ -2751,6 +2785,14 @@ class Ledger:
                 hold_id: _authorization_for(hold) for hold_id, hold in state.holds.items()
             }
             self._legacy_auth_ids = {}
+
+    def _rewind(self, length: int) -> None:
+        """Take a ledger with no store back to its first ``length`` entries,
+        and forget the calls recorded after them: a transaction that did not
+        complete. Replays what is kept, as an open would. Lock held."""
+        assert self._store is None and self._entries is not None
+        self._adopt(self._entries[:length])
+        self._keys = {key: r for key, r in self._keys.items() if r.sequence <= length}
 
     def _resolve(self, entry_id: uuid.UUID) -> LedgerEntry | None:
         """The committed entry with this id, within this view, or ``None``."""
@@ -3034,6 +3076,9 @@ class Ledger:
             self._follow_holds(view)
             if self._entries is not None:
                 self._entries.extend(batch.entries)
+            if self._store is None:
+                for record in batch.idempotency:
+                    self._keys[record.key] = record
             # Formatting a line costs more than hashing it; skip both
             # renderings when nothing is listening.
             if audit_log.isEnabledFor(logging.INFO):
@@ -3434,6 +3479,165 @@ class JoinedTransaction:
         return claim
 
 
+class Transaction:
+    """A unit of work held open by :meth:`BudgetManager.transaction`.
+
+    Its methods are the governor's own, run inside the transaction: reads
+    are current, and every mutation joins the transaction's one commit. It
+    is used by the thread that opened it, inside its ``with`` block only.
+    """
+
+    __slots__ = ("_manager", "_open", "_owner", "_trips")
+
+    def __init__(self, manager: BudgetManager) -> None:
+        self._manager = manager
+        self._owner = threading.get_ident()
+        self._open = True
+        self._trips: list[tuple[str, str]] = []  # breaker trips recorded inside
+
+    def _governor(self) -> BudgetManager:
+        if not self._open:
+            raise RuntimeError(
+                "this transaction has ended; open another with BudgetManager.transaction()"
+            )
+        if threading.get_ident() != self._owner:
+            raise RuntimeError("a transaction is used only by the thread that opened it")
+        return self._manager
+
+    # -- reads, current inside a transaction --------------------------------
+
+    def available(self, scope_id: str) -> Decimal:
+        """:meth:`BudgetManager.available`, current."""
+        return self._governor().available(scope_id)
+
+    def subtree_available(self, scope_id: str) -> Decimal:
+        """:meth:`BudgetManager.subtree_available`, current."""
+        return self._governor().subtree_available(scope_id)
+
+    def is_halted(self, scope_id: str) -> bool:
+        """:meth:`BudgetManager.is_halted`, current."""
+        return self._governor().is_halted(scope_id)
+
+    def authorization(self, authorization_id: uuid.UUID | str) -> Authorization | None:
+        """:meth:`BudgetManager.authorization`, current."""
+        return self._governor().authorization(authorization_id)
+
+    # -- mutations, joining the transaction's commit ------------------------
+
+    def authorize(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str = "",
+        idempotency_key: str | None = None,
+    ) -> Authorization:
+        """:meth:`BudgetManager.authorize`, in this transaction."""
+        return self._governor().authorize(
+            scope_id, amount, memo=memo, idempotency_key=idempotency_key
+        )
+
+    def try_authorize(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str = "",
+        idempotency_key: str | None = None,
+    ) -> Authorization | None:
+        """:meth:`BudgetManager.try_authorize`, in this transaction."""
+        return self._governor().try_authorize(
+            scope_id, amount, memo=memo, idempotency_key=idempotency_key
+        )
+
+    def capture(
+        self,
+        authorization: Authorization,
+        actual_cost: Decimal | int | str,
+        *,
+        memo: str = "",
+        idempotency_key: str | None = None,
+    ) -> LedgerEntry:
+        """:meth:`BudgetManager.capture`, in this transaction."""
+        return self._governor().capture(
+            authorization, actual_cost, memo=memo, idempotency_key=idempotency_key
+        )
+
+    def void(
+        self, authorization: Authorization, *, memo: str = "", idempotency_key: str | None = None
+    ) -> LedgerEntry:
+        """:meth:`BudgetManager.void`, in this transaction."""
+        return self._governor().void(authorization, memo=memo, idempotency_key=idempotency_key)
+
+    def spend(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str = "",
+        idempotency_key: str | None = None,
+    ) -> LedgerEntry:
+        """:meth:`BudgetManager.spend`, in this transaction."""
+        return self._governor().spend(scope_id, amount, memo=memo, idempotency_key=idempotency_key)
+
+    def refund(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str = "",
+        reverses: LedgerEntry | uuid.UUID | None = None,
+        idempotency_key: str | None = None,
+    ) -> LedgerEntry:
+        """:meth:`BudgetManager.refund`, in this transaction."""
+        return self._governor().refund(
+            scope_id, amount, memo=memo, reverses=reverses, idempotency_key=idempotency_key
+        )
+
+    def fund(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str = "",
+        idempotency_key: str | None = None,
+    ) -> LedgerEntry:
+        """:meth:`BudgetManager.fund`, in this transaction."""
+        return self._governor().fund(scope_id, amount, memo=memo, idempotency_key=idempotency_key)
+
+    def delegate(
+        self,
+        parent_id: str,
+        child_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str = "",
+        idempotency_key: str | None = None,
+    ) -> BudgetNode:
+        """:meth:`BudgetManager.delegate`, in this transaction."""
+        return self._governor().delegate(
+            parent_id, child_id, amount, memo=memo, idempotency_key=idempotency_key
+        )
+
+    def release(
+        self, scope_id: str, amount: Decimal | int | str | None = None, *, memo: str = ""
+    ) -> Decimal:
+        """:meth:`BudgetManager.release`, in this transaction."""
+        return self._governor().release(scope_id, amount, memo=memo)
+
+    def anchor(self, scope_id: str, memo: str) -> LedgerEntry:
+        """:meth:`BudgetManager.anchor`, in this transaction."""
+        return self._governor().anchor(scope_id, memo)
+
+    def trip(self, scope_id: str, reason: str) -> None:
+        """:meth:`BudgetManager.trip`, in this transaction."""
+        self._governor().trip(scope_id, reason)
+
+    def reset(self, scope_id: str) -> None:
+        """:meth:`BudgetManager.reset`, in this transaction."""
+        self._governor().reset(scope_id)
+
+
 @dataclass(slots=True)
 class _Velocity:
     """A scope's recent authorizations, for the runaway-loop detector.
@@ -3502,13 +3706,18 @@ _R = TypeVar("_R")
 class _Request:
     """One caller's mutation, waiting for a unit of work to run it in."""
 
-    __slots__ = ("error", "settled", "value", "work")
+    __slots__ = ("error", "key", "settled", "value", "wake", "work")
 
-    def __init__(self, work: Callable[[], Any]) -> None:
+    def __init__(self, work: Callable[[], Any], key: str | None = None) -> None:
         self.work = work
+        self.key = key  # its idempotency key, looked up with the others queued
         self.value: Any = None
         self.error: BaseException | None = None
         self.settled = False
+        # Released once, to wake its caller alone: when the work is settled,
+        # or when the lead is handed to it.
+        self.wake = threading.Lock()
+        self.wake.acquire()
 
     def outcome(self) -> Any:
         if self.error is not None:
@@ -3523,10 +3732,67 @@ def _grouped(
 
     @functools.wraps(method)
     def grouped(self: BudgetManager, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
-        result: _R = self._submit(functools.partial(method, self, *args, **kwargs))
+        key = kwargs.get("idempotency_key")
+        work = functools.partial(method, self, *args, **kwargs)
+        result: _R = self._submit(work, key if isinstance(key, str) else None)
         return result
 
     return grouped
+
+
+_UNRECORDED: Final[Any] = object()
+"""No call was recorded under the key: the call is a new one."""
+
+_KEY_BYTES: Final = 255
+"""The most UTF-8 bytes an idempotency key may hold."""
+
+
+def _request_text(operation: str, **arguments: object) -> str:
+    """A call's identity: canonical JSON of its operation and its arguments,
+    each as the call used it (an amount as it was rounded to be posted)."""
+    document: dict[str, object] = {"op": operation}
+    for name, value in arguments.items():
+        if isinstance(value, Decimal):
+            value = _fixed(value)
+        elif isinstance(value, uuid.UUID):
+            value = str(value)
+        document[name] = value
+    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _operation_of(request: str) -> str:
+    """The operation a recorded request names, for an error message."""
+    try:
+        return str(json.loads(request)["op"])
+    except (ValueError, KeyError, TypeError):
+        return "an unreadable request"
+
+
+def _require_key(key: object) -> str:
+    """``key``, if it can be an idempotency key: text, at most 255 bytes of
+    UTF-8, with no control character."""
+    if not isinstance(key, str) or not key:
+        raise ValueError("an idempotency key must be a non-empty string")
+    problem = _check_text(key, "idempotency key", limit=_KEY_BYTES, identifier=True)
+    if problem is not None:
+        raise ValueError(problem)
+    return key
+
+
+@dataclass(slots=True)
+class _Call:
+    """A call made under an idempotency key, while it runs.
+
+    :ivar replayed: What the call returned when it was first made, if it
+        was: then it is not made again.
+    :ivar record: Its record, once its entries are committed with it.
+    """
+
+    key: str
+    request: str
+    outcome: str
+    replayed: Any = _UNRECORDED
+    record: IdempotencyRecord | None = None
 
 
 class BudgetManager:
@@ -3627,6 +3893,12 @@ class BudgetManager:
         self._lock = self._ledger.lock
         self._store: PersistenceStore | None = store
         self._shared: SharedStore | None = shared
+        # A single-writer store that can carry many commits in one
+        # transaction (SQLite) shares units of work too: one fsync for every
+        # caller queued, rather than one each.
+        self._grouping = shared is not None or (
+            store is not None and not store.read_only and hasattr(store, "unit")
+        )
         self._writing = False
         self._dirty = False
         self._depth = 0
@@ -3635,9 +3907,14 @@ class BudgetManager:
         self._signing = signing
         self._queue: list[_Request] = []
         self._queue_lock = threading.Lock()
-        self._settled = threading.Condition(self._queue_lock)  # work settled; a leader stood down
         self._leading = False
         self._contended = False  # the last catch-up found others' entries
+        self._transaction: Transaction | None = None
+        self._unit_session: WriterSession | None = None  # the shared store's, while one is open
+        # Within one unit of work: the calls made under a key and what each
+        # returned, and the keys already looked up in the store.
+        self._unit_calls: dict[str, tuple[IdempotencyRecord, Any]] = {}
+        self._key_cache: dict[str, IdempotencyRecord | None] = {}
         self._auditor: Any = None
         self._velocity: dict[str, _Velocity] = {}
         self._repairs: tuple[str, ...] = ()
@@ -4170,44 +4447,49 @@ class BudgetManager:
     _BATCH: Final = 256
     """The most mutations one unit of work runs."""
 
-    def _submit(self, work: Callable[[], _R]) -> _R:
+    def _submit(self, work: Callable[[], _R], key: str | None = None) -> _R:
         """Run ``work``, a mutation, in a unit of work it may share.
 
         On a shared ledger every mutation takes the fleet's writer lock,
-        catches up and commits. Callers of one governor that arrive together
-        share that: each queues its work and takes this governor's lock, and
-        the first to get it runs everything queued, in order, in one unit of
-        work: one lock, one catch-up, one commit. Each caller's own failure is
-        its own (a breaker trip recorded on the way still commits); a commit
-        that fails fails every mutation it carried. No result is returned
-        before the unit of work commits.
+        catches up and commits; on SQLite every one commits and syncs the
+        file. Callers of one governor that arrive together share that: each
+        queues its work and takes this governor's lock, and the first to get
+        it runs everything queued, in order, in one unit of work: one lock,
+        one catch-up, one commit. Each caller's own failure is its own (a
+        breaker trip recorded on the way still commits); a commit that fails
+        fails every mutation it carried, and the governor re-reads the
+        ledger. No result is returned before the unit of work commits.
 
         A caller that already holds this governor's lock (``ledger.lock``,
         around a check and the act it decides) runs its work there and then,
         alone: others' work never runs inside its critical section.
         """
         owned = getattr(self._lock, "_is_owned", None)
-        if self._shared is None or owned is None or owned():
+        if not self._grouping or owned is None or owned():
             return work()
-        request = _Request(work)
+        request = _Request(work, key)
         with self._queue_lock:
             self._queue.append(request)
-            # One leader at a time; the others wait to be told their work is
-            # settled, all at once, never queueing on the governor's lock.
-            while not request.settled and self._leading:
-                self._settled.wait()
+            led = self._leading
+            self._leading = True
+        if led:
+            # One leader at a time. The others wait, each to be woken alone
+            # (never queueing on the governor's lock): when their work is
+            # settled, or when the lead is handed to them.
+            request.wake.acquire()
             if request.settled:
                 result: _R = request.outcome()
                 return result
-            self._leading = True
         try:
             with self._lock:
                 while not request.settled:
                     self._lead()
         finally:
             with self._queue_lock:
-                self._leading = False
-                self._settled.notify_all()  # the next with work queued leads
+                successor = self._queue[0] if self._queue else None
+                self._leading = successor is not None
+            if successor is not None:
+                successor.wake.release()  # the oldest caller still queued leads next
         # A checkpoint come due, now that the units' callers have their
         # results and the next unit is free to begin.
         self._after_mutation()
@@ -4221,16 +4503,18 @@ class BudgetManager:
         lock, and again until it is empty: every caller that queued while the
         lock was awaited rides along."""
         batch: list[_Request] = []
+        unit: Any = None
         try:
-            with self._mutating(then=False):
+            with self._mutating(then=False), self._store_unit() as unit:
                 while len(batch) < self._BATCH:
                     with self._queue_lock:
                         room = self._BATCH - len(batch)
                         taken, self._queue = self._queue[:room], self._queue[room:]
                     if not taken:
                         break
+                    batch.extend(taken)
+                    self._look_up_calls([r.key for r in taken if r.key is not None])
                     for request in taken:
-                        batch.append(request)
                         try:
                             request.value = request.work()
                         except Exception as exc:  # its own: the others go on
@@ -4239,6 +4523,7 @@ class BudgetManager:
             # The unit of work did not commit, or never began: nothing it
             # wrote is durable, and nothing it returned stands. Work that
             # never ran because it could not begin fails the same way.
+            self._roll_back(len(self._ledger), unit)
             if not batch:
                 with self._queue_lock:
                     batch, self._queue = self._queue[: self._BATCH], self._queue[self._BATCH :]
@@ -4246,10 +4531,9 @@ class BudgetManager:
                 if request.error is None:
                     request.value, request.error = None, exc
         finally:
-            with self._queue_lock:
-                for request in batch:
-                    request.settled = True
-                self._settled.notify_all()
+            for request in batch:
+                request.settled = True
+                request.wake.release()
 
     @contextmanager
     def _mutating(self, *, then: bool = True) -> Iterator[None]:
@@ -4298,15 +4582,20 @@ class BudgetManager:
                     self._writing = True
                     try:
                         with shared.writer(**self._reading_ahead(shared)) as session:
+                            self._unit_session = session
                             self._follow(shared)
                             yield
                     finally:
                         self._writing = False
+                        self._unit_session = None
                         if session is not None and session.wrote and not session.committed:
                             self._dirty = True
                             self._recover(shared)
             finally:
                 self._depth -= 1
+                if not self._depth:
+                    self._unit_calls.clear()
+                    self._key_cache.clear()
         if then:
             self._after_mutation()
 
@@ -4387,7 +4676,6 @@ class BudgetManager:
         :raises ReadOnlyLedgerError: On a read-only view.
         :raises ValueError: If the ledger is empty.
         """
-        from agentgov.exceptions import ReadOnlyLedgerError
         from agentgov.storage import Snapshot
 
         store: Any = self._store
@@ -4495,6 +4783,115 @@ class BudgetManager:
                 f"{len(witnesses)} witnesses; " + "; ".join(refusals)
             )
         return checkpoint
+
+    @contextmanager
+    def transaction(self) -> Iterator[Transaction]:
+        """A unit of work the caller holds: current, atomic, one commit.
+
+        Inside the block, reads are current: on a shared ledger, the fleet's
+        writer lock is held and this view caught up under it, so no governor
+        writes between a check and the act it decides. Every mutation made
+        inside joins one commit, made when the block ends::
+
+            with gov.transaction() as txn:
+                if txn.available("researcher") >= cost:
+                    hold = txn.authorize("researcher", cost)
+
+        If the block raises, nothing it did is written: the store's
+        transaction rolls back and this view is rebuilt as it was. A breaker
+        trip recorded on the way (an overdraft attempt, a runaway loop) is the
+        breaker's, not the block's: it is then written on its own.
+
+        Other callers of this governor wait while the block runs, and on a
+        shared ledger every governor's writes wait too: keep it short, with no
+        call to anything slow inside. The governor's other methods may be
+        called inside it, from the same thread; they join it.
+
+        :raises ReadOnlyLedgerError: On a read-only view.
+        :raises RuntimeError: Inside another transaction of this governor, or
+            one of its mutations.
+        """
+        store = self._store
+        if store is not None and store.read_only:
+            raise ReadOnlyLedgerError("open a transaction")
+        with self._lock:
+            if self._depth or self._transaction is not None:
+                raise RuntimeError(
+                    "a transaction does not nest: not in another, nor in a mutation of this "
+                    "governor"
+                )
+            txn = Transaction(self)
+            self._transaction = txn
+            mark = len(self._ledger)
+            unit: Any = None
+            try:
+                with self._mutating(), self._store_unit() as unit:
+                    try:
+                        yield txn
+                    except BaseException:
+                        # The block failed: nothing it did is written.
+                        if unit is not None:
+                            unit.abandon()
+                        if self._unit_session is not None:
+                            self._unit_session.abandon()
+                        raise
+            except BaseException:
+                self._transaction = None
+                txn._open = False
+                self._roll_back(mark, unit)
+                self._retrip(txn._trips)
+                raise
+            finally:
+                self._transaction = None
+                txn._open = False
+
+    def _store_unit(self) -> AbstractContextManager[Any]:
+        """One store transaction for a whole :meth:`transaction`, from a
+        single-writer store that can defer its commits (SQLite). A shared
+        store's writer session is one already; a ledger with no store has
+        nothing to defer."""
+        store = self._store
+        if store is None or self._shared is not None or not hasattr(store, "unit"):
+            return nullcontext(None)
+        unit: AbstractContextManager[Any] = store.unit()
+        return unit
+
+    def _roll_back(self, mark: int, unit: Any) -> None:
+        """Rebuild this view after a transaction that did not commit. Lock held.
+
+        A shared ledger's view was re-read already, when the writer session
+        that wrote and did not commit ended. A single-writer store's is read
+        again; a ledger with no store replays what it keeps, to ``mark``."""
+        store = self._store
+        if store is None:
+            if len(self._ledger) > mark:
+                self._ledger._rewind(mark)
+            return
+        if unit is not None and unit.wrote and not unit.committed:
+            try:
+                self._reload(store)
+            except Exception as exc:
+                self._unusable = (
+                    f"a transaction did not commit, and the ledger could not be read again "
+                    f"after it: {exc}"
+                )
+                logger.warning("could not re-read the ledger after a rolled-back transaction")
+
+    def _retrip(self, trips: Sequence[tuple[str, str]]) -> None:
+        """Write the breaker trips a transaction that did not commit had
+        recorded, each in its own unit of work. A failure is logged: the
+        transaction's own error is the one raised."""
+        for scope_id, reason in trips:
+            try:
+                with self._mutating():
+                    self._trip(scope_id, reason)
+            except Exception:
+                logger.warning(
+                    "could not record the breaker trip of %r after the transaction that "
+                    "recorded it rolled back",
+                    scope_id,
+                    exc_info=True,
+                )
 
     @contextmanager
     def joined(self, connection: object) -> Iterator[JoinedTransaction]:
@@ -4824,21 +5221,30 @@ class BudgetManager:
         with self._lock:
             return tuple(self._state.nodes)
 
-    def available(self, scope_id: str) -> Decimal:
+    def available(self, scope_id: str, *, fresh: bool = False) -> Decimal:
         """Return ``scope_id``'s spendable balance, net of outstanding holds.
 
+        :param fresh: On a shared ledger, or a read-only view, catch up with
+            what other governors committed first. Otherwise the answer is as
+            of this view's last write or refresh. Inside :meth:`transaction`
+            every read is current.
         :raises UnknownScopeError: If no such scope is registered.
         """
+        if fresh:
+            self.refresh()
         with self._lock:
             self._require_node(scope_id)
             return self._ledger.balance(scope_id)
 
-    def subtree_available(self, scope_id: str) -> Decimal:
+    def subtree_available(self, scope_id: str, *, fresh: bool = False) -> Decimal:
         """Return the total spendable balance of ``scope_id`` and everything
         delegated beneath it.
 
+        :param fresh: Catch up first, as for :meth:`available`.
         :raises UnknownScopeError: If no such scope is registered.
         """
+        if fresh:
+            self.refresh()
         with self._lock:
             total = self._ledger.balance(scope_id)
             for node in self.descendants(scope_id):
@@ -4989,6 +5395,7 @@ class BudgetManager:
         amount: Decimal | int | str,
         *,
         memo: str = "",
+        idempotency_key: str | None = None,
     ) -> LedgerEntry:
         """Top up an existing root scope from the external treasury.
 
@@ -4999,6 +5406,9 @@ class BudgetManager:
         :param scope_id: The root scope to credit.
         :param amount: The amount to add to its envelope.
         :param memo: Free-form audit context.
+        :param idempotency_key: Names this call, so a retry of it (after a
+            lost answer, say) returns its result and writes nothing; another
+            call under the key raises :class:`IdempotencyConflictError`.
         :returns: The committed funding entry.
         :raises UnknownScopeError: If no such scope is registered.
         :raises ValueError: If ``scope_id`` is not a root or ``amount`` is
@@ -5009,6 +5419,12 @@ class BudgetManager:
             raise ValueError(f"funding must be positive, got {credited}")
 
         with self._mutating():
+            call = self._called(
+                idempotency_key, "entry", "fund", scope_id=scope_id, amount=credited, memo=memo
+            )
+            if call is not None and call.replayed is not _UNRECORDED:
+                replayed: LedgerEntry = call.replayed
+                return replayed
             node = self._require_node(scope_id)
             if node.parent_id is not None:
                 raise ValueError(f"scope {scope_id!r} is not a root; use delegate() to fund it")
@@ -5025,8 +5441,8 @@ class BudgetManager:
                     )
                 ]
             )
-            self._commit(pending)
-            return entry
+            self._commit(pending, call, entry)
+            return self._answered(call, entry)
 
     @_grouped
     def delegate(
@@ -5036,6 +5452,7 @@ class BudgetManager:
         amount: Decimal | int | str,
         *,
         memo: str = "",
+        idempotency_key: str | None = None,
     ) -> BudgetNode:
         """Sub-delegate part of ``parent_id``'s budget to a new child scope.
 
@@ -5047,6 +5464,9 @@ class BudgetManager:
         :param child_id: Identifier for the new sub-agent scope.
         :param amount: The sub-limit to grant.
         :param memo: Free-form audit context.
+        :param idempotency_key: Names this call, so a retry of it (after a
+            lost answer, say) returns its result and writes nothing; another
+            call under the key raises :class:`IdempotencyConflictError`.
         :returns: The newly created child node.
         :raises UnknownScopeError: If ``parent_id`` is not registered.
         :raises DuplicateScopeError: If ``child_id`` is already registered.
@@ -5062,6 +5482,18 @@ class BudgetManager:
         _require_scope_id(child_id)
 
         with self._mutating():
+            call = self._called(
+                idempotency_key,
+                "node",
+                "delegate",
+                parent_id=parent_id,
+                child_id=child_id,
+                amount=granted,
+                memo=memo,
+            )
+            if call is not None and call.replayed is not _UNRECORDED:
+                replayed: BudgetNode = call.replayed
+                return replayed
             parent = self._require_node(parent_id)
             if child_id in self._state.nodes:
                 raise DuplicateScopeError(child_id)
@@ -5082,7 +5514,7 @@ class BudgetManager:
 
             note = memo or f"sub-budget delegated to {child_id}"
             pending = self._ledger._begin()
-            pending.post(
+            _, credit = pending.post(
                 [
                     LedgerLine(
                         entry_type=EntryType.ALLOCATION,
@@ -5102,8 +5534,8 @@ class BudgetManager:
                     ),
                 ]
             )
-            self._commit(pending)
-            return self._state.nodes[child_id]
+            self._commit(pending, call, credit)
+            return self._answered(call, self._state.nodes[child_id])
 
     @_grouped
     def release(
@@ -5174,6 +5606,7 @@ class BudgetManager:
         amount: Decimal | int | str,
         *,
         memo: str = "",
+        idempotency_key: str | None = None,
     ) -> Authorization:
         """Place an authorization hold before a billable call is made.
 
@@ -5188,6 +5621,9 @@ class BudgetManager:
         :param scope_id: The scope that will make the call.
         :param amount: The estimated maximum cost of the call.
         :param memo: Free-form audit context.
+        :param idempotency_key: Names this call, so a retry of it (after a
+            lost answer, say) returns its result and writes nothing; another
+            call under the key raises :class:`IdempotencyConflictError`.
         :returns: The :class:`Authorization` to settle with :meth:`capture`
             or :meth:`void`.
         :raises UnknownScopeError: If no such scope is registered.
@@ -5202,17 +5638,64 @@ class BudgetManager:
             is still refused, but the subtree keeps running.
         :raises ValueError: If ``amount`` is not positive.
         """
+        hold = self._authorize(scope_id, amount, memo, idempotency_key, trip=True)
+        assert hold is not None
+        return hold
+
+    @_grouped
+    def try_authorize(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str = "",
+        idempotency_key: str | None = None,
+    ) -> Authorization | None:
+        """Place a hold if ``scope_id`` can pay for it; refuse quietly if not.
+
+        :meth:`authorize` without the breaker's answer to an overdraft:
+        ``None``, no trip and nothing written when ``amount`` exceeds the
+        available balance. The check and the hold are one step, under the
+        fleet's writer lock on a shared ledger, so a caller can ask whether
+        it can afford a call and hold the funds if so, with no other writer
+        between. A halted scope still raises :class:`CircuitOpenError`, and a
+        runaway loop still trips, as they do for :meth:`authorize`.
+
+        :param idempotency_key: As for :meth:`authorize`, whose calls it
+            shares: under one key, the two are the same call. A refusal
+            records nothing, so a retry is decided again.
+        :returns: The hold, or ``None`` if the scope cannot pay.
+        """
+        return self._authorize(scope_id, amount, memo, idempotency_key, trip=False)
+
+    def _authorize(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        memo: str,
+        key: str | None,
+        *,
+        trip: bool,
+    ) -> Authorization | None:
         held = _cost(amount)
         if held <= ZERO:
             raise ValueError(f"authorization amount must be positive, got {held}")
 
         with self._mutating():
+            call = self._called(
+                key, "authorization", "authorize", scope_id=scope_id, amount=held, memo=memo
+            )
+            if call is not None and call.replayed is not _UNRECORDED:
+                replayed: Authorization = call.replayed
+                return replayed
             self._require_node(scope_id)
             self._assert_not_halted(scope_id)
             self._record_velocity(scope_id)
 
             available = self._ledger.balance(scope_id)
             if held > available:
+                if not trip:
+                    return None
                 if not self._policy.trip_on_overdraft:
                     # Advisory mode: refuse the spend but leave siblings running.
                     raise BudgetExceededError(held, available, scope_id)
@@ -5235,8 +5718,8 @@ class BudgetManager:
                     )
                 ]
             )
-            self._commit(pending)
-            return self._open_auths[entry.entry_id]
+            self._commit(pending, call, entry)
+            return self._answered(call, self._open_auths[entry.entry_id])
 
     @_grouped
     def capture(
@@ -5245,6 +5728,7 @@ class BudgetManager:
         actual_cost: Decimal | int | str,
         *,
         memo: str = "",
+        idempotency_key: str | None = None,
     ) -> LedgerEntry:
         """Settle an authorization at its true cost.
 
@@ -5267,6 +5751,10 @@ class BudgetManager:
         :param authorization: The hold returned by :meth:`authorize`.
         :param actual_cost: The true cost incurred.
         :param memo: Free-form audit context.
+        :param idempotency_key: Names this call, so a retry of it (after a
+            lost answer, say) returns its result and writes nothing; another
+            call under the key raises :class:`IdempotencyConflictError`. A capture that overdrew
+            raised once, when it was made; its retry returns the spend.
         :returns: The committed :attr:`EntryType.SPEND` entry.
         :raises DoubleSpendError: If this authorization was already settled.
         :raises DenialOfWalletError: If the settled cost overdrew the scope.
@@ -5277,11 +5765,29 @@ class BudgetManager:
             raise ValueError(f"actual cost must not be negative, got {settled}")
 
         with self._mutating():
+            call = self._called(
+                idempotency_key,
+                "entry",
+                "capture",
+                authorization_id=authorization.authorization_id,
+                actual_cost=settled,
+                memo=memo,
+            )
+            if call is not None and call.replayed is not _UNRECORDED:
+                replayed: LedgerEntry = call.replayed
+                return replayed
+            return self._capture(authorization, settled, memo, call)
+
+    def _capture(
+        self, authorization: Authorization, settled: Decimal, memo: str, call: _Call | None
+    ) -> LedgerEntry:
+        """Settle ``authorization`` at ``settled``. Inside a mutation."""
+        with self._mutating():
             self._require_open_authorization(authorization, "was already settled")
 
             if settled == ZERO:
                 # Nothing was billed; the hold is simply lifted.
-                return self._void_locked(authorization, memo or "captured at zero cost")
+                return self._void_locked(authorization, memo or "captured at zero cost", call)
 
             scope_id = authorization.scope_id
             hold_id = authorization.entry.entry_id
@@ -5327,7 +5833,8 @@ class BudgetManager:
             # Only once the settlement is durable does the hold leave the open
             # set: a failed commit leaves it open for a retry or an operator to
             # reconcile, instead of orphaning it.
-            self._commit(pending)
+            self._commit(pending, call, spend_entry)
+            self._answered(call, spend_entry)
 
             if overdraft is not None:
                 raise DenialOfWalletError(
@@ -5339,17 +5846,36 @@ class BudgetManager:
             return spend_entry
 
     @_grouped
-    def void(self, authorization: Authorization, *, memo: str = "") -> LedgerEntry:
+    def void(
+        self,
+        authorization: Authorization,
+        *,
+        memo: str = "",
+        idempotency_key: str | None = None,
+    ) -> LedgerEntry:
         """Cancel an authorization without spending, returning the held funds.
 
         :param authorization: The hold to cancel.
         :param memo: Free-form audit context.
+        :param idempotency_key: Names this call, so a retry of it (after a
+            lost answer, say) returns its result and writes nothing; another
+            call under the key raises :class:`IdempotencyConflictError`.
         :returns: The committed :attr:`EntryType.HOLD_VOID` entry.
         :raises DoubleSpendError: If this authorization was already settled.
         """
         with self._mutating():
+            call = self._called(
+                idempotency_key,
+                "entry",
+                "void",
+                authorization_id=authorization.authorization_id,
+                memo=memo,
+            )
+            if call is not None and call.replayed is not _UNRECORDED:
+                replayed: LedgerEntry = call.replayed
+                return replayed
             self._require_open_authorization(authorization, "was already settled")
-            return self._void_locked(authorization, memo or "authorization voided")
+            return self._void_locked(authorization, memo or "authorization voided", call)
 
     @_grouped
     def spend(
@@ -5358,6 +5884,7 @@ class BudgetManager:
         amount: Decimal | int | str,
         *,
         memo: str = "",
+        idempotency_key: str | None = None,
     ) -> LedgerEntry:
         """Authorize and capture a known cost in one step.
 
@@ -5369,11 +5896,21 @@ class BudgetManager:
         :param scope_id: The spending scope.
         :param amount: The exact cost.
         :param memo: Free-form audit context.
+        :param idempotency_key: Names this call, so a retry of it (after a
+            lost answer, say) returns its result and writes nothing; another
+            call under the key raises :class:`IdempotencyConflictError`.
         :returns: The committed spend entry.
         """
+        cost = _cost(amount)
         with self._mutating():
-            auth = self.authorize(scope_id, amount, memo=memo)
-            return self.capture(auth, amount, memo=memo)
+            call = self._called(
+                idempotency_key, "entry", "spend", scope_id=scope_id, amount=cost, memo=memo
+            )
+            if call is not None and call.replayed is not _UNRECORDED:
+                replayed: LedgerEntry = call.replayed
+                return replayed
+            auth = self.authorize(scope_id, cost, memo=memo)
+            return self._capture(auth, cost, memo, call)
 
     @_grouped
     def refund(
@@ -5383,6 +5920,7 @@ class BudgetManager:
         *,
         memo: str = "",
         reverses: LedgerEntry | uuid.UUID | None = None,
+        idempotency_key: str | None = None,
     ) -> LedgerEntry:
         """Record a vendor refund of previously settled spend.
 
@@ -5401,6 +5939,9 @@ class BudgetManager:
         :param memo: Free-form audit context.
         :param reverses: The SPEND entry (or its ``entry_id``) this refunds.
             Refunds that name no spend are deprecated, and an error in 2.0.
+        :param idempotency_key: Names this call, so a retry of it (after a
+            lost answer, say) returns its result and writes nothing; another
+            call under the key raises :class:`IdempotencyConflictError`.
         :returns: The committed :attr:`EntryType.REVERSAL` entry.
         :raises UnknownScopeError: If no such scope is registered.
         :raises ValueError: If ``amount`` is not positive; if ``reverses`` is
@@ -5419,11 +5960,24 @@ class BudgetManager:
                 stacklevel=2,
             )
 
+        named = reverses.entry_id if isinstance(reverses, LedgerEntry) else reverses
         with self._mutating():
+            call = self._called(
+                idempotency_key,
+                "entry",
+                "refund",
+                scope_id=scope_id,
+                amount=credited,
+                memo=memo,
+                reverses=named,
+            )
+            if call is not None and call.replayed is not _UNRECORDED:
+                replayed: LedgerEntry = call.replayed
+                return replayed
             self._require_node(scope_id)
             ref: uuid.UUID | None = None
-            if reverses is not None:
-                ref = reverses.entry_id if isinstance(reverses, LedgerEntry) else reverses
+            if named is not None:
+                ref = named
                 spend = self._ledger._resolve(ref)
                 if spend is None or spend.entry_type is not EntryType.SPEND:
                     raise ValueError(f"{ref} is not a spend this ledger holds")
@@ -5461,8 +6015,8 @@ class BudgetManager:
                     )
                 ]
             )
-            self._commit(pending)
-            return entry
+            self._commit(pending, call, entry)
+            return self._answered(call, entry)
 
     @_grouped
     def anchor(self, scope_id: str, memo: str) -> LedgerEntry:
@@ -5580,14 +6134,44 @@ class BudgetManager:
 
     # -- circuit breaker --------------------------------------------------
 
-    def is_halted(self, scope_id: str) -> bool:
+    def is_halted(self, scope_id: str, *, fresh: bool = False) -> bool:
         """Whether ``scope_id`` is halted by its own breaker or an ancestor's.
 
+        :param fresh: Catch up first, as for :meth:`available`.
         :raises UnknownScopeError: If no such scope is registered.
         """
+        if fresh:
+            self.refresh()
         with self._lock:
             self._require_node(scope_id)
             return self._halted_by(scope_id) is not None
+
+    def authorization(self, authorization_id: uuid.UUID | str) -> Authorization | None:
+        """The open authorization with this id: to capture or void a hold
+        placed elsewhere (another host, another governor), given its id.
+
+        On a shared ledger, or a read-only view, a hold this view has not
+        seen is looked for again after catching up.
+
+        :returns: The hold, or ``None`` if none with this id is open: never
+            placed, or already captured or voided.
+        :raises ValueError: If ``authorization_id`` is not a UUID.
+        """
+        wanted = (
+            authorization_id
+            if isinstance(authorization_id, uuid.UUID)
+            else uuid.UUID(authorization_id)
+        )
+        with self._lock:
+            found = self._open_auths.get(wanted)
+            if found is not None or self._depth:
+                return found
+        store = self._store
+        if self._shared is None and (store is None or not store.read_only):
+            return None
+        self.refresh()
+        with self._lock:
+            return self._open_auths.get(wanted)
 
     def halted_by(self, scope_id: str) -> str | None:
         """Return the scope whose open breaker halts ``scope_id``, if any.
@@ -5739,17 +6323,126 @@ class BudgetManager:
 
     # -- internals --------------------------------------------------------
 
-    def _commit(self, pending: _Pending) -> None:
+    def _commit(
+        self, pending: _Pending, call: _Call | None = None, result: LedgerEntry | None = None
+    ) -> None:
         """Make a unit of work durable, then visible, here and in the ledger.
 
         The ledger writes the entries with the cache rows they imply and only
         then merges them; this manager then follows what they opened, closed
-        and recorded. Lock held.
+        and recorded. With ``call``, the call made under an idempotency key
+        is recorded in the same write, its result read back from ``result``.
+        Lock held.
         """
+        record: IdempotencyRecord | None = None
+        if call is not None:
+            assert result is not None
+            record = IdempotencyRecord(
+                key=call.key,
+                request=call.request,
+                outcome=call.outcome,
+                sequence=result.sequence,
+                created_at=result.timestamp,
+            )
+            pending.batch.idempotency.append(record)
         controls = [e for e in pending.entries if e.entry_type in _CONTROL_TYPES]
         self._ledger._commit(pending)
+        if call is not None:
+            call.record = record
         for entry in controls:
             self._log_control(entry)
+
+    # -- idempotency keys -------------------------------------------------
+
+    def _called(
+        self, key: str | None, outcome: str, operation: str, **arguments: object
+    ) -> _Call | None:
+        """The call being made under ``key``, if it has one, with what it
+        returned when it was first made, if it was. Inside a mutation.
+
+        :param outcome: What the call returns: ``"authorization"``,
+            ``"entry"`` or ``"node"``.
+        :raises IdempotencyConflictError: If ``key`` was used for another call.
+        :raises ValueError: If ``key`` cannot be an idempotency key.
+        """
+        if key is None:
+            return None
+        call = _Call(_require_key(key), _request_text(operation, **arguments), outcome)
+        running = self._unit_calls.get(key)
+        if running is not None:
+            made, result = running
+            self._match(call, made)
+            call.replayed = result
+            return call
+        record = self._recorded(key)
+        if record is not None:
+            self._match(call, record)
+            call.replayed = self._result_of(record)
+        return call
+
+    @staticmethod
+    def _match(call: _Call, record: IdempotencyRecord) -> None:
+        if record.request != call.request:
+            raise IdempotencyConflictError(call.key, _operation_of(record.request))
+
+    def _answered(self, call: _Call | None, result: _R) -> _R:
+        """``result``, as what the call made under its key returned, for a
+        retry within the same unit of work. Inside a mutation."""
+        if call is not None and call.record is not None:
+            self._unit_calls[call.key] = (call.record, result)
+        return result
+
+    def _recorded(self, key: str) -> IdempotencyRecord | None:
+        """The call recorded under ``key``, if any. Inside a mutation: on a
+        shared ledger, under the writer lock, so no other governor is making
+        it meanwhile."""
+        if key in self._key_cache:
+            return self._key_cache[key]
+        store = self._store
+        if store is None:
+            return self._ledger._keys.get(key)
+        found = self._recorded_calls(store, [key]).get(key)
+        self._key_cache[key] = found
+        return found
+
+    def _look_up_calls(self, keys: list[str]) -> None:
+        """Read the calls recorded under ``keys``, in one query, for the unit
+        of work about to run the calls made under them. Inside a mutation."""
+        store = self._store
+        wanted = [k for k in dict.fromkeys(keys) if k not in self._unit_calls]
+        wanted = [k for k in wanted if k not in self._key_cache]
+        if store is None or not wanted:
+            return
+        found = self._recorded_calls(store, wanted)
+        for key in wanted:
+            self._key_cache[key] = found.get(key)
+
+    @staticmethod
+    def _recorded_calls(store: PersistenceStore, keys: list[str]) -> dict[str, IdempotencyRecord]:
+        lookup = getattr(store, "idempotency", None)
+        if lookup is None:
+            raise StorageError("this ledger's store keeps no record of calls made under a key")
+        found: dict[str, IdempotencyRecord] = lookup(keys)
+        return found
+
+    def _result_of(self, record: IdempotencyRecord) -> Any:
+        """What the call recorded under a key returned, read back from the
+        entry its record names, which must be what that call wrote."""
+        entry = self._ledger.entry(record.sequence)
+        result: Any = None
+        if entry is not None:
+            if record.outcome == "entry":
+                result = entry
+            elif record.outcome == "authorization" and entry.entry_type is EntryType.HOLD:
+                result = _authorization_for(entry)
+            elif record.outcome == "node" and entry.entry_type is EntryType.ALLOCATION:
+                result = self._state.nodes.get(entry.scope_id)
+        if result is None:
+            raise LedgerIntegrityError(
+                f"the call recorded under idempotency key {record.key!r} names entry "
+                f"{record.sequence} as its {record.outcome}, and this ledger holds no such entry"
+            )
+        return result
 
     def _require_node(self, scope_id: str) -> BudgetNode:
         """Return the node for ``scope_id`` or raise. Caller holds the lock."""
@@ -5794,12 +6487,18 @@ class BudgetManager:
             raise RunawayLoopDetectedError(scope_id, count, window)
 
     def _trip(self, scope_id: str, reason: str) -> None:
-        """Latch the breaker for ``scope_id`` in its own unit of work. Lock held."""
+        """Latch the breaker for ``scope_id`` in its own unit of work. Lock held.
+
+        Inside a transaction, the trip joins its commit; if the transaction
+        does not commit, the trip is written on its own afterwards (it is the
+        breaker's, not the caller's work)."""
         if self._state.trip_of(scope_id) is not None:
             return
         pending = self._ledger._begin()
         self._stage_trip(pending, scope_id, reason)
         self._commit(pending)
+        if self._transaction is not None:
+            self._transaction._trips.append((scope_id, reason))
 
     def _stage_trip(self, pending: _Pending, scope_id: str, reason: str) -> LedgerEntry | None:
         """Add a trip to a unit of work, unless the scope is already latched."""
@@ -5868,7 +6567,9 @@ class BudgetManager:
                 authorization.scope_id, str(authorization.authorization_id), detail
             )
 
-    def _void_locked(self, authorization: Authorization, memo: str) -> LedgerEntry:
+    def _void_locked(
+        self, authorization: Authorization, memo: str, call: _Call | None = None
+    ) -> LedgerEntry:
         """Release a hold and close its authorization in one unit of work. Lock held."""
         pending = self._ledger._begin()
         (entry,) = pending.post(
@@ -5884,8 +6585,8 @@ class BudgetManager:
                 )
             ]
         )
-        self._commit(pending)
-        return entry
+        self._commit(pending, call, entry)
+        return self._answered(call, entry)
 
 
 _VERIFY_POLICIES: Final = frozenset({"checkpoint", "full"})

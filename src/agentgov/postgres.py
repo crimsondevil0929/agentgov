@@ -71,6 +71,7 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
+import threading
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
@@ -84,6 +85,7 @@ from agentgov.core import (
     BudgetNode,
     ControlEvent,
     EntryType,
+    IdempotencyRecord,
     LedgerEntry,
     SettlementClaim,
     WriteBatch,
@@ -106,6 +108,7 @@ from agentgov.storage import (
     Snapshot,
     StoreDelta,
     StoreImage,
+    _guarded,
 )
 
 try:
@@ -246,6 +249,10 @@ class _Session:
         self.batches: list[WriteBatch] = []
         self.pending = 0
 
+    def abandon(self) -> None:
+        """Roll the session back when it ends, whatever it wrote."""
+        self.failed = True
+
 
 class PostgresStore:
     """A :class:`~agentgov.storage.SharedStore` in a PostgreSQL schema.
@@ -304,6 +311,7 @@ class PostgresStore:
         self._rendered: dict[str, str] | None = None  # see _templates
         self._key: bytes | None = None
         self._sql = _Statements(schema, _lock_keys(schema), self._lock_timeout_ms)
+        self._guard = threading.RLock()  # one transaction on the connection at a time
         self._conn = self._connect()
         try:
             self._version = self._open()
@@ -474,28 +482,30 @@ class PostgresStore:
             ``lock_timeout``, or the database could not be reached.
         """
         self._require_writable("write the ledger")
-        if self._session is not None:
-            if self._session.token is not None:
-                raise StorageError(
-                    "cannot open a writer session inside a joined transaction: the joined "
-                    "transaction holds the writer lock, so this would wait on itself"
-                )
-            yield self._session
-            return
-        after = None if after_sequence is None else (after_sequence, after_control_row or 0)
-        head, delta = self._begin(after)
-        session = _Session(self._conn)
-        session.head, session.delta, session.after = head, delta, after
-        self._session = session
-        try:
-            yield session
-        except BaseException:
+        with self._guard:  # held for the session: its transaction is the connection's
+            if self._session is not None:
+                if self._session.token is not None:
+                    raise StorageError(
+                        "cannot open a writer session inside a joined transaction: the joined "
+                        "transaction holds the writer lock, so this would wait on itself"
+                    )
+                yield self._session
+                return
+            after = None if after_sequence is None else (after_sequence, after_control_row or 0)
+            head, delta = self._begin(after)
+            session = _Session(self._conn)
+            session.head, session.delta, session.after = head, delta, after
+            self._session = session
+            try:
+                yield session
+            except BaseException:
+                self._session = None
+                self._end(session)
+                raise
             self._session = None
             self._end(session)
-            raise
-        self._session = None
-        self._end(session)
 
+    @_guarded
     def writer_lock_held(self, timeout: float = 0.1) -> bool:
         """Whether another transaction holds this schema's writer lock: it is
         not granted within ``timeout`` seconds.
@@ -658,10 +668,12 @@ class PostgresStore:
         controls: list[ControlEvent] = []
         opened: dict[Any, Authorization] = {}
         closed: list[Any] = []
+        calls: list[IdempotencyRecord] = []
         for batch in batches:
             for node in batch.nodes:
                 nodes[node.scope_id] = node
             controls.extend(batch.control_events)
+            calls.extend(batch.idempotency)
             for auth in batch.opened:
                 opened[auth.authorization_id] = auth
             for authorization_id in batch.closed:
@@ -683,6 +695,9 @@ class PostgresStore:
         if closed:
             ids = ", ".join([_literal(authorization_id) for authorization_id in closed])
             statements.append(text["close"] + ids + ")")
+        if calls:
+            rows = ", ".join([_values(_idempotency_row(record)) for record in calls])
+            statements.append(text["keys"] + rows)
         return statements
 
     def _end(self, session: _Session) -> None:
@@ -774,20 +789,22 @@ class PostgresStore:
         ``REPEATABLE READ`` transaction on this store's own connection, so
         several SELECTs see one snapshot of what is committed.
         """
-        if self._in_own_session():
-            self._flush()
-            yield
-            return
-        conn = self._live()
-        with self._errors("begin a read"):
-            conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        try:
-            yield
-        finally:
-            self._rollback_quietly()
+        with self._guard:
+            if self._in_own_session():
+                self._flush()
+                yield
+                return
+            conn = self._live()
+            with self._errors("begin a read"):
+                conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            try:
+                yield
+            finally:
+                self._rollback_quietly()
 
     # -- writing ----------------------------------------------------------
 
+    @_guarded
     def commit(self, batch: WriteBatch) -> None:
         """Write one unit of work into the open session's transaction.
 
@@ -841,6 +858,8 @@ class PostgresStore:
                 cur.execute(self._sql.insert_authorization, _authorization_row(auth))
             for authorization_id in batch.closed:
                 cur.execute(self._sql.delete_authorization, (authorization_id,))
+            for record in batch.idempotency:
+                cur.execute(self._sql.insert_idempotency, _idempotency_row(record))
             if batch.redeemed:
                 # Booked exactly once: the claims leave in the same
                 # transaction as the entries that book them, and every one of
@@ -853,6 +872,7 @@ class PostgresStore:
                         f"{cur.rowcount} were still pending; a claim is booked once"
                     )
 
+    @_guarded
     def rebuild_caches(
         self,
         *,
@@ -908,32 +928,33 @@ class PostgresStore:
             the transaction's own ``lock_timeout``.
         """
         self._require_writable("join a transaction")
-        if self._session is not None:
-            raise StorageError("cannot join a transaction inside another writer session")
-        status = connection.info.transaction_status
-        if status is not psycopg.pq.TransactionStatus.INTRANS:
-            raise StorageError(
-                f"a governor joins an open transaction, and this connection's is {status.name}"
-            )
-        key = self._join_key()
-        try:
-            connection.execute(self._sql.lock_in_transaction)
-            row = connection.execute("SELECT pg_current_xact_id()::text").fetchone()
-        except psycopg.errors.LockNotAvailable as exc:
-            raise LedgerConflictError(
-                f"the joined transaction was not granted the writer lock of ledger schema "
-                f"{self._schema!r} within its lock_timeout; another governor holds it"
-            ) from exc
-        except psycopg.Error as exc:
-            raise StorageError(f"cannot join the transaction: {exc}") from exc
-        assert row is not None
-        token = hashlib.sha256(key + str(row[0]).encode()).digest()
-        session = _Session(connection, token=token)
-        self._session = session
-        try:
-            yield session
-        finally:
-            self._session = None
+        with self._guard:
+            if self._session is not None:
+                raise StorageError("cannot join a transaction inside another writer session")
+            status = connection.info.transaction_status
+            if status is not psycopg.pq.TransactionStatus.INTRANS:
+                raise StorageError(
+                    f"a governor joins an open transaction, and this connection's is {status.name}"
+                )
+            key = self._join_key()
+            try:
+                connection.execute(self._sql.lock_in_transaction)
+                row = connection.execute("SELECT pg_current_xact_id()::text").fetchone()
+            except psycopg.errors.LockNotAvailable as exc:
+                raise LedgerConflictError(
+                    f"the joined transaction was not granted the writer lock of ledger schema "
+                    f"{self._schema!r} within its lock_timeout; another governor holds it"
+                ) from exc
+            except psycopg.Error as exc:
+                raise StorageError(f"cannot join the transaction: {exc}") from exc
+            assert row is not None
+            token = hashlib.sha256(key + str(row[0]).encode()).digest()
+            session = _Session(connection, token=token)
+            self._session = session
+            try:
+                yield session
+            finally:
+                self._session = None
 
     def claim(self, claim: SettlementClaim) -> None:
         """Record ``claim`` in the joined transaction.
@@ -961,6 +982,7 @@ class PostgresStore:
             )
         session.wrote = True
 
+    @_guarded
     def pending_claims(self) -> tuple[SettlementClaim, ...]:
         """Every committed claim not yet booked into the chain, oldest first."""
         with self._reading(), self._errors("read the pending settlement claims"):
@@ -976,6 +998,7 @@ class PostgresStore:
             for row in rows
         )
 
+    @_guarded
     def grant_join(self, *roles: str) -> None:
         """Let ``roles`` settle with the ledger in transactions of their own.
 
@@ -1005,6 +1028,7 @@ class PostgresStore:
 
     # -- reading ----------------------------------------------------------
 
+    @_guarded
     def head(self) -> tuple[int, str]:
         """The committed length and head hash. See
         :meth:`agentgov.storage.SharedStore.head`."""
@@ -1018,6 +1042,7 @@ class PostgresStore:
             return 0, GENESIS_HASH
         return int(row[0]), str(row[1])
 
+    @_guarded
     def load(self, *, from_checkpoint: bool = False) -> StoreImage:
         """Read every table in one consistent read.
 
@@ -1051,6 +1076,7 @@ class PostgresStore:
             base=base,
         )
 
+    @_guarded
     def snapshot(
         self, *, after_sequence: int, after_control_row: int, authorizations: bool = True
     ) -> StoreDelta:
@@ -1089,6 +1115,32 @@ class PostgresStore:
             control_high_water=max((row_id for row_id, _ in rows), default=after_control_row),
         )
 
+    @_guarded
+    def idempotency(self, keys: Sequence[str]) -> dict[str, IdempotencyRecord]:
+        """The calls recorded under ``keys``: those of them that were made.
+
+        Inside a writer session, read in its transaction, under the writer
+        lock: no other governor can record one meanwhile. What the session
+        has written itself is not sent before it commits, and not read here:
+        the governor keeps the calls of its own unit of work.
+        """
+        if not keys:
+            return {}
+        conn = self._conn if self._session is not None else self._live()
+        with self._errors("read the calls recorded under keys"):
+            rows = conn.execute(self._sql.select_idempotency, (list(keys),)).fetchall()
+        return {
+            str(row[0]): IdempotencyRecord(
+                key=str(row[0]),
+                request=str(row[1]),
+                outcome=str(row[2]),
+                sequence=int(row[3]),
+                created_at=_parse_iso(str(row[4])),
+            )
+            for row in rows
+        }
+
+    @_guarded
     def _read_after(self, after_sequence: int, after_control_row: int) -> StoreDelta:
         """What was committed after ``after_sequence`` and ``after_control_row``,
         in one message: a read-only transaction around the reads."""
@@ -1135,6 +1187,7 @@ class PostgresStore:
             signature=stored[3],
         )
 
+    @_guarded
     def put_snapshot(self, snapshot: Snapshot) -> None:
         """Store a snapshot, once, in a transaction of its own and without the
         writer lock: the state as of a sequence never changes, so an identical
@@ -1159,6 +1212,7 @@ class PostgresStore:
                 f"derivations of the same chain disagree"
             )
 
+    @_guarded
     def snapshot_at(self, sequence: int) -> Snapshot | None:
         """The stored snapshot of ``sequence``, if any."""
         with self._reading(), self._errors("read a checkpoint snapshot"):
@@ -1169,6 +1223,7 @@ class PostgresStore:
             sequence=int(row[0]), digest=str(row[1]), body=bytes(row[2]), signature=row[3]
         )
 
+    @_guarded
     def checkpoints(self) -> tuple[tuple[int, int, str], ...]:
         """Every well-formed CHECKPOINT entry: its own sequence, the sequence
         its snapshot is of, and the snapshot's digest, oldest first."""
@@ -1183,12 +1238,14 @@ class PostgresStore:
 
     # -- history ----------------------------------------------------------
 
+    @_guarded
     def entry_at(self, sequence: int) -> LedgerEntry | None:
         """The entry at ``sequence``, if there is one."""
         with self._reading(), self._errors("read an entry"):
             row = self._conn.execute(self._sql.select_entry_at, (sequence,)).fetchone()
         return None if row is None else _entry(row)
 
+    @_guarded
     def entry_by_id(self, entry_id: uuid.UUID) -> LedgerEntry | None:
         """The entry with this ``entry_id``, if there is one."""
         with self._reading(), self._errors("read an entry"):
@@ -1209,6 +1266,7 @@ class PostgresStore:
             yield from batch
             position = batch[-1].sequence
 
+    @_guarded
     def find_entries(
         self,
         *,
@@ -1238,12 +1296,14 @@ class PostgresStore:
             rows = self._conn.execute(self._sql.find_entries(criteria), criteria).fetchall()
         return tuple(_entry(row) for row in rows)
 
+    @_guarded
     def released(self, hold_id: uuid.UUID) -> bool:
         """Whether an entry released the hold ``hold_id`` by name."""
         with self._reading(), self._errors("read the ledger"):
             row = self._conn.execute(self._sql.released, (hold_id,)).fetchone()
         return row is not None
 
+    @_guarded
     def control_events(self) -> tuple[ControlEvent, ...]:
         """Every circuit-breaker trip and reset recorded, oldest first."""
         with self._reading(), self._errors("read the control events"):
@@ -1251,6 +1311,7 @@ class PostgresStore:
 
     # -- the auditor's marks ----------------------------------------------
 
+    @_guarded
     def record_audit(self, mark: AuditMark) -> None:
         """Record how far an auditor verified the chain, and what it found.
 
@@ -1273,6 +1334,7 @@ class PostgresStore:
                 ),
             )
 
+    @_guarded
     def audit_marks(self) -> tuple[AuditMark, ...]:
         """Every audit mark, oldest first."""
         if self._version != _SCHEMA_VERSION:
@@ -1281,6 +1343,7 @@ class PostgresStore:
             rows = self._conn.execute(self._sql.select_audit_marks).fetchall()
         return tuple(_audit_mark(row) for row in rows)
 
+    @_guarded
     def audit_failure(self) -> AuditMark | None:
         """The newest audit mark, if it is a failure. A later mark that
         verified the chain supersedes an earlier failure."""
@@ -1302,6 +1365,7 @@ class PostgresStore:
             idle_timeout=self._idle_timeout_ms / 1000,
         )
 
+    @_guarded
     def load_entries(self) -> tuple[LedgerEntry, ...]:
         """Return every persisted entry, oldest first."""
         with self._reading(), self._errors("load the ledger's entries"):
@@ -1358,6 +1422,7 @@ class PostgresStore:
 
     # -- lifecycle --------------------------------------------------------
 
+    @_guarded
     def close(self) -> None:
         """Close the connection. An open session is rolled back by the server.
         Safe to call more than once."""
@@ -1443,6 +1508,16 @@ def _entry_row(entry: LedgerEntry) -> tuple[object, ...]:
         entry.memo,
         entry.version,
         entry.ref,
+    )
+
+
+def _idempotency_row(record: IdempotencyRecord) -> tuple[object, ...]:
+    return (
+        record.key,
+        record.request,
+        record.outcome,
+        record.sequence,
+        _iso(record.created_at),
     )
 
 
@@ -1622,7 +1697,17 @@ class _Statements:
                 "INSERT INTO {} (authorization_id, scope_id, amount, opened_at, entry_id) VALUES "
             ).format(auths),
             "close": sql.SQL("DELETE FROM {} WHERE authorization_id IN (").format(auths),
+            "keys": sql.SQL(
+                "INSERT INTO {} (key, request, outcome, sequence, created_at) VALUES "
+            ).format(table("idempotency")),
         }
+        self.insert_idempotency = sql.SQL(
+            "INSERT INTO {} (key, request, outcome, sequence, created_at) "
+            "VALUES (%s, %s, %s, %s, %s)"
+        ).format(table("idempotency"))
+        self.select_idempotency = sql.SQL(
+            "SELECT key, request, outcome, sequence, created_at FROM {} WHERE key = ANY(%s)"
+        ).format(table("idempotency"))
         self.select_authorizations = sql.SQL(
             "SELECT authorization_id, scope_id, amount, opened_at, entry_id FROM {}"
         ).format(auths)
