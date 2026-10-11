@@ -91,7 +91,7 @@ from decimal import (
     Overflow,
 )
 from enum import Enum, unique
-from typing import TYPE_CHECKING, Any, Concatenate, Final, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Concatenate, Final, NoReturn, ParamSpec, TypeVar
 
 from agentgov.exceptions import (
     BudgetExceededError,
@@ -101,6 +101,7 @@ from agentgov.exceptions import (
     DuplicateScopeError,
     IdempotencyConflictError,
     LedgerIntegrityError,
+    LedgerRollbackError,
     ReadOnlyLedgerError,
     RunawayLoopDetectedError,
     StorageError,
@@ -3684,6 +3685,11 @@ class GovernancePolicy:
     :ivar trip_on_exhaustion: Trip the breaker when a scope's balance reaches
         exactly zero with no holds outstanding, so the next call fails fast
         instead of racing to the same conclusion.
+    :ivar fleet_velocity: Count a scope's authorizations across the fleet:
+        the holds placed on it in the chain, by every governor, within
+        ``window_seconds`` (by their timestamps), rather than this governor's
+        own calls. Without it, N governors of one ledger admit N times the
+        rate. Only on a shared ledger does it differ.
     """
 
     max_calls_per_window: int = 1000
@@ -3692,6 +3698,7 @@ class GovernancePolicy:
     trip_on_overdraft: bool = True
     trip_on_exhaustion: bool = True
     checkpoint_every: int = 10_000
+    fleet_velocity: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -3739,6 +3746,11 @@ def _grouped(
 
     return grouped
 
+
+_RECENT_HASHES: Final = 4096
+"""How many of the newest entries' hashes a governor keeps, to tell a ledger
+cut back under it from one rewritten: a failover loses at most the last few
+seconds of commits."""
 
 _UNRECORDED: Final[Any] = object()
 """No call was recorded under the key: the call is a new one."""
@@ -3917,6 +3929,13 @@ class BudgetManager:
         self._key_cache: dict[str, IdempotencyRecord | None] = {}
         self._auditor: Any = None
         self._velocity: dict[str, _Velocity] = {}
+        # Every scope's recent holds, by any governor (fleet_velocity), and the
+        # hashes of the entries this view verified last: to tell a ledger
+        # cut back under it (a failover) from one rewritten.
+        self._fleet_holds: dict[str, deque[datetime]] = {}
+        self._recent: deque[tuple[int, str]] = deque(maxlen=_RECENT_HASHES)
+        self._checkpoint_retry_at = 0.0  # after a failed automatic checkpoint
+        self._checkpoint_backoff = 0.0
         self._repairs: tuple[str, ...] = ()
         self._schema_version = ""
         self._control_high_water = 0
@@ -3927,6 +3946,7 @@ class BudgetManager:
             self._start_auditing(
                 store, opened_from_checkpoint=image.snapshot is not None, want=auditor
             )
+        self._remember_head()
 
     def _start_auditing(
         self, store: PersistenceStore, *, opened_from_checkpoint: bool, want: bool | None
@@ -4653,17 +4673,40 @@ class BudgetManager:
             last = state.last_checkpoint[0] if state.last_checkpoint is not None else 0
             if self._checkpointing or self._depth or state.length - last < every:
                 return
+            if time.monotonic() < self._checkpoint_retry_at:
+                return  # backing off after a failure: a signer may be down
             self._checkpointing = True
         try:
             self.checkpoint()
         except Exception:
+            # Writes never wait on a checkpoint's signer: after a failure the
+            # next tries are spaced out, 1 s doubling to a minute, and until
+            # one succeeds the chain grows past its last checkpoint, which
+            # checkpoint_lag() shows.
+            backoff = min(max(1.0, self._checkpoint_backoff * 2), 60.0)
+            self._checkpoint_backoff = backoff
+            self._checkpoint_retry_at = time.monotonic() + backoff
             logger.warning(
-                "an automatic checkpoint failed; the ledger is unaffected, and the next "
-                "mutation tries again",
+                "an automatic checkpoint failed; the ledger is unaffected, and the next try "
+                "is in %.0f s",
+                backoff,
                 exc_info=True,
             )
+        else:
+            self._checkpoint_backoff = 0.0
+            self._checkpoint_retry_at = 0.0
         finally:
             self._checkpointing = False
+
+    def checkpoint_lag(self) -> int:
+        """How many entries the chain holds past its newest checkpoint, in this
+        view: about :attr:`GovernancePolicy.checkpoint_every` at most while
+        checkpoints succeed. Growing past that, they are failing (a signer
+        that cannot be reached, say), and an open replays more."""
+        with self._lock:
+            state = self._state
+            last = state.last_checkpoint[0] if state.last_checkpoint is not None else 0
+            return state.length - last
 
     def checkpoint(self) -> int:
         """Checkpoint the chain state as of this governor's view.
@@ -5106,10 +5149,7 @@ class BudgetManager:
             self._reload(store)
             return len(ledger) - before
         if before and delta.anchor_hash != ledger.head_hash:
-            raise LedgerIntegrityError(
-                f"the ledger was rewritten under this reader: entry {before} no longer "
-                f"carries the head this view verified"
-            )
+            self._refuse_moved_chain(store, before)
         if delta.legacy_control_events and self._state.saw_v2:
             raise LedgerIntegrityError(
                 "control_events gained rows outside the chain after the ledger was sealed"
@@ -5143,7 +5183,42 @@ class BudgetManager:
         else:
             ledger._follow_holds(view)
         self._control_high_water = delta.control_high_water
+        self._remember(delta.entries)
         return len(delta.entries)
+
+    def _remember(self, entries: Sequence[LedgerEntry]) -> None:
+        """Note entries this view now holds: each one's hash, among the newest
+        kept, and, for the fleet-wide velocity window, each hold. Lock held."""
+        recent = self._recent
+        fleet = self._policy.fleet_velocity
+        for entry in entries:
+            recent.append((entry.sequence, entry.entry_hash))
+            if fleet and entry.entry_type is EntryType.HOLD:
+                self._fleet_holds.setdefault(entry.scope_id, deque()).append(entry.timestamp)
+
+    def _remember_head(self) -> None:
+        """Start the newest hashes over from this view's head. Lock held."""
+        self._recent.clear()
+        if len(self._ledger):
+            self._recent.append((len(self._ledger), self._ledger.head_hash))
+
+    def _refuse_moved_chain(self, store: PersistenceStore, verified: int) -> NoReturn:
+        """The ledger no longer holds, at ``verified``, the head this view
+        verified there. Say whether it was cut back to a prefix of what was
+        verified (a rollback: a failover, say) or rewritten."""
+        length: int | None = None
+        try:
+            length, head = store.head()  # type: ignore[attr-defined]
+        except Exception:
+            length = None
+        if length is not None and 0 < length < verified:
+            known = next((h for sequence, h in self._recent if sequence == length), None)
+            if known is None or known == head:
+                raise LedgerRollbackError(verified, length, confirmed=known is not None)
+        raise LedgerIntegrityError(
+            f"the ledger was rewritten under this reader: entry {verified} no longer carries "
+            f"the head this view verified"
+        )
 
     def _hold_index(self, extra: Sequence[LedgerEntry] = ()) -> _HoldIndex:
         """Every HOLD entry by id, and which were released, for matching
@@ -5184,6 +5259,7 @@ class BudgetManager:
         self._ledger._legacy_auth_ids = fresh._ledger._legacy_auth_ids
         self._schema_version = fresh._schema_version
         self._control_high_water = fresh._control_high_water
+        self._remember_head()
 
     # -- accessors --------------------------------------------------------
 
@@ -6352,6 +6428,7 @@ class BudgetManager:
             pending.batch.idempotency.append(record)
         controls = [e for e in pending.entries if e.entry_type in _CONTROL_TYPES]
         self._ledger._commit(pending)
+        self._remember(pending.entries)
         if call is not None:
             call.record = record
         for entry in controls:
@@ -6473,10 +6550,26 @@ class BudgetManager:
             raise CircuitOpenError(scope_id, tripped, self._state.tripped[tripped][1])
 
     def _record_velocity(self, scope_id: str) -> None:
-        """Record an authorization and trip on runaway loops. Lock held."""
+        """Record an authorization and trip on runaway loops. Lock held.
+
+        With :attr:`GovernancePolicy.fleet_velocity`, the count is the holds
+        on the scope in the chain within the window, by every governor (this
+        view is current: it caught up under the writer lock), and this one."""
         limit = self._policy.max_calls_per_window
         window = self._policy.window_seconds
         if limit <= 0 or window <= 0:
+            return
+        if self._policy.fleet_velocity:
+            held = self._fleet_holds.setdefault(scope_id, deque())
+            since = datetime.now(UTC) - timedelta(seconds=window)
+            while held and held[0] < since:
+                held.popleft()
+            count = len(held) + 1
+            if count > limit:
+                self._trip(
+                    scope_id, f"runaway loop: {count} authorizations in {window}s, fleet-wide"
+                )
+                raise RunawayLoopDetectedError(scope_id, count, window)
             return
 
         now = time.monotonic()

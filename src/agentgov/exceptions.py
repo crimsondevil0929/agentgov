@@ -45,6 +45,7 @@ __all__ = [
     "LedgerConflictError",
     "LedgerError",
     "LedgerIntegrityError",
+    "LedgerRollbackError",
     "MalformedReceiptError",
     "ReadOnlyLedgerError",
     "ReceiptError",
@@ -470,6 +471,45 @@ class LedgerIntegrityError(LedgerError):
         self.scope_id = scope_id
         where = f" for scope {scope_id!r}" if scope_id else ""
         super().__init__(f"Ledger integrity violation{where}: {detail}")
+
+
+class LedgerRollbackError(LedgerIntegrityError):
+    """Raised when the ledger is shorter than a chain this governor verified,
+    and what is left of it is the chain it verified, cut back.
+
+    Not tampering: the entries after :attr:`ledger_length` are gone, and every
+    one before them is as verified. The usual cause is a failover to a replica
+    that had not yet received the last commits (asynchronous replication).
+    The governor stops writing, as it does for any chain it cannot follow:
+    anchors and receipts may name heads the ledger no longer holds. See the
+    operations guide's failover runbook.
+
+    :param verified_length: How many entries this governor had verified.
+    :param ledger_length: How many the ledger holds now.
+    :param confirmed: Whether entry ``ledger_length`` was compared with the
+        one this governor verified there, and matched. ``False`` when it lies
+        further back than the governor remembers: then only the length is
+        known, and ``agentgov verify`` (and a witness's cosignatures) can tell
+        the rest.
+    """
+
+    def __init__(self, verified_length: int, ledger_length: int, *, confirmed: bool) -> None:
+        self.verified_length = verified_length
+        self.ledger_length = ledger_length
+        self.confirmed = confirmed
+        lost = verified_length - ledger_length
+        detail = (
+            f"entry {ledger_length} is the one it verified, so the {lost} after it were lost, "
+            f"not rewritten"
+            if confirmed
+            else f"entry {ledger_length} is further back than this governor remembers, so it "
+            f"could not be compared with what was verified there"
+        )
+        super().__init__(
+            f"the ledger was rolled back: it holds {ledger_length} entries, and this governor "
+            f"had verified {verified_length}; {detail} (a failover to a replica that had not "
+            f"received the last commits?)"
+        )
 
 
 class DoubleSpendError(LedgerError):

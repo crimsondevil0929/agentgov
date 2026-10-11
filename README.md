@@ -772,23 +772,29 @@ and races them: writes get refused, and the ledger still balances to the cent.
   or not at all.
 - A governor that reads an entry that does not verify stops writing. Every later write
   raises `LedgerIntegrityError`; reads keep serving what it last verified.
+- A ledger cut back under a governor, to exactly the chain it verified (a failover to a
+  replica that had not received the last commits), raises `LedgerRollbackError`, and the
+  governor stops writing as above. [docs/OPERATIONS.md](docs/OPERATIONS.md) has the
+  runbook, and recommends synchronous replication.
 
 **What to know before relying on it.**
 
-- **Reads are as of this governor's last write.** `available()`, `is_halted()` and the
-  rest are served from memory; call `refresh()` first when the answer must be current.
-  Writes always catch up first.
-- **The runaway-loop velocity window is per governor**, not fleet-wide: eight governors
-  with a 1000/s limit admit up to 8000/s between them.
-- **One global chain serializes every write in the fleet, and it is slower than
-  SQLite.** Measured on one laptop against PostgreSQL 16 in Docker, `spend()` ran at
-  about 500 a second from one governor and about 180 a second in total with eight
-  contending, against about 4,500 a second for a single SQLite governor on the same
-  machine. Each write is a dozen round trips, and must first read what the others wrote.
-  That is the price of one authoritative balance; a chain per root scope is how it would
-  scale out.
-- **Tested on PostgreSQL 14 and 16, connected directly.** Not yet tested behind a
-  connection pooler.
+- **Reads are as of this governor's last write**, unless asked otherwise.
+  `available()`, `is_halted()` and the rest are served from memory; pass `fresh=True`
+  to catch up first, or read inside `transaction()`, where reads are current and the
+  check and the act it decides are one atomic step across the fleet.
+- **The runaway-loop velocity window is per governor** by default: eight governors with
+  a 1000/s limit admit up to 8000/s between them.
+  `GovernancePolicy(fleet_velocity=True)` counts the holds of every governor instead.
+- **One global chain serializes every write in the fleet.** Concurrent callers of one
+  governor share units of work (one lock, one catch-up, one commit), and a unit costs
+  two round trips. Measured on one laptop against PostgreSQL 16 in Docker, eight callers
+  ran about 2,500 operations a second through one governor, and eight governors with
+  eight callers each about 2,000 a second in total, at a p99 latency near 90 ms. That
+  is the price of one authoritative balance; a chain per root scope is how it would
+  scale out further.
+- **Tested on PostgreSQL 14, 16, 17 and 18,** connected directly and, the whole suite,
+  behind PgBouncer in transaction mode ([docs/OPERATIONS.md](docs/OPERATIONS.md)).
 - **The CLI does not read PostgreSQL yet.** Use `open_postgres(..., read_only=True)` and
   `verify_integrity()` for an audit.
 
