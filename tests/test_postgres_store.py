@@ -49,7 +49,16 @@ ADVISORY = GovernancePolicy(trip_on_overdraft=False, trip_on_exhaustion=False)
 
 def admin(dsn: str) -> psycopg.Connection[tuple[Any, ...]]:
     """An autocommit connection as the database's owner."""
-    return psycopg.connect(dsn, autocommit=True)
+    return psycopg.connect(dsn, autocommit=True, prepare_threshold=None)
+
+
+def server_pid(conn: psycopg.Connection[Any]) -> int:
+    """The server backend serving ``conn`` now: inside a transaction, the one
+    serving it, directly or behind a pooler, whose own pid
+    (``conn.info.backend_pid``) is not a server's."""
+    row = conn.execute("SELECT pg_backend_pid()").fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 def seeded(dsn: str, **kwargs: Any) -> BudgetManager:
@@ -531,8 +540,9 @@ def test_a_connection_lost_before_commit_rolls_back_and_is_re_read(
 
     def write_then_lose_the_connection(batch: WriteBatch) -> None:
         original(batch)
+        serving = server_pid(store._conn)  # inside the session's transaction
         with admin(pg_dsn) as conn:
-            conn.execute("SELECT pg_terminate_backend(%s)", (store._conn.info.backend_pid,))
+            conn.execute("SELECT pg_terminate_backend(%s)", (serving,))
 
     with monkeypatch.context() as patch:
         patch.setattr(store, "commit", write_then_lose_the_connection)
@@ -700,11 +710,19 @@ def test_a_governor_that_hangs_holding_the_lock_is_cut_off_by_the_server(
 def test_a_connection_the_server_ended_between_writes_is_reopened(
     pg_dsn: str, gov: BudgetManager
 ) -> None:
-    pid = _store(gov)._conn.info.backend_pid
-    with admin(pg_dsn) as conn:
-        conn.execute("SELECT pg_terminate_backend(%s)", (pid,))
+    """Directly connected, the store reconnects; behind a pooler, which
+    replaces the server connection itself, it never notices. Either way the
+    next write goes through."""
+    conn = _store(gov)._conn
+    pid = server_pid(conn)
+    direct = conn.info.backend_pid == pid
+    with admin(pg_dsn) as other, suppress(psycopg.errors.AdminShutdown):
+        # Behind a pooler this may be served by that very server connection,
+        # and end itself: the backend is gone either way.
+        other.execute("SELECT pg_terminate_backend(%s)", (pid,))
     gov.spend("agent", "0.10")
-    assert _store(gov)._conn.info.backend_pid != pid
+    if direct:
+        assert _store(gov)._conn.info.backend_pid != pid
     assert gov.available("agent") == money("1.90")
 
 
@@ -793,8 +811,11 @@ def test_a_units_writes_read_back_exactly_whatever_their_text(pg_admin_dsn: str)
         )
         def read_back(values: list[object]) -> None:
             for conforming in ("on", "off"):
-                conn.execute(f"SET standard_conforming_strings = {conforming}")
-                row = conn.execute("SELECT " + ", ".join(_literal(v) for v in values)).fetchone()
+                with conn.transaction():  # SET LOCAL: one transaction, behind a pooler too
+                    conn.execute(f"SET LOCAL standard_conforming_strings = {conforming}")
+                    row = conn.execute(
+                        "SELECT " + ", ".join(_literal(v) for v in values)
+                    ).fetchone()
                 assert row is not None and list(row) == values
 
         read_back()
@@ -843,3 +864,53 @@ def test_the_tail_is_read_by_its_index_on_a_ledger_never_analyzed(
             assert "Seq Scan" in unhinted, "the hazard: without the settings, a full scan"
             assert plan.startswith("Index Scan using entries_pkey"), plan
             assert "Sort" not in plan
+
+
+def test_a_store_keeps_no_state_on_its_session_for_a_pooler_to_misplace(pg_dsn: str) -> None:
+    """Behind PgBouncer in transaction mode, a session setting lands on
+    whichever server connection served it, and stays there for the next
+    client. So the store sets nothing on its session: each transaction sets
+    its own lock wait and idle bound, a read declares itself read-only, and
+    no statement is prepared unless asked for."""
+    for read_only in (False, True):
+        if not read_only:
+            seeded(pg_dsn).close()
+        store = PostgresStore(pg_dsn, read_only=read_only)
+        try:
+            conn = store._conn
+            assert conn.prepare_threshold is None
+            settings = conn.execute(
+                "SELECT current_setting('idle_in_transaction_session_timeout'), "
+                "current_setting('default_transaction_read_only')"
+            ).fetchone()
+            assert settings == ("0", "off"), "nothing set on the session"
+            with store._reading():
+                row = conn.execute(
+                    "SELECT current_setting('transaction_read_only'), "
+                    "current_setting('idle_in_transaction_session_timeout')"
+                ).fetchone()
+            assert row == ("on", "1min")
+            if not read_only:
+                with store.writer():
+                    row = conn.execute(
+                        "SELECT current_setting('lock_timeout'), "
+                        "current_setting('idle_in_transaction_session_timeout')"
+                    ).fetchone()
+                assert row == ("30s", "1min")
+        finally:
+            store.close()
+    # Preparing every statement at once: queries with parameters are
+    # prepared, and the messages of several statements a unit of work sends
+    # never are (the server would refuse them).
+    with BudgetManager.open_postgres(pg_dsn, prepare_threshold=0, auditor=False) as gov:
+        preparing = gov.store
+        assert isinstance(preparing, PostgresStore) and preparing._conn.prepare_threshold == 0
+        for n in range(3):
+            spent = gov.spend("agent", "0.01", idempotency_key=f"k-{n}")
+            assert gov.entry(spent.sequence) == spent
+            assert gov.find_entries(ref=spent.ref)
+            assert not preparing.writer_lock_held(0.1)
+        gov.refresh()
+        gov.verify_integrity()
+    with pytest.raises(ValueError, match="prepare_threshold"):
+        PostgresStore(pg_dsn, prepare_threshold=-1)

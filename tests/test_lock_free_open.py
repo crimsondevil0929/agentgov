@@ -39,7 +39,7 @@ def seeded(pg_dsn: str) -> Iterator[BudgetManager]:
 
 def _hold_writer_lock(dsn: str, schema: str = "agentgov") -> psycopg.Connection[Any]:
     """A raw session that takes the ledger's writer lock and keeps it."""
-    conn = psycopg.connect(dsn)
+    conn = psycopg.connect(dsn, prepare_threshold=None)
     k1, k2 = _lock_keys(schema)
     conn.execute("SELECT pg_advisory_xact_lock(%s, %s)", (k1, k2))
     return conn
@@ -146,7 +146,7 @@ def test_open_applies_each_entry_once(
 def test_a_repair_re_reads_under_the_lock_and_erases_nothing_written_since(
     pg_dsn: str, seeded: BudgetManager
 ) -> None:
-    with psycopg.connect(pg_dsn, autocommit=True) as conn:
+    with psycopg.connect(pg_dsn, autocommit=True, prepare_threshold=None) as conn:
         conn.execute("DELETE FROM agentgov.nodes WHERE scope_id = 'agent'")
 
     class Racing(PostgresStore):

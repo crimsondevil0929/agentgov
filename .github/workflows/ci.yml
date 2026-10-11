@@ -89,8 +89,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 14 is the oldest the shared ledger is written for; 16 is current.
-        postgres: ["14", "16"]
+        # 14 is the oldest the shared ledger is written for; 18 is current.
+        postgres: ["14", "16", "17", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -131,6 +131,63 @@ jobs:
       # Every module, postgres.py included (97% measured).
       - name: Enforce coverage floor
         run: uv run coverage report --fail-under=95
+
+  # The same suite again, every PostgreSQL test through PgBouncer in
+  # transaction mode: a small pool, so clients share server connections and
+  # anything a store left on its session would reach another client, and no
+  # tracking of prepared statements (tests/pgbouncer/pgbouncer.ini).
+  pgbouncer:
+    name: test behind PgBouncer (transaction mode, py3.12)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentgov_admin
+          POSTGRES_PASSWORD: agentgov
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentgov_admin"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      AGENTGOV_TEST_POSTGRES_DSN: postgresql://agentgov_admin:agentgov@localhost:6432/postgres
+      AGENTGOV_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install the project
+        run: uv sync --frozen --python 3.12
+
+      # PgBouncer 1.26.0, pinned by digest, on the service's network, where
+      # the server is `postgres`.
+      - name: Start PgBouncer in front of PostgreSQL
+        run: |
+          mkdir -p "$RUNNER_TEMP/pgbouncer"
+          sed 's/@HOST@/postgres/; s/@PORT@/5432/' tests/pgbouncer/pgbouncer.ini \
+            > "$RUNNER_TEMP/pgbouncer/pgbouncer.ini"
+          cp tests/pgbouncer/userlist.txt "$RUNNER_TEMP/pgbouncer/"
+          docker run -d --name pgbouncer --network "${{ job.services.postgres.network }}" \
+            -p 6432:6432 -v "$RUNNER_TEMP/pgbouncer:/etc/pgbouncer:ro" \
+            edoburu/pgbouncer@sha256:9c78945868a6a142c7fc40ccd843bbe5a606df163c7ffce4de70e0d628d696a2
+          for _ in $(seq 30); do
+            pg_isready -h localhost -p 6432 -U agentgov_admin && break
+            sleep 1
+          done
+
+      - name: Tests, every PostgreSQL test through PgBouncer
+        run: uv run pytest -q
 
   # Interlock is agentgov's main downstream consumer. Its whole suite runs
   # against this branch, PostgreSQL and PgBouncer included, exactly as

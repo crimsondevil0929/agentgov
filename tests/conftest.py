@@ -39,12 +39,12 @@ def pg_dsn(pg_admin_dsn: str) -> Iterator[str]:
     from psycopg.conninfo import make_conninfo
 
     name = f"agentgov_t_{uuid.uuid4().hex[:12]}"
-    with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+    with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as admin:
         admin.execute(sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(name)))
     try:
         yield make_conninfo(pg_admin_dsn, dbname=name)
     finally:
-        with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+        with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as admin:
             admin.execute(
                 sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
             )

@@ -22,6 +22,13 @@ runs inside :meth:`PostgresStore.writer`, which is one database transaction:
    head it just verified, and write them.
 4. ``COMMIT`` releases the lock with the transaction.
 
+**Behind a pooler.** The store keeps no state on its session: the lock
+wait, the idle bound and read-only are set in the message that begins each
+transaction (``SET LOCAL``), the lock is a transaction's, and no statement
+is prepared unless ``prepare_threshold`` asks for it. So PgBouncer in
+transaction mode may serve each transaction from any server connection; the
+test suite runs behind one.
+
 **Why READ COMMITTED.** Under ``REPEATABLE READ`` the transaction's snapshot
 is taken by its first statement, which is the lock request itself, *before*
 it waits. A governor would then catch up to the ledger as it stood when it
@@ -274,7 +281,7 @@ class PostgresStore:
     :param schema: The schema holding the ledger's tables. Lowercase letters,
         digits and underscores.
     :param read_only: Open for audit. No DDL, no writer lock, every write
-        refused, and the session itself set read-only.
+        refused, and every transaction declared read-only.
     :param lock_timeout: Seconds to wait for the writer lock before giving up
         with :class:`~agentgov.exceptions.StorageError`.
     :param idle_timeout: Seconds the server lets this governor sit idle inside
@@ -282,6 +289,16 @@ class PostgresStore:
         while it holds the writer lock (a stopped process, a stalled host)
         would otherwise stall the whole fleet; this bounds that, and the
         governor finds out, and re-reads the ledger, at its next operation.
+        Set in every transaction, with the message that begins it, never on
+        the session: behind a pooler in transaction mode a session setting
+        lands on whichever server connection served it.
+    :param prepare_threshold: psycopg's: after how many executions a query
+        is prepared on the server, or ``None`` (the default) for never. A
+        prepared statement belongs to one server connection, which a pooler
+        in transaction mode does not keep: leave it ``None`` behind one that
+        does not track prepared statements (PgBouncer before 1.21, or with
+        ``max_prepared_statements = 0``). The messages a unit of work sends
+        are simple queries, prepared either way never.
     :raises StorageError: If the database cannot be reached, or holds no
         ledger when opened read-only.
     :raises LedgerIntegrityError: If the schema was written by a layout this
@@ -296,6 +313,7 @@ class PostgresStore:
         read_only: bool = False,
         lock_timeout: float = 30.0,
         idle_timeout: float = 60.0,
+        prepare_threshold: int | None = None,
     ) -> None:
         if not _SCHEMA_NAME.match(schema):
             raise ValueError(
@@ -307,10 +325,15 @@ class PostgresStore:
         self._read_only = read_only
         self._lock_timeout_ms = _millis(lock_timeout, "lock_timeout")
         self._idle_timeout_ms = _millis(idle_timeout, "idle_timeout")
+        if prepare_threshold is not None and prepare_threshold < 0:
+            raise ValueError(f"prepare_threshold must be None or >= 0, got {prepare_threshold}")
+        self._prepare_threshold = prepare_threshold
         self._session: _Session | None = None
         self._rendered: dict[str, str] | None = None  # see _templates
         self._key: bytes | None = None
-        self._sql = _Statements(schema, _lock_keys(schema), self._lock_timeout_ms)
+        self._sql = _Statements(
+            schema, _lock_keys(schema), self._lock_timeout_ms, self._idle_timeout_ms
+        )
         self._guard = threading.RLock()  # one transaction on the connection at a time
         self._conn = self._connect()
         try:
@@ -322,21 +345,15 @@ class PostgresStore:
     # -- connection -------------------------------------------------------
 
     def _connect(self) -> psycopg.Connection[tuple[Any, ...]]:
+        """A connection with no session state of its own: everything a
+        transaction needs (the idle bound, the lock wait, read-only) is set in
+        the message that begins it, so a pooler may hand it any server
+        connection."""
         try:
             conn = psycopg.connect(self._conninfo, autocommit=True)
         except psycopg.Error as exc:
             raise StorageError(f"cannot connect to the ledger database: {exc}") from exc
-        try:
-            conn.execute(
-                sql.SQL("SET idle_in_transaction_session_timeout = {}").format(
-                    sql.Literal(self._idle_timeout_ms)
-                )
-            )
-            if self._read_only:
-                conn.execute("SET default_transaction_read_only = on")
-        except psycopg.Error as exc:
-            conn.close()
-            raise StorageError(f"cannot configure the ledger connection: {exc}") from exc
+        conn.prepare_threshold = self._prepare_threshold
         return conn
 
     def _live(self) -> psycopg.Connection[tuple[Any, ...]]:
@@ -416,7 +433,7 @@ class PostgresStore:
             if version is None:
                 with self._errors(f"create the ledger schema {self._schema!r}"):
                     for statement in self._sql.install:
-                        conn.execute(statement)
+                        conn.execute(statement, prepare=False)
                     # The secret joined transactions are authorized by. From
                     # the OS's CSPRNG, not the server's random(); readable by
                     # the ledger's owner and the governors it grants, never by
@@ -430,7 +447,7 @@ class PostgresStore:
                     f"that may create tables and indexes in it)"
                 ):
                     for statement in self._sql.upgrade:
-                        conn.execute(statement)
+                        conn.execute(statement, prepare=False)
                     conn.execute(self._sql.set_version, (_SCHEMA_VERSION,))
             version = _SCHEMA_VERSION
         return version
@@ -525,7 +542,7 @@ class PostgresStore:
             )
         conn = self._live()
         try:
-            conn.execute(self._sql.probe_lock(millis))
+            conn.execute(self._sql.probe_lock(millis), prepare=False)
         except psycopg.errors.LockNotAvailable:
             self._rollback_quietly()
             return True
@@ -548,7 +565,7 @@ class PostgresStore:
             conn = self._live()
             try:
                 if after is None:
-                    conn.execute(self._sql.begin_locked)
+                    conn.execute(self._sql.begin_locked, prepare=False)
                     return None, None
                 return self._begin_reading(conn, *after)
             except psycopg.errors.LockNotAvailable as exc:
@@ -578,7 +595,7 @@ class PostgresStore:
         message = template.replace("<AFTER>", str(int(after_sequence))).replace(
             "<CONTROL>", str(int(after_control_row))
         )
-        selected = _selected(conn.execute(message))
+        selected = _selected(conn.execute(message, prepare=False))
         entry_rows, control_rows = selected[-2:]  # after the lock's
         found = [_entry(row) for row in entry_rows]
         if after_sequence > 0 and (not found or found[0].sequence != after_sequence):
@@ -634,7 +651,7 @@ class PostgresStore:
                 ),
                 "read": "; ".join(
                     (
-                        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                        self._sql.begin_reading.as_string(conn),
                         index_only,
                         entries.replace("%s", "<AFTER>"),
                         control,
@@ -654,7 +671,7 @@ class PostgresStore:
         statements, count = self._render(session.batches), session.pending
         session.batches, session.pending = [], 0
         with self._errors(_appending(count), refused=_REFUSED):
-            self._conn.execute("; ".join(statements))
+            self._conn.execute("; ".join(statements), prepare=False)
 
     def _render(self, batches: Sequence[WriteBatch]) -> list[str]:
         """A session's writes as at most one statement per table: every entry,
@@ -717,7 +734,7 @@ class PostgresStore:
             count = session.pending
             session.batches, session.pending = [], 0
             try:
-                cursor = conn.execute(message)
+                cursor = conn.execute(message, prepare=False)
                 while cursor.nextset():
                     pass
                 status = cursor.statusmessage
@@ -796,7 +813,7 @@ class PostgresStore:
                 return
             conn = self._live()
             with self._errors("begin a read"):
-                conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                conn.execute(self._sql.begin_reading, prepare=False)
             try:
                 yield
             finally:
@@ -1151,7 +1168,7 @@ class PostgresStore:
         )
         with self._errors("read the ledger"):
             try:
-                selected = _selected(conn.execute(message))
+                selected = _selected(conn.execute(message, prepare=False))
             except BaseException:
                 self._rollback_quietly()
                 raise
@@ -1554,7 +1571,9 @@ class _Statements:
     interpolated, and the schema name is validated before it gets here.
     """
 
-    def __init__(self, schema: str, keys: tuple[int, int], lock_timeout_ms: int) -> None:
+    def __init__(
+        self, schema: str, keys: tuple[int, int], lock_timeout_ms: int, idle_timeout_ms: int
+    ) -> None:
         def table(name: str) -> sql.Identifier:
             return sql.Identifier(schema, name)
 
@@ -1571,12 +1590,21 @@ class _Statements:
         self.begin_locked = sql.SQL(
             "BEGIN ISOLATION LEVEL READ COMMITTED; "
             "SET LOCAL lock_timeout = {timeout}; "
+            "SET LOCAL idle_in_transaction_session_timeout = {idle}; "
             "SELECT pg_advisory_xact_lock({k1}, {k2})"
         ).format(
             timeout=sql.Literal(lock_timeout_ms),
+            idle=sql.Literal(idle_timeout_ms),
             k1=sql.Literal(keys[0]),
             k2=sql.Literal(keys[1]),
         )
+        # A read: read-only by its own declaration, not a session default a
+        # pooler could leave on a connection another client then writes on.
+        self.begin_reading = sql.SQL(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; "
+            "SET LOCAL idle_in_transaction_session_timeout = {idle}"
+        ).format(idle=sql.Literal(idle_timeout_ms))
+        self._idle_timeout_ms = idle_timeout_ms
         self.get_version = sql.SQL("SELECT value FROM {} WHERE key = 'schema_version'").format(meta)
         self.has_schema_meta = sql.SQL(
             "SELECT 1 FROM pg_catalog.pg_class c "
@@ -1748,9 +1776,12 @@ class _Statements:
     def probe_lock(self, timeout_ms: int) -> sql.Composed:
         """A transaction that only tries for the writer lock, for ``timeout_ms``."""
         return sql.SQL(
-            "BEGIN; SET LOCAL lock_timeout = {timeout}; SELECT pg_advisory_xact_lock({k1}, {k2})"
+            "BEGIN; SET LOCAL lock_timeout = {timeout}; "
+            "SET LOCAL idle_in_transaction_session_timeout = {idle}; "
+            "SELECT pg_advisory_xact_lock({k1}, {k2})"
         ).format(
             timeout=sql.Literal(timeout_ms),
+            idle=sql.Literal(self._idle_timeout_ms),
             k1=sql.Literal(self._keys[0]),
             k2=sql.Literal(self._keys[1]),
         )

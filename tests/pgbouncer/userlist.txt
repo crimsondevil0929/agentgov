@@ -1,0 +1,3 @@
+; The throwaway admin of the test server (POSTGRES_PASSWORD in CI). Other roles
+; the tests create are looked up through auth_query.
+"agentgov_admin" "agentgov"

@@ -89,7 +89,7 @@ def test_a_release_database_upgrades_and_keeps_working(release: str, tmp_path: P
 
 def _restore(dsn: str, release: str) -> None:
     script = (FIXTURES / f"{release}.pg.sql").read_text()
-    with psycopg.connect(dsn, autocommit=True) as conn:
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as conn:
         conn.execute(script)
 
 

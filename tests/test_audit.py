@@ -227,6 +227,12 @@ def test_urls_name_every_kind_of_ledger(tmp_path: Path) -> None:
     assert dsn == "postgresql://gov:pw@db:5432/fleet?sslmode=require"
     with pytest.raises(ValueError, match="not a float"):
         parse_url("postgresql://db/fleet?idle_timeout=soon")
+    assert parse_url("postgresql://db/fleet?prepare_threshold=none")[2] == {
+        "prepare_threshold": None
+    }
+    assert parse_url("postgresql://db/fleet?prepare_threshold=5")[2] == {"prepare_threshold": 5}
+    with pytest.raises(ValueError, match="not an integer, or none"):
+        parse_url("postgresql://db/fleet?prepare_threshold=often")
     with pytest.raises(ValueError, match="no kind of ledger"):
         parse_url("mysql://db/fleet")
     with pytest.raises(ValueError):

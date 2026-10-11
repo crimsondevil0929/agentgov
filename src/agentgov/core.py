@@ -4057,6 +4057,7 @@ class BudgetManager:
         repair: bool = False,
         lock_timeout: float = 30.0,
         idle_timeout: float = 60.0,
+        prepare_threshold: int | None = None,
         verify: str = "checkpoint",
         auditor: bool | None = None,
         signing: CheckpointSigning | None = None,
@@ -4084,6 +4085,9 @@ class BudgetManager:
             operation fails with :class:`~agentgov.exceptions.StorageError`.
         :param idle_timeout: Seconds the server lets this governor idle inside
             an open transaction, holding the lock, before ending its session.
+        :param prepare_threshold: When psycopg prepares a query on the server:
+            ``None`` (the default) for never, which any pooler accepts. See
+            :class:`~agentgov.postgres.PostgresStore`.
         :param verify: What to verify at open; see :meth:`open_sqlite`.
         :param auditor: Run an auditor thread; see :meth:`open_sqlite`.
         :param signing: Sign checkpoints, and check them; see :meth:`open_sqlite`.
@@ -4100,6 +4104,7 @@ class BudgetManager:
             read_only=read_only,
             lock_timeout=lock_timeout,
             idle_timeout=idle_timeout,
+            prepare_threshold=prepare_threshold,
         )
         try:
             return cls(

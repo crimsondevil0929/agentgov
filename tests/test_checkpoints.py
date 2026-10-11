@@ -369,7 +369,7 @@ def test_snapshots_and_audit_marks_are_append_only_in_postgres(pg_dsn: str) -> N
     with BudgetManager.open_postgres(pg_dsn, policy=NEVER) as gov:
         _populate(gov, spends=2)
         gov.checkpoint()
-    with psycopg.connect(pg_dsn, autocommit=True) as conn:
+    with psycopg.connect(pg_dsn, autocommit=True, prepare_threshold=None) as conn:
         with pytest.raises(psycopg.errors.IntegrityConstraintViolation, match="append-only"):
             conn.execute("UPDATE agentgov.snapshots SET digest = 'x'")
         with pytest.raises(psycopg.errors.IntegrityConstraintViolation, match="append-only"):

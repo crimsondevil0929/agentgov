@@ -56,7 +56,7 @@ def copy_to_postgres(sqlite_path: str | Path, dsn: str, *, schema: str = "agentg
     source = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
     copied = 0
     try:
-        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        with psycopg.connect(dsn, prepare_threshold=None) as conn, conn.cursor() as cur:
             present = {
                 row[0]
                 for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")

@@ -46,7 +46,7 @@ PASSWORD = "caller"  # noqa: S105 - a throwaway role in a throwaway database
 def caller_role(pg_admin_dsn: str, pg_dsn: str) -> Iterator[str]:
     """A login role granted joined settlement, and nothing else on the ledger."""
     role = f"caller_{uuid.uuid4().hex[:10]}"
-    with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
+    with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as conn:
         conn.execute(
             sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(PASSWORD)
@@ -61,16 +61,18 @@ def caller_role(pg_admin_dsn: str, pg_dsn: str) -> Iterator[str]:
             store.grant_join(role)
         yield role
     finally:
-        with psycopg.connect(pg_dsn, autocommit=True) as conn:
+        with psycopg.connect(pg_dsn, autocommit=True, prepare_threshold=None) as conn:
             conn.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
-        with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
+        with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as conn:
             conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
 
 
 def open_caller(pg_dsn: str, role: str) -> psycopg.Connection[Any]:
     """The caller's connection, with a REPEATABLE READ transaction open whose
     snapshot is already taken, as an escrow stage's is."""
-    conn = psycopg.connect(make_conninfo(pg_dsn, user=role, password=PASSWORD), autocommit=True)
+    conn = psycopg.connect(
+        make_conninfo(pg_dsn, user=role, password=PASSWORD), autocommit=True, prepare_threshold=None
+    )
     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
     conn.execute("SELECT 1")
     return conn
@@ -379,7 +381,7 @@ def test_a_token_is_good_for_its_own_transaction_only(
 def test_only_the_named_roles_may_call_the_claim_function(pg_admin_dsn: str, pg_dsn: str) -> None:
     PostgresStore(pg_dsn).close()
     role = f"stranger_{uuid.uuid4().hex[:10]}"
-    with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
+    with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as conn:
         conn.execute(
             sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(PASSWORD)
@@ -388,7 +390,7 @@ def test_only_the_named_roles_may_call_the_claim_function(pg_admin_dsn: str, pg_
     try:
         dsn = make_conninfo(pg_dsn, user=role, password=PASSWORD)
         with (
-            psycopg.connect(dsn, autocommit=True) as conn,
+            psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as conn,
             pytest.raises(psycopg.errors.InsufficientPrivilege),
         ):
             conn.execute(
@@ -396,7 +398,7 @@ def test_only_the_named_roles_may_call_the_claim_function(pg_admin_dsn: str, pg_
                 (b"\x00" * 32,),
             )
     finally:
-        with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
+        with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as conn:
             conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
 
 

@@ -7,9 +7,10 @@ path from a PostgreSQL DSN:
 - ``sqlite:///path/to/ledger.db`` (absolute; ``sqlite:////path`` too),
   ``sqlite:ledger.db`` (relative), or a bare filesystem path;
 - ``postgresql://user:password@host:port/database?schema=agentgov`` (or
-  ``postgres://``). ``schema``, ``lock_timeout`` and ``idle_timeout`` are read
-  from the query and given to :meth:`~agentgov.core.BudgetManager.open_postgres`;
-  every other query parameter (``sslmode``, ...) is passed to libpq;
+  ``postgres://``). ``schema``, ``lock_timeout``, ``idle_timeout`` and
+  ``prepare_threshold`` (an integer, or ``none``) are read from the query and
+  given to :meth:`~agentgov.core.BudgetManager.open_postgres`; every other
+  query parameter (``sslmode``, ...) is passed to libpq;
 - a libpq ``key=value`` connection string (``host=db dbname=fleet``), passed to
   libpq as it is; give ``schema`` and the timeouts as keyword options. Such a
   string is never taken for a file name.
@@ -26,7 +27,19 @@ from agentgov.core import BudgetManager, GovernancePolicy
 __all__ = ["open_url", "parse_url"]
 
 _POSTGRES_SCHEMES = ("postgresql", "postgres")
-_POSTGRES_OPTIONS: dict[str, type] = {"schema": str, "lock_timeout": float, "idle_timeout": float}
+
+
+def _threshold(value: str) -> int | None:
+    """``prepare_threshold`` from a URL: an integer, or ``none``."""
+    return None if value.lower() in ("none", "") else int(value)
+
+
+_POSTGRES_OPTIONS: dict[str, Any] = {
+    "schema": str,
+    "lock_timeout": float,
+    "idle_timeout": float,
+    "prepare_threshold": _threshold,
+}
 _CONNINFO = re.compile(r"\A\s*[a-z_]+\s*=")
 """A libpq ``key=value`` connection string, as opposed to a URL or a path."""
 
@@ -57,9 +70,8 @@ def parse_url(url: str) -> tuple[str, str, dict[str, Any]]:
             try:
                 options[key] = kind(value)
             except ValueError as exc:
-                raise ValueError(
-                    f"{key}={value!r} in the ledger URL is not a {kind.__name__}"
-                ) from exc
+                wanted = "an integer, or none" if kind is _threshold else f"a {kind.__name__}"
+                raise ValueError(f"{key}={value!r} in the ledger URL is not {wanted}") from exc
         dsn = urlunsplit(
             (parts.scheme, parts.netloc, parts.path, urlencode(passed), parts.fragment)
         )
