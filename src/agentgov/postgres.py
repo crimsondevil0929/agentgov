@@ -410,6 +410,35 @@ class PostgresStore:
         self._session = None
         self._end(session)
 
+    def writer_lock_held(self, timeout: float = 0.1) -> bool:
+        """Whether another transaction holds this schema's writer lock: it is
+        not granted within ``timeout`` seconds.
+
+        Writes nothing: the lock, if granted, is released at once. Opening a
+        governor never waits for the writer lock (it reads a snapshot), so an
+        open is no test of whether a writer is in the middle of one; this is.
+
+        :raises ValueError: If ``timeout`` is not positive.
+        :raises StorageError: If the database cannot be reached, or this store
+            is inside a session of its own, which may hold the lock itself.
+        """
+        millis = _millis(timeout, "timeout")
+        if self._session is not None:
+            raise StorageError(
+                "cannot probe the writer lock from inside a session: it may be this one's"
+            )
+        conn = self._live()
+        try:
+            conn.execute(self._sql.probe_lock(millis))
+        except psycopg.errors.LockNotAvailable:
+            self._rollback_quietly()
+            return True
+        except psycopg.Error as exc:
+            self._rollback_quietly()
+            raise StorageError(f"cannot probe the writer lock: {exc}") from exc
+        self._rollback_quietly()
+        return False
+
     def _begin(self) -> None:
         """Open the transaction and take the lock, reconnecting once if the
         server ended an idle connection since the last session."""
@@ -1277,6 +1306,8 @@ class _Statements:
         self.upgrade = _pg2_statements(schema)
         self._insert_entries: dict[int, sql.Composed] = {}
 
+        self._keys = keys
+
         # Joined transactions. The lock is the same key as begin_locked's,
         # taken inside a transaction the caller opened.
         self.lock_in_transaction = sql.SQL("SELECT pg_advisory_xact_lock({k1}, {k2})").format(
@@ -1302,6 +1333,16 @@ class _Statements:
             sql.SQL(
                 "GRANT EXECUTE ON FUNCTION {}(bytea, uuid, uuid, text, text, text) TO {}"
             ).format(self._claim_fn, who),
+        )
+
+    def probe_lock(self, timeout_ms: int) -> sql.Composed:
+        """A transaction that only tries for the writer lock, for ``timeout_ms``."""
+        return sql.SQL(
+            "BEGIN; SET LOCAL lock_timeout = {timeout}; SELECT pg_advisory_xact_lock({k1}, {k2})"
+        ).format(
+            timeout=sql.Literal(timeout_ms),
+            k1=sql.Literal(self._keys[0]),
+            k2=sql.Literal(self._keys[1]),
         )
 
     def find_entries(self, criteria: dict[str, object]) -> sql.Composed:

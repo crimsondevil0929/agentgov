@@ -602,6 +602,43 @@ def test_a_lock_wait_that_times_out_is_a_storage_error_and_changes_nothing(
         assert waiter.available("agent") == money("1.80")
 
 
+def test_whether_a_writer_holds_the_lock_is_probed_without_writing(
+    pg_dsn: str, gov: BudgetManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening is no probe of the writer lock: a governor opens from a snapshot
+    while another holds it. writer_lock_held() asks without writing."""
+    probe = PostgresStore(pg_dsn, read_only=True)
+    try:
+        assert probe.writer_lock_held(0.1) is False
+        holding, release = threading.Event(), threading.Event()
+        store = _store(gov)
+        original = store.commit
+
+        def hold_the_lock(batch: WriteBatch) -> None:
+            original(batch)
+            holding.set()
+            release.wait(10)
+
+        monkeypatch.setattr(store, "commit", hold_the_lock)
+        holder = threading.Thread(target=gov.spend, args=("agent", "0.10"))
+        holder.start()
+        assert holding.wait(10)
+        assert probe.writer_lock_held(0.2) is True
+        started = time.monotonic()
+        BudgetManager.open_postgres(pg_dsn, lock_timeout=0.2).close()  # never waits
+        assert time.monotonic() - started < 5
+        release.set()
+        holder.join()
+        assert probe.writer_lock_held(0.1) is False
+        assert _store(gov).head() == (len(gov.ledger), gov.ledger.head_hash), "nothing else wrote"
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            probe.writer_lock_held(0)
+    finally:
+        probe.close()
+    with _store(gov).writer(), pytest.raises(StorageError, match="inside a session"):
+        _store(gov).writer_lock_held()
+
+
 def test_a_governor_that_hangs_holding_the_lock_is_cut_off_by_the_server(
     pg_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
