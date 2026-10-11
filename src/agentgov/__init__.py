@@ -35,6 +35,7 @@ ledger.
 
 from __future__ import annotations
 
+from agentgov._aio import AsyncBudgetManager
 from agentgov.cognitive import (
     CallCycleDetector,
     CognitiveBreaker,
@@ -135,6 +136,7 @@ __all__ = [
     "AgentGovError",
     "AgentThrashingError",
     "AgentThrashingException",
+    "AsyncBudgetManager",
     "AsyncMeteredStream",
     "Authorization",
     "BudgetError",
