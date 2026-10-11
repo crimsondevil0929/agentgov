@@ -64,6 +64,7 @@ always *conservative for the governor*: costs round up, credits round down.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import itertools
 import json
@@ -91,7 +92,7 @@ from decimal import (
     Overflow,
 )
 from enum import Enum, unique
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Concatenate, Final, ParamSpec, TypeVar
 
 from agentgov.exceptions import (
     BudgetExceededError,
@@ -603,6 +604,14 @@ def _check_text(text: str, label: str, *, limit: int, identifier: bool) -> str |
     return None
 
 
+_escape_json: Final = json.encoder.encode_basestring
+
+
+def _quote(text: str | None) -> str:
+    """A JSON string as json.dumps(ensure_ascii=False) writes it, or null."""
+    return "null" if text is None else str(_escape_json(text))
+
+
 def _hash_entry(
     *,
     prev_hash: str,
@@ -632,6 +641,25 @@ def _hash_entry(
         AGOV3 entry's text is not Unicode.
     """
     if version == _AUDIT_V3:
+        if _HEX64.fullmatch(prev_hash):
+            # The canonical document written out directly: the same bytes as
+            # the dict below through json.dumps, without building it. Only the
+            # free text needs escaping; every other value is a UUID, an
+            # enum's value, a fixed-point amount, an instant or an integer.
+            reference = "null" if ref is None else f'"{ref}"'
+            text = (
+                f'{{"amount":"{_fixed(amount)}","balance_after":"{_fixed(balance_after)}",'
+                f'"counterparty_id":{_quote(counterparty_id)},"direction":"{direction.value}",'
+                f'"entry_id":"{entry_id}","entry_type":"{entry_type.value}","format":"AGOV3",'
+                f'"memo":{_quote(memo)},"prev_hash":"{prev_hash}",'
+                f'"ref":{reference},"scope_id":{_quote(scope_id)},'
+                f'"sequence":{int(sequence)},"timestamp":"{_iso(timestamp)}",'
+                f'"transaction_id":"{transaction_id}"}}'
+            )
+            try:
+                return hashlib.sha256(text.encode("utf-8")).hexdigest()
+            except UnicodeEncodeError as exc:
+                raise ValueError("an AGOV3 entry's text must be valid Unicode") from exc
         # RFC 8785 canonical JSON of one flat object: the keys below are in
         # canonical (sorted) order, every value is a string, null or a safe
         # integer, and json.dumps with ensure_ascii=False escapes strings
@@ -3442,6 +3470,40 @@ class GovernancePolicy:
 # --------------------------------------------------------------------------
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+class _Request:
+    """One caller's mutation, waiting for a unit of work to run it in."""
+
+    __slots__ = ("error", "settled", "value", "work")
+
+    def __init__(self, work: Callable[[], Any]) -> None:
+        self.work = work
+        self.value: Any = None
+        self.error: BaseException | None = None
+        self.settled = False
+
+    def outcome(self) -> Any:
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+def _grouped(
+    method: Callable[Concatenate[BudgetManager, _P], _R],
+) -> Callable[Concatenate[BudgetManager, _P], _R]:
+    """A mutation that may share a unit of work with others (group commit)."""
+
+    @functools.wraps(method)
+    def grouped(self: BudgetManager, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        result: _R = self._submit(functools.partial(method, self, *args, **kwargs))
+        return result
+
+    return grouped
+
+
 class BudgetManager:
     """The spend governor: a hierarchical budget DAG over an immutable ledger.
 
@@ -3546,6 +3608,11 @@ class BudgetManager:
         self._checkpointing = False
         self._verify = verify
         self._signing = signing
+        self._queue: list[_Request] = []
+        self._queue_lock = threading.Lock()
+        self._settled = threading.Condition(self._queue_lock)  # work settled; a leader stood down
+        self._leading = False
+        self._contended = False  # the last catch-up found others' entries
         self._auditor: Any = None
         self._velocity: dict[str, _Velocity] = {}
         self._repairs: tuple[str, ...] = ()
@@ -4075,6 +4142,87 @@ class BudgetManager:
                 f"this {kind} stopped following the ledger: {self._unusable}"
             )
 
+    _BATCH: Final = 256
+    """The most mutations one unit of work runs."""
+
+    def _submit(self, work: Callable[[], _R]) -> _R:
+        """Run ``work``, a mutation, in a unit of work it may share.
+
+        On a shared ledger every mutation takes the fleet's writer lock,
+        catches up and commits. Callers of one governor that arrive together
+        share that: each queues its work and takes this governor's lock, and
+        the first to get it runs everything queued, in order, in one unit of
+        work: one lock, one catch-up, one commit. Each caller's own failure is
+        its own (a breaker trip recorded on the way still commits); a commit
+        that fails fails every mutation it carried. No result is returned
+        before the unit of work commits.
+
+        A caller that already holds this governor's lock (``ledger.lock``,
+        around a check and the act it decides) runs its work there and then,
+        alone: others' work never runs inside its critical section.
+        """
+        owned = getattr(self._lock, "_is_owned", None)
+        if self._shared is None or owned is None or owned():
+            return work()
+        request = _Request(work)
+        with self._queue_lock:
+            self._queue.append(request)
+            # One leader at a time; the others wait to be told their work is
+            # settled, all at once, never queueing on the governor's lock.
+            while not request.settled and self._leading:
+                self._settled.wait()
+            if request.settled:
+                result: _R = request.outcome()
+                return result
+            self._leading = True
+        try:
+            with self._lock:
+                while not request.settled:
+                    self._lead()
+        finally:
+            with self._queue_lock:
+                self._leading = False
+                self._settled.notify_all()  # the next with work queued leads
+        result = request.outcome()
+        return result
+
+    def _lead(self) -> None:
+        """Run what is queued, in one unit of work. Lock held.
+
+        The queue is drained once the unit of work holds the fleet's writer
+        lock, and again until it is empty: every caller that queued while the
+        lock was awaited rides along."""
+        batch: list[_Request] = []
+        try:
+            with self._mutating():
+                while len(batch) < self._BATCH:
+                    with self._queue_lock:
+                        room = self._BATCH - len(batch)
+                        taken, self._queue = self._queue[:room], self._queue[room:]
+                    if not taken:
+                        break
+                    for request in taken:
+                        batch.append(request)
+                        try:
+                            request.value = request.work()
+                        except Exception as exc:  # its own: the others go on
+                            request.error = exc
+        except BaseException as exc:
+            # The unit of work did not commit, or never began: nothing it
+            # wrote is durable, and nothing it returned stands. Work that
+            # never ran because it could not begin fails the same way.
+            if not batch:
+                with self._queue_lock:
+                    batch, self._queue = self._queue[: self._BATCH], self._queue[self._BATCH :]
+            for request in batch:
+                if request.error is None:
+                    request.value, request.error = None, exc
+        finally:
+            with self._queue_lock:
+                for request in batch:
+                    request.settled = True
+                self._settled.notify_all()
+
     @contextmanager
     def _mutating(self) -> Iterator[None]:
         """Hold this manager's lock for a mutation — and, on a shared ledger,
@@ -4109,19 +4257,60 @@ class BudgetManager:
                     self._require_following()
                     if self._dirty:
                         self._follow(shared)
+                    elif self._contended:
+                        # Others are writing: verify what they wrote before
+                        # taking the fleet's lock, so it is held only for
+                        # what they write meanwhile.
+                        self._catch_up_ahead(shared)
                     session: WriterSession | None = None
                     self._writing = True
                     try:
-                        with shared.writer() as session:
+                        with shared.writer(**self._reading_ahead(shared)) as session:
                             self._follow(shared)
                             yield
                     finally:
                         self._writing = False
                         if session is not None and session.wrote and not session.committed:
                             self._dirty = True
+                            self._recover(shared)
             finally:
                 self._depth -= 1
         self._after_mutation()
+
+    def _catch_up_ahead(self, store: SharedStore) -> None:
+        """Catch up from a snapshot, without the writer lock. Lock held."""
+        try:
+            self._catch_up(store)
+        except LedgerIntegrityError as exc:
+            self._unusable = str(exc)
+            raise
+
+    def _recover(self, store: SharedStore) -> None:
+        """A session wrote and did not commit, so its writes are in this view
+        and not in the ledger. Re-read the ledger now, still under the lock,
+        so no reader is served what never committed; when it cannot be read,
+        the next mutation tries again first. Lock held."""
+        try:
+            self._reload(store)
+        except Exception:
+            logger.warning(
+                "could not re-read the ledger after a write that did not commit; the next "
+                "mutation will",
+                exc_info=True,
+            )
+        else:
+            self._dirty = False
+
+    def _reading_ahead(self, store: SharedStore) -> dict[str, int]:
+        """What a store that reads ahead should read with the writer lock, for
+        the catch-up after it: everything after this view. Not for a ledger a
+        pre-0.1.2 writer still writes, whose catch-up reads authorization
+        rows too. Lock held."""
+        if not getattr(store, "prefetches", False):
+            return {}
+        if (self._state.saw_v1 and not self._state.saw_v2) or not _holds_snapshots(store):
+            return {}
+        return {"after_sequence": len(self._ledger), "after_control_row": self._control_high_water}
 
     def _after_mutation(self) -> None:
         """Work an outermost mutation makes due, done once it has committed and
@@ -4452,8 +4641,9 @@ class BudgetManager:
                 return
             length, head = store.head()
             if length == len(self._ledger) and head == self._ledger.head_hash:
+                self._contended = False
                 return
-            self._catch_up(store)
+            self._contended = self._catch_up(store) > 0
         except LedgerIntegrityError as exc:
             self._unusable = str(exc)
             raise
@@ -4717,6 +4907,7 @@ class BudgetManager:
 
     # -- topology ---------------------------------------------------------
 
+    @_grouped
     def open_root(
         self,
         scope_id: str,
@@ -4758,6 +4949,7 @@ class BudgetManager:
             self._commit(pending)
             return self._state.nodes[scope_id]
 
+    @_grouped
     def fund(
         self,
         scope_id: str,
@@ -4803,6 +4995,7 @@ class BudgetManager:
             self._commit(pending)
             return entry
 
+    @_grouped
     def delegate(
         self,
         parent_id: str,
@@ -4879,6 +5072,7 @@ class BudgetManager:
             self._commit(pending)
             return self._state.nodes[child_id]
 
+    @_grouped
     def release(
         self,
         scope_id: str,
@@ -4940,6 +5134,7 @@ class BudgetManager:
 
     # -- authorize / capture ---------------------------------------------
 
+    @_grouped
     def authorize(
         self,
         scope_id: str,
@@ -5010,6 +5205,7 @@ class BudgetManager:
             self._commit(pending)
             return self._open_auths[entry.entry_id]
 
+    @_grouped
     def capture(
         self,
         authorization: Authorization,
@@ -5109,6 +5305,7 @@ class BudgetManager:
                 )
             return spend_entry
 
+    @_grouped
     def void(self, authorization: Authorization, *, memo: str = "") -> LedgerEntry:
         """Cancel an authorization without spending, returning the held funds.
 
@@ -5121,6 +5318,7 @@ class BudgetManager:
             self._require_open_authorization(authorization, "was already settled")
             return self._void_locked(authorization, memo or "authorization voided")
 
+    @_grouped
     def spend(
         self,
         scope_id: str,
@@ -5144,6 +5342,7 @@ class BudgetManager:
             auth = self.authorize(scope_id, amount, memo=memo)
             return self.capture(auth, amount, memo=memo)
 
+    @_grouped
     def refund(
         self,
         scope_id: str,
@@ -5232,6 +5431,7 @@ class BudgetManager:
             self._commit(pending)
             return entry
 
+    @_grouped
     def anchor(self, scope_id: str, memo: str) -> LedgerEntry:
         """Commit an external record into the chain, moving no money.
 
@@ -5302,6 +5502,7 @@ class BudgetManager:
             ]
         return tuple(sorted(matching, key=lambda auth: auth.opened_at))
 
+    @_grouped
     def void_stale(
         self,
         older_than: timedelta | float,
@@ -5366,6 +5567,7 @@ class BudgetManager:
             self._require_node(scope_id)
             return self._halted_by(scope_id)
 
+    @_grouped
     def trip(self, scope_id: str, reason: str) -> None:
         """Manually trip the breaker for ``scope_id`` and its whole subtree.
 
@@ -5381,6 +5583,7 @@ class BudgetManager:
             self._require_node(scope_id)
             self._trip(scope_id, reason)
 
+    @_grouped
     def reset(self, scope_id: str) -> None:
         """Clear a tripped breaker so the scope may spend again.
 

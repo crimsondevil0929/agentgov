@@ -356,11 +356,20 @@ def test_a_failure_the_store_did_not_see_still_rolls_the_session_back(pg_dsn: st
 
 
 def test_a_write_the_database_refuses_fails_the_whole_session(pg_dsn: str) -> None:
+    """Writes go to the database with the COMMIT, so a refused one fails the
+    session as it ends; a read inside the session sends them first, and
+    learns of the refusal there."""
     store = PostgresStore(pg_dsn)
     try:
-        with store.writer() as session:
-            with pytest.raises(LedgerIntegrityError, match="durably append"):
+        with pytest.raises(LedgerIntegrityError, match="durably append 1 entry"):
+            with store.writer() as session:
                 store.commit(WriteBatch(entries=[_forged_first_entry()]))
+        assert session.wrote and not session.committed
+        assert store.head() == (0, GENESIS_HASH)
+        with store.writer() as session:
+            store.commit(WriteBatch(entries=[_forged_first_entry()]))
+            with pytest.raises(LedgerIntegrityError, match="durably append 1 entry"):
+                store.find_entries(scope_id="org")
             with pytest.raises(StorageError, match="earlier write in this session failed"):
                 store.commit(WriteBatch(entries=[_forged_first_entry()]))
         assert session.wrote and not session.committed
@@ -485,7 +494,8 @@ def test_a_governor_with_a_stale_view_is_refused_not_forked_and_recovers(
     pg_dsn: str, gov: BudgetManager, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Skip the catch-up and write on an old head: the database refuses the
-    entry, the session rolls back, and the next write re-reads the ledger."""
+    entry, the session rolls back, and the governor re-reads the ledger at
+    once, so nothing that never committed is served."""
     with BudgetManager.open_postgres(pg_dsn) as other:
         other.spend("agent", "0.50")
         committed = other.ledger.entries()
@@ -494,8 +504,9 @@ def test_a_governor_with_a_stale_view_is_refused_not_forked_and_recovers(
         patch.setattr(BudgetManager, "_follow", lambda self, store: None)
         with pytest.raises(LedgerIntegrityError, match="extend the committed head"):
             gov.spend("agent", "0.10")
-    assert gov._dirty, "a session that wrote and did not commit leaves memory suspect"
+    assert not gov._dirty, "re-read at once: memory is the ledger's again"
     assert _store(gov).load_entries() == committed, "the refused entries never landed"
+    assert gov.ledger.head_hash == committed[-1].entry_hash
 
     gov.spend("agent", "0.10")  # re-reads, then writes on the real head
     with BudgetManager.open_postgres(pg_dsn, read_only=True) as audit:
@@ -512,7 +523,7 @@ def test_a_connection_lost_before_commit_rolls_back_and_is_re_read(
 ) -> None:
     """The server ends the session after the writes and before COMMIT: the
     caller is told the write did not commit, and it did not; the governor,
-    whose memory already held it, re-reads before acting again."""
+    whose memory already held it, re-reads at once."""
     store = _store(gov)
     original = store.commit
 
@@ -525,10 +536,11 @@ def test_a_connection_lost_before_commit_rolls_back_and_is_re_read(
         patch.setattr(store, "commit", write_then_lose_the_connection)
         with pytest.raises(StorageError, match="did not commit"):
             gov.authorize("agent", "0.30")
-    assert gov._dirty
-    assert gov.available("agent") == money("1.70"), "memory ran ahead of the database"
+    assert not gov._dirty
+    assert gov.available("agent") == money("2.00"), "the phantom hold is gone"
+    assert gov.stale_authorizations(0) == ()
 
-    gov.spend("agent", "0.10")  # reconnects, re-reads, and the phantom hold is gone
+    gov.spend("agent", "0.10")
     assert gov.available("agent") == money("1.90")
     assert gov.stale_authorizations(0) == ()
     gov.verify_integrity()
@@ -550,9 +562,9 @@ def test_a_commit_whose_outcome_is_lost_is_re_read_not_retried(
         patch.setattr(PostgresStore, "_end", commit_then_lose_the_answer)
         with pytest.raises(StorageError, match="connection lost"):
             gov.spend("agent", "0.25")
-    assert gov._dirty
+    assert not gov._dirty, "re-read in full at once"
 
-    assert gov.refresh() == 0  # re-read in full; nothing new beyond what it held
+    assert gov.refresh() == 0  # nothing new beyond what it re-read
     assert not gov._dirty
     assert gov.available("agent") == money("1.75")
     spends = [e for e in gov.audit_trail("agent") if e.entry_type is EntryType.SPEND]
@@ -644,7 +656,7 @@ def test_a_governor_that_hangs_holding_the_lock_is_cut_off_by_the_server(
 ) -> None:
     """A stalled lock holder cannot stall the fleet: after ``idle_timeout`` the
     server ends its session, rolls its writes back, and frees the lock. The
-    stalled governor learns at its commit and re-reads before acting again."""
+    stalled governor learns at its commit and re-reads at once."""
     seeded(pg_dsn).close()
     hung = BudgetManager.open_postgres(pg_dsn, idle_timeout=0.5)
     stalled = threading.Event()
@@ -672,7 +684,8 @@ def test_a_governor_that_hangs_holding_the_lock_is_cut_off_by_the_server(
             healthy.spend("agent", "0.20")  # waits out the stalled holder, then writes
         thread.join()
         assert len(outcome) == 1 and isinstance(outcome[0], StorageError)
-        assert hung._dirty
+        assert not hung._dirty
+        assert hung.available("agent") == money("1.80"), "re-read: the healthy 0.20, not the 0.40"
 
         monkeypatch.undo()
         hung.spend("agent", "0.30")  # reconnects, re-reads, writes on the real head

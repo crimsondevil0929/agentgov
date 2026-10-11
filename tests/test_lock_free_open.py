@@ -176,21 +176,16 @@ def test_a_repair_re_reads_under_the_lock_and_erases_nothing_written_since(
 def test_a_governor_left_dirty_re_reads_before_it_takes_the_lock(
     pg_dsn: str, seeded: BudgetManager, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After a commit whose outcome was lost, the next mutation rebuilds its
-    view from a snapshot, as an open does, and holds the writer lock only to
-    catch up from it: the full read never runs under the fleet's lock."""
+    """After a commit whose outcome was lost, the governor rebuilds its view
+    from a snapshot at once, as an open does, before anyone reads what may
+    never have committed; and the full read never runs under the fleet's
+    lock. If that read fails too, the next mutation makes it, first."""
     original_end = PostgresStore._end
 
     def commit_then_lose_the_answer(self: PostgresStore, session: Any) -> None:
         original_end(self, session)
         session.committed = False
         raise StorageError("connection lost after COMMIT was sent")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(PostgresStore, "_end", commit_then_lose_the_answer)
-        with pytest.raises(StorageError, match="connection lost"):
-            seeded.spend("agent", money("1"))
-    assert seeded._dirty
 
     full_reads_under_the_lock: list[bool] = []
     original_load = PostgresStore.load
@@ -200,7 +195,26 @@ def test_a_governor_left_dirty_re_reads_before_it_takes_the_lock(
         return original_load(self, **kwargs)
 
     monkeypatch.setattr(PostgresStore, "load", watched_load)
+    with monkeypatch.context() as patch:
+        patch.setattr(PostgresStore, "_end", commit_then_lose_the_answer)
+        with pytest.raises(StorageError, match="connection lost"):
+            seeded.spend("agent", money("1"))
+    assert full_reads_under_the_lock == [False] and not seeded._dirty
+    assert seeded.available("agent") == money("9"), "the lost commit had in fact committed"
+
+    def unreadable(self: PostgresStore, **kwargs: Any) -> StoreImage:
+        full_reads_under_the_lock.append(self._session is not None)
+        raise StorageError("the database is unreachable")
+
+    full_reads_under_the_lock.clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(PostgresStore, "_end", commit_then_lose_the_answer)
+        patch.setattr(PostgresStore, "load", unreadable)
+        with pytest.raises(StorageError, match="connection lost"):
+            seeded.spend("agent", money("1"))
+    assert full_reads_under_the_lock == [False] and seeded._dirty
+    full_reads_under_the_lock.clear()
     seeded.spend("agent", money("2"))
     assert full_reads_under_the_lock == [False]
-    assert seeded.available("agent") == money("7")
+    assert seeded.available("agent") == money("6")
     seeded.verify_integrity()

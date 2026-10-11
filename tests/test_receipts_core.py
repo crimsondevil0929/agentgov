@@ -81,7 +81,7 @@ def _reference(value: object) -> bytes:
 _PIECES = ["", "a", "Z", '"', "\\", "\n", "\x00", "\x1f", "\x7f", "\u2028", "é", "\ue000"]
 _PIECES += ["\uffff", "\U00010000", "\U0001f600"]
 _TEXT = st.lists(st.sampled_from(_PIECES), max_size=6).map("".join) | st.text(
-    alphabet=st.characters(exclude_categories=("Cs",)), max_size=8
+    alphabet=st.characters(codec="utf-8"), max_size=8
 )
 _JSON = st.recursive(
     st.none() | st.booleans() | st.integers(-(2**53 - 1), 2**53 - 1) | _TEXT,

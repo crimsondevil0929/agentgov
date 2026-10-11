@@ -242,3 +242,65 @@ def test_a_timestamp_not_in_the_written_form_parses_as_strptime_would(text: str)
     except ValueError:
         found = ValueError
     assert found == expected
+
+
+_TEXT = st.text(alphabet=st.characters(codec="utf-8", exclude_characters="\x00"), max_size=12)
+
+
+@given(
+    scope=_TEXT,
+    counterparty=st.none() | _TEXT,
+    memo=_TEXT,
+    ref=st.none() | st.uuids(),
+    sequence=st.integers(min_value=1, max_value=2**53 - 1),
+    amount=st.decimals(min_value=Decimal(0), max_value=Decimal("1e9"), places=8),
+    balance=st.decimals(min_value=Decimal("-1e9"), max_value=Decimal("1e9"), places=8),
+    prev=st.sampled_from(["0" * 64, "ab" * 32, 'not"hex', "A" * 64]),
+)
+def test_the_agov3_hash_is_its_canonical_documents_digest(
+    scope: str,
+    counterparty: str | None,
+    memo: str,
+    ref: uuid.UUID | None,
+    sequence: int,
+    amount: Decimal,
+    balance: Decimal,
+    prev: str,
+) -> None:
+    """However it is computed, an AGOV3 hash is SHA-256 of the RFC 8785
+    encoding of the entry's document: the fast path writes the same bytes."""
+    import hashlib
+
+    fields: dict[str, Any] = {
+        "sequence": sequence,
+        "entry_id": uuid.UUID(int=sequence),
+        "transaction_id": uuid.UUID(int=sequence + 1),
+        "timestamp": datetime(2026, 10, 11, 12, 30, 15, 123456, tzinfo=UTC),
+        "entry_type": EntryType.SPEND,
+        "direction": Direction.DEBIT,
+        "scope_id": scope,
+        "counterparty_id": counterparty,
+        "amount": amount,
+        "balance_after": balance,
+        "prev_hash": prev,
+        "memo": memo,
+        "ref": ref,
+        "version": "AGOV3",
+    }
+    document = {
+        "amount": _fixed(amount),
+        "balance_after": _fixed(balance),
+        "counterparty_id": counterparty,
+        "direction": Direction.DEBIT.value,
+        "entry_id": str(fields["entry_id"]),
+        "entry_type": EntryType.SPEND.value,
+        "format": "AGOV3",
+        "memo": memo,
+        "prev_hash": prev,
+        "ref": str(ref) if ref is not None else None,
+        "scope_id": scope,
+        "sequence": sequence,
+        "timestamp": "2026-10-11T12:30:15.123456Z",
+        "transaction_id": str(fields["transaction_id"]),
+    }
+    assert _hash_entry(**fields) == hashlib.sha256(canonical_bytes(document)).hexdigest()

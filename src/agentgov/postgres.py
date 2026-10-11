@@ -158,6 +158,53 @@ def _millis(seconds: float, label: str) -> int:
     return max(1, round(seconds * 1000))
 
 
+_REFUSED: Final = "; the database admits only entries that extend the committed head"
+"""A duplicate sequence and a broken link are the same event: the entries were
+built on a head that is no longer the committed one."""
+
+
+def _appending(count: int) -> str:
+    return f"durably append {count} {'entry' if count == 1 else 'entries'}"
+
+
+def _mapped(exc: psycopg.Error, operation: str, refused: str = "") -> Exception:
+    """The package's own error for a driver's."""
+    if isinstance(exc, psycopg.errors.SerializationFailure):
+        return LedgerConflictError(f"cannot {operation}: {exc}")
+    if isinstance(exc, psycopg.errors.IntegrityError):
+        return LedgerIntegrityError(f"cannot {operation}{refused}: {exc}")
+    return StorageError(f"cannot {operation}: {exc}")
+
+
+def _selected(cursor: psycopg.Cursor[Any]) -> list[list[tuple[Any, ...]]]:
+    """The rows of every statement of a message that returned rows, in order."""
+    selected: list[list[tuple[Any, ...]]] = []
+    while True:
+        if cursor.description is not None:
+            selected.append(cursor.fetchall())
+        if not cursor.nextset():
+            return selected
+
+
+def _control_rows(rows: Sequence[tuple[Any, ...]]) -> tuple[tuple[int, ControlEvent], ...]:
+    """``control_events`` rows as ``(row id, event)``."""
+    return tuple(
+        (
+            int(row[0]),
+            ControlEvent(
+                event_id=row[1],
+                timestamp=_parse_iso(row[2]),
+                event_type=row[3],
+                scope_id=row[4],
+                reason=row[5],
+                ledger_head_hash=row[6],
+                entry_id=row[7],
+            ),
+        )
+        for row in rows
+    )
+
+
 class _Session:
     """One writer session. See :class:`~agentgov.storage.WriterSession`.
 
@@ -165,9 +212,26 @@ class _Session:
         or, for a joined session, the caller's.
     :ivar token: For a joined session, what proves to the database that a
         governor of this ledger joined that transaction. ``None`` otherwise.
+    :ivar head: The committed length and head, read with the lock; ``None``
+        once the session has written, or when they were not read.
+    :ivar delta: What was committed after ``after``, read with the lock, for
+        the governor's catch-up; ``None`` once used.
+    :ivar batches: The session's writes, sent in one message with the
+        ``COMMIT``: at most one statement per table, however many batches.
     """
 
-    __slots__ = ("committed", "conn", "failed", "token", "wrote")
+    __slots__ = (
+        "after",
+        "batches",
+        "committed",
+        "conn",
+        "delta",
+        "failed",
+        "head",
+        "pending",
+        "token",
+        "wrote",
+    )
 
     def __init__(self, conn: psycopg.Connection[Any], *, token: bytes | None = None) -> None:
         self.conn = conn
@@ -175,6 +239,11 @@ class _Session:
         self.committed = False
         self.wrote = False
         self.failed = False
+        self.head: tuple[int, str] | None = None
+        self.delta: StoreDelta | None = None
+        self.after: tuple[int, int] | None = None
+        self.batches: list[WriteBatch] = []
+        self.pending = 0
 
 
 class PostgresStore:
@@ -231,6 +300,7 @@ class PostgresStore:
         self._lock_timeout_ms = _millis(lock_timeout, "lock_timeout")
         self._idle_timeout_ms = _millis(idle_timeout, "idle_timeout")
         self._session: _Session | None = None
+        self._rendered: dict[str, str] | None = None  # see _templates
         self._key: bytes | None = None
         self._sql = _Statements(schema, _lock_keys(schema), self._lock_timeout_ms)
         self._conn = self._connect()
@@ -380,10 +450,23 @@ class PostgresStore:
 
     # -- sessions ---------------------------------------------------------
 
+    prefetches = True
+    """:meth:`writer` reads what a governor needs to catch up in the message
+    that takes the lock."""
+
     @contextmanager
-    def writer(self) -> Iterator[_Session]:
+    def writer(
+        self, *, after_sequence: int | None = None, after_control_row: int | None = None
+    ) -> Iterator[_Session]:
         """Take the writer lock for one unit of work. See
         :meth:`agentgov.storage.SharedStore.writer`.
+
+        A unit of work costs two round trips. The message that begins the
+        transaction and takes the lock also reads the head and, given the
+        caller's ``after_sequence`` and ``after_control_row``, everything
+        committed after them, which :meth:`head` and :meth:`snapshot` then
+        answer from. The session's writes go in one message with the
+        ``COMMIT``.
 
         :raises ReadOnlyLedgerError: If this store was opened read-only.
         :raises StorageError: If the lock was not granted within
@@ -398,8 +481,10 @@ class PostgresStore:
                 )
             yield self._session
             return
-        self._begin()
+        after = None if after_sequence is None else (after_sequence, after_control_row or 0)
+        head, delta = self._begin(after)
         session = _Session(self._conn)
+        session.head, session.delta, session.after = head, delta, after
         self._session = session
         try:
             yield session
@@ -439,14 +524,22 @@ class PostgresStore:
         self._rollback_quietly()
         return False
 
-    def _begin(self) -> None:
+    def _begin(
+        self, after: tuple[int, int] | None = None
+    ) -> tuple[tuple[int, str] | None, StoreDelta | None]:
         """Open the transaction and take the lock, reconnecting once if the
-        server ended an idle connection since the last session."""
+        server ended an idle connection since the last session; with
+        ``after``, read the head and what was committed after it, too.
+
+        :returns: The head and that delta, or ``(None, None)`` without ``after``.
+        """
         for attempt in (1, 2):
             conn = self._live()
             try:
-                conn.execute(self._sql.begin_locked)
-                return
+                if after is None:
+                    conn.execute(self._sql.begin_locked)
+                    return None, None
+                return self._begin_reading(conn, *after)
             except psycopg.errors.LockNotAvailable as exc:
                 self._rollback_quietly()
                 raise StorageError(
@@ -462,6 +555,138 @@ class PostgresStore:
             except psycopg.Error as exc:
                 self._rollback_quietly()
                 raise StorageError(f"cannot open a ledger transaction: {exc}") from exc
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _begin_reading(
+        self, conn: psycopg.Connection[Any], after_sequence: int, after_control_row: int
+    ) -> tuple[tuple[int, str], StoreDelta]:
+        """One message: begin, take the lock, and read the entry at
+        ``after_sequence``, every entry after it (the last is the head) and the
+        control rows after ``after_control_row``."""
+        template = self._templates(conn)["begin"]
+        message = template.replace("<AFTER>", str(int(after_sequence))).replace(
+            "<CONTROL>", str(int(after_control_row))
+        )
+        selected = _selected(conn.execute(message))
+        entry_rows, control_rows = selected[-2:]  # after the lock's
+        found = [_entry(row) for row in entry_rows]
+        if after_sequence > 0 and (not found or found[0].sequence != after_sequence):
+            # Shorter than this view: the ledger was cut back under it. Its
+            # real head, for the caller's catch-up to refuse.
+            row = conn.execute(self._sql.head).fetchone()
+            head = (int(row[0]), str(row[1])) if row is not None else (0, GENESIS_HASH)
+            return head, self._delta(None, [], control_rows, after_control_row)
+        anchor = found[0].entry_hash if after_sequence > 0 else None
+        entries = found[1:] if after_sequence > 0 else found
+        last = found[-1] if found else None
+        head = (last.sequence, last.entry_hash) if last is not None else (0, GENESIS_HASH)
+        return head, self._delta(anchor, entries, control_rows, after_control_row)
+
+    def _delta(
+        self,
+        anchor: str | None,
+        entries: Sequence[LedgerEntry],
+        control_rows: Sequence[tuple[Any, ...]],
+        after_control_row: int,
+    ) -> StoreDelta:
+        rows = _control_rows(control_rows)
+        return StoreDelta(
+            schema_version=self._version,
+            anchor_hash=anchor,
+            entries=tuple(entries),
+            authorizations=(),
+            legacy_control_events=tuple(event for _, event in rows if event.entry_id is None),
+            control_high_water=max((row_id for row_id, _ in rows), default=after_control_row),
+        )
+
+    def _templates(self, conn: psycopg.Connection[Any]) -> dict[str, str]:
+        """The messages this store sends most, rendered once."""
+        if self._rendered is None:
+            entries = self._sql.select_entries_from.as_string(conn)
+            control = self._sql.select_control.as_string(conn).replace("%s", "<CONTROL>")
+            self._rendered = {
+                "begin": "; ".join(
+                    (
+                        self._sql.begin_locked.as_string(conn),
+                        entries.replace("%s", "<AFTER>"),
+                        control,
+                    )
+                ),
+                "read": "; ".join(
+                    (
+                        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                        entries.replace("%s", "<AFTER>"),
+                        control,
+                        "ROLLBACK",
+                    )
+                ),
+            }
+        return self._rendered
+
+    def _flush(self) -> None:
+        """Send what this session wrote, without committing: a read inside the
+        session then sees its writes. Inside the session."""
+        session = self._session
+        if session is None or not session.batches:
+            return
+        statements, count = self._render(session.batches), session.pending
+        session.batches, session.pending = [], 0
+        with self._errors(_appending(count), refused=_REFUSED):
+            self._conn.execute("; ".join(statements))
+
+    def _render(self, batches: Sequence[WriteBatch]) -> list[str]:
+        """A session's writes as at most one statement per table: every entry,
+        in chain order, in one INSERT (a row trigger sees the rows the
+        statement inserted before it, so the chain check holds within it);
+        each node's last state; the control rows; and the open holds, less
+        those opened and closed again within the session."""
+        mogrify = psycopg.ClientCursor(self._conn).mogrify
+        entries = [entry for batch in batches for entry in batch.entries]
+        nodes: dict[str, BudgetNode] = {}
+        controls: list[ControlEvent] = []
+        opened: dict[Any, Authorization] = {}
+        closed: list[Any] = []
+        for batch in batches:
+            for node in batch.nodes:
+                nodes[node.scope_id] = node
+            controls.extend(batch.control_events)
+            for auth in batch.opened:
+                opened[auth.authorization_id] = auth
+            for authorization_id in batch.closed:
+                if opened.pop(authorization_id, None) is None:
+                    closed.append(authorization_id)
+        statements = []
+        if entries:
+            statements.append(
+                mogrify(
+                    self._sql.insert_entries(len(entries)),
+                    [value for entry in entries for value in _entry_row(entry)],
+                )
+            )
+        if nodes:
+            statements.append(
+                mogrify(
+                    self._sql.upsert_nodes(len(nodes)),
+                    [value for node in nodes.values() for value in _node_row(node)],
+                )
+            )
+        if controls:
+            statements.append(
+                mogrify(
+                    self._sql.insert_controls(len(controls)),
+                    [value for event in controls for value in _control_row(event)],
+                )
+            )
+        if opened:
+            statements.append(
+                mogrify(
+                    self._sql.insert_authorizations(len(opened)),
+                    [value for auth in opened.values() for value in _authorization_row(auth)],
+                )
+            )
+        if closed:
+            statements.append(mogrify(self._sql.delete_authorizations, (closed,)))
+        return statements
 
     def _end(self, session: _Session) -> None:
         conn = self._conn
@@ -472,6 +697,34 @@ class PostgresStore:
         if session.failed or conn.info.transaction_status is psycopg.pq.TransactionStatus.INERROR:
             session.failed = True
             self._rollback_quietly()
+            return
+        if session.batches:
+            # The writes and the COMMIT, in one message: a write the database
+            # refuses skips the rest, COMMIT included.
+            message = "; ".join([*self._render(session.batches), "COMMIT"])
+            count = session.pending
+            session.batches, session.pending = [], 0
+            try:
+                cursor = conn.execute(message)
+                while cursor.nextset():
+                    pass
+                status = cursor.statusmessage
+            except psycopg.OperationalError as exc:
+                session.failed = True
+                self._rollback_quietly()
+                raise StorageError(
+                    f"the ledger transaction did not commit, or its outcome was lost with the "
+                    f"connection: {exc}"
+                ) from exc
+            except psycopg.Error as exc:
+                session.failed = True
+                self._rollback_quietly()
+                raise _mapped(exc, _appending(count), _REFUSED) from exc
+            if status != "COMMIT":  # pragma: no cover - an error above comes first
+                raise StorageError(
+                    f"the ledger transaction did not commit: the server answered {status}"
+                )
+            session.committed = True
             return
         try:
             status = conn.execute("COMMIT").statusmessage
@@ -504,18 +757,10 @@ class PostgresStore:
         """
         try:
             yield
-        except psycopg.errors.SerializationFailure as exc:
-            if self._session is not None:
-                self._session.failed = True
-            raise LedgerConflictError(f"cannot {operation}: {exc}") from exc
-        except psycopg.errors.IntegrityError as exc:
-            if self._session is not None:
-                self._session.failed = True
-            raise LedgerIntegrityError(f"cannot {operation}{refused}: {exc}") from exc
         except psycopg.Error as exc:
             if self._session is not None:
                 self._session.failed = True
-            raise StorageError(f"cannot {operation}: {exc}") from exc
+            raise _mapped(exc, operation, refused) from exc
         except BaseException:
             if self._session is not None:
                 self._session.failed = True
@@ -533,6 +778,7 @@ class PostgresStore:
         several SELECTs see one snapshot of what is committed.
         """
         if self._in_own_session():
+            self._flush()
             yield
             return
         conn = self._live()
@@ -566,20 +812,25 @@ class PostgresStore:
                 "the transaction commits"
             )
         session.wrote = True
+        session.head = None  # the head is the session's own now
+        session.delta = None
         conn = self._conn
         count = len(batch.entries)
-        noun = "entry" if count == 1 else "entries"
-        # A duplicate sequence and a broken link are the same event: these
-        # entries were built on a head that is no longer the committed one.
-        refused = "; the database admits only entries that extend the committed head"
-        # Plain statements, never pipeline mode (nor executemany, which uses
-        # it): after a pipeline the server shows the session idle in
-        # transaction but has not armed idle_in_transaction_session_timeout,
-        # so a governor that stalled right after writing would hold the writer
-        # lock forever. The entries go in as one multi-row INSERT, so a batch
-        # is still one round trip; a row trigger sees the rows the same
-        # statement inserted before it, so the chain check holds within it.
-        with self._errors(f"durably append {count} {noun}", refused=refused), conn.cursor() as cur:
+        if not batch.redeemed:
+            # Kept, and sent with the COMMIT: plain statements in one simple
+            # query, never pipeline mode (nor executemany, which uses it).
+            # After a pipeline the server shows the session idle in
+            # transaction without having armed
+            # idle_in_transaction_session_timeout, so a governor that stalled
+            # right after writing would hold the writer lock forever; a message
+            # that ends in COMMIT leaves no transaction open.
+            session.batches.append(batch)
+            session.pending += count
+            return
+        # Claims to book: each must still be pending, which only the count of
+        # rows deleted shows, before the COMMIT. What is queued goes first.
+        self._flush()
+        with self._errors(_appending(count), refused=_REFUSED), conn.cursor() as cur:
             if batch.entries:
                 cur.execute(
                     self._sql.insert_entries(len(batch.entries)),
@@ -621,6 +872,7 @@ class PostgresStore:
         session = self._require_session("repair cache tables")
         if session.token is not None:
             raise StorageError("cannot repair cache tables inside a joined transaction")
+        self._flush()
         session.wrote = True
         conn = self._conn
         with self._errors("repair cache tables"), conn.cursor() as cur:
@@ -759,6 +1011,10 @@ class PostgresStore:
     def head(self) -> tuple[int, str]:
         """The committed length and head hash. See
         :meth:`agentgov.storage.SharedStore.head`."""
+        session = self._session
+        if session is not None and session.token is None and session.head is not None:
+            return session.head
+        self._flush()
         with self._errors("read the ledger head"):
             row = self._live().execute(self._sql.head).fetchone()
         if row is None:
@@ -806,6 +1062,18 @@ class PostgresStore:
         :param authorizations: Read every open authorization too. A reader
             that follows holds from the entries themselves need not.
         """
+        session = self._session
+        if (
+            session is not None
+            and session.token is None
+            and session.delta is not None
+            and session.after == (after_sequence, after_control_row)
+            and not authorizations
+        ):
+            delta, session.delta = session.delta, None
+            return delta
+        if session is None and not authorizations and self._version == _SCHEMA_VERSION:
+            return self._read_after(after_sequence, after_control_row)
         with self._reading(), self._errors("read the ledger"):
             version = self._installed_version() or _SCHEMA_VERSION
             anchor: str | None = None
@@ -823,6 +1091,28 @@ class PostgresStore:
             legacy_control_events=tuple(event for _, event in rows if event.entry_id is None),
             control_high_water=max((row_id for row_id, _ in rows), default=after_control_row),
         )
+
+    def _read_after(self, after_sequence: int, after_control_row: int) -> StoreDelta:
+        """What was committed after ``after_sequence`` and ``after_control_row``,
+        in one message: a read-only transaction around the reads."""
+        conn = self._live()
+        template = self._templates(conn)["read"]
+        message = template.replace("<AFTER>", str(int(after_sequence))).replace(
+            "<CONTROL>", str(int(after_control_row))
+        )
+        with self._errors("read the ledger"):
+            try:
+                selected = _selected(conn.execute(message))
+            except BaseException:
+                self._rollback_quietly()
+                raise
+        entry_rows, control_rows = selected
+        found = [_entry(row) for row in entry_rows]
+        if after_sequence > 0:
+            if not found or found[0].sequence != after_sequence:
+                return self._delta(None, [], control_rows, after_control_row)
+            return self._delta(found[0].entry_hash, found[1:], control_rows, after_control_row)
+        return self._delta(None, found, control_rows, after_control_row)
 
     # -- checkpoints ------------------------------------------------------
 
@@ -1054,21 +1344,7 @@ class PostgresStore:
             rows = self._conn.execute(
                 self._sql.select_control_after_entry, (after_entry,)
             ).fetchall()
-        return tuple(
-            (
-                int(row[0]),
-                ControlEvent(
-                    event_id=row[1],
-                    timestamp=_parse_iso(row[2]),
-                    event_type=row[3],
-                    scope_id=row[4],
-                    reason=row[5],
-                    ledger_head_hash=row[6],
-                    entry_id=row[7],
-                ),
-            )
-            for row in rows
-        )
+        return _control_rows(rows)
 
     def _select_authorizations(self) -> tuple[PersistedAuthorization, ...]:
         rows = self._conn.execute(self._sql.select_authorizations).fetchall()
@@ -1222,6 +1498,9 @@ class _Statements:
         self.select_entries = sql.SQL(
             "SELECT {} FROM {} WHERE sequence > %s ORDER BY sequence ASC"
         ).format(columns, entries)
+        self.select_entries_from = sql.SQL(
+            "SELECT {} FROM {} WHERE sequence >= %s ORDER BY sequence ASC"
+        ).format(columns, entries)
         self.select_entries_range = sql.SQL(
             "SELECT {} FROM {} WHERE sequence > %s AND sequence <= %s "
             "ORDER BY sequence ASC LIMIT %s"
@@ -1298,6 +1577,11 @@ class _Statements:
         self.delete_authorization = sql.SQL("DELETE FROM {} WHERE authorization_id = %s").format(
             auths
         )
+        self.delete_authorizations = sql.SQL(
+            "DELETE FROM {} WHERE authorization_id = ANY(%s)"
+        ).format(auths)
+        self._nodes_table, self._control_table, self._auths_table = nodes, control, auths
+        self._multi: dict[tuple[str, int], sql.Composed] = {}
         self.select_authorizations = sql.SQL(
             "SELECT authorization_id, scope_id, amount, opened_at, entry_id FROM {}"
         ).format(auths)
@@ -1362,6 +1646,53 @@ class _Statements:
         limit = sql.SQL(" LIMIT %(limit)s") if "limit" in criteria else sql.SQL("")
         return sql.SQL("SELECT {} FROM {} WHERE {} ORDER BY sequence ASC{}").format(
             self._entries_columns, self._entries_table, sql.SQL(" AND ").join(clauses), limit
+        )
+
+    def _rows(
+        self, key: str, prefix: sql.Composable, width: int, count: int, suffix: str = ""
+    ) -> sql.Composed:
+        """``prefix VALUES (...), ... suffix`` for ``count`` rows of ``width``."""
+        statement = self._multi.get((key, count))
+        if statement is None:
+            row = sql.SQL("({})").format(sql.SQL(", ").join([sql.Placeholder()] * width))
+            statement = sql.SQL("{} VALUES {}{}").format(
+                prefix, sql.SQL(", ").join([row] * count), sql.SQL(suffix)
+            )
+            self._multi[(key, count)] = statement
+        return statement
+
+    def upsert_nodes(self, count: int) -> sql.Composed:
+        """One upsert of ``count`` nodes, each a different scope."""
+        return self._rows(
+            "nodes",
+            sql.SQL("INSERT INTO {} (scope_id, parent_id, depth, allocated, created_at)").format(
+                self._nodes_table
+            ),
+            5,
+            count,
+            " ON CONFLICT (scope_id) DO UPDATE SET parent_id = excluded.parent_id, "
+            "depth = excluded.depth, allocated = excluded.allocated",
+        )
+
+    def insert_controls(self, count: int) -> sql.Composed:
+        return self._rows(
+            "controls",
+            sql.SQL(
+                "INSERT INTO {} "
+                "(event_id, timestamp, event_type, scope_id, reason, ledger_head_hash, entry_id)"
+            ).format(self._control_table),
+            7,
+            count,
+        )
+
+    def insert_authorizations(self, count: int) -> sql.Composed:
+        return self._rows(
+            "authorizations",
+            sql.SQL(
+                "INSERT INTO {} (authorization_id, scope_id, amount, opened_at, entry_id)"
+            ).format(self._auths_table),
+            5,
+            count,
         )
 
     def insert_entries(self, count: int) -> sql.Composed:

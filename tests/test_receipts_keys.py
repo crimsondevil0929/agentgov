@@ -15,6 +15,7 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -94,7 +95,7 @@ class Spy:
         raise AssertionError("agentgov verified through the signer")
 
 
-def _write(path: Path, signer: Signer, first: int, count: int, **kwargs: object) -> None:
+def _write(path: Path, signer: Signer, first: int, count: int, **kwargs: Any) -> None:
     with ReceiptLog(
         LOG_ID, signer, path=path, policy=EVERY_TWO, clock=Clock(), fsync=False, **kwargs
     ) as log:

@@ -269,7 +269,9 @@ def test_witnesses_cosign_a_ledgers_checkpoints_and_refuse_a_rewrite(tmp_path: P
         str(path), policy=EVERY_TEN, auditor=False, signing=signing
     ) as gov:
         first = gov.publish_checkpoint([witness])
-        assert first.log_id == log_id and first.tree_size == gov.ledger._state.last_checkpoint[0]
+        anchored = gov.ledger._state.last_checkpoint
+        assert anchored is not None
+        assert first.log_id == log_id and first.tree_size == anchored[0]
         for _ in range(12):
             gov.spend("agent", money("0.01"))
         second = gov.publish_checkpoint([witness])  # a consistency proof from the first
