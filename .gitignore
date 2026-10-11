@@ -70,3 +70,4 @@ Thumbs.db
 # Benchmark fixtures and local results (benchmarks/baseline/ is committed)
 benchmarks/.fixtures/
 benchmarks/results/
+.hypothesis/

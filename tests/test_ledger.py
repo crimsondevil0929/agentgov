@@ -72,8 +72,8 @@ def test_empty_ledger_starts_at_genesis() -> None:
 
 def test_post_chains_entries_and_updates_balance() -> None:
     ledger = Ledger()
-    (first,) = ledger.post([fund("root", "1.00")])
-    (second,) = ledger.post([spend("root", "0.25")])
+    (first,) = ledger._post([fund("root", "1.00")])
+    (second,) = ledger._post([spend("root", "0.25")])
 
     assert first.sequence == 1
     assert first.prev_hash == GENESIS_HASH
@@ -87,7 +87,8 @@ def test_post_chains_entries_and_updates_balance() -> None:
 
 def test_one_transaction_shares_a_transaction_id() -> None:
     ledger = Ledger()
-    entries = ledger.post(
+    ledger._post([fund("root", "1.00")])
+    entries = ledger._post(
         [
             LedgerLine(EntryType.ALLOCATION, Direction.DEBIT, "root", money("0.10"), "kid"),
             LedgerLine(EntryType.ALLOCATION, Direction.CREDIT, "kid", money("0.10"), "root"),
@@ -100,9 +101,9 @@ def test_one_transaction_shares_a_transaction_id() -> None:
 def test_balances_thread_through_a_single_transaction() -> None:
     """A capture credits and debits the same scope in one transaction."""
     ledger = Ledger()
-    ledger.post([fund("root", "1.00")])
-    (hold,) = ledger.post([LedgerLine(EntryType.HOLD, Direction.DEBIT, "root", money("0.30"))])
-    entries = ledger.post(
+    ledger._post([fund("root", "1.00")])
+    (hold,) = ledger._post([LedgerLine(EntryType.HOLD, Direction.DEBIT, "root", money("0.30"))])
+    entries = ledger._post(
         [
             LedgerLine(
                 EntryType.HOLD_VOID, Direction.CREDIT, "root", money("0.30"), ref=hold.entry_id
@@ -122,27 +123,27 @@ def test_balances_thread_through_a_single_transaction() -> None:
 def test_illegal_direction_is_rejected() -> None:
     ledger = Ledger()
     with pytest.raises(ValueError, match="may not be a"):
-        ledger.post([LedgerLine(EntryType.SPEND, Direction.CREDIT, "root", money("1"))])
+        ledger._post([LedgerLine(EntryType.SPEND, Direction.CREDIT, "root", money("1"))])
 
 
 def test_non_positive_amount_is_rejected() -> None:
     ledger = Ledger()
     with pytest.raises(ValueError, match="must be positive"):
-        ledger.post([fund("root", "0")])
+        ledger._post([fund("root", "0")])
 
 
 def test_unquantized_amount_is_rejected() -> None:
     ledger = Ledger()
     line = LedgerLine(EntryType.FUNDING, Direction.CREDIT, "root", Decimal("0.123456789"))
     with pytest.raises(ValueError, match="not quantized"):
-        ledger.post([line])
+        ledger._post([line])
 
 
 def test_unbalanced_transfer_is_rejected() -> None:
     ledger = Ledger()
-    ledger.post([fund("root", "1.00")])
+    ledger._post([fund("root", "1.00")])
     with pytest.raises(LedgerIntegrityError, match="does not balance"):
-        ledger.post(
+        ledger._post(
             [
                 LedgerLine(EntryType.ALLOCATION, Direction.DEBIT, "root", money("0.10"), "kid"),
                 LedgerLine(EntryType.ALLOCATION, Direction.CREDIT, "kid", money("0.09"), "root"),
@@ -152,17 +153,17 @@ def test_unbalanced_transfer_is_rejected() -> None:
 
 def test_empty_transaction_is_rejected() -> None:
     with pytest.raises(ValueError, match="at least one line"):
-        Ledger().post([])
+        Ledger()._post([])
 
 
 def test_a_rejected_transaction_writes_nothing() -> None:
     """Validation completes before any append, so failure leaves no trace."""
     ledger = Ledger()
-    ledger.post([fund("root", "1.00")])
+    ledger._post([fund("root", "1.00")])
     head_before = ledger.head_hash
 
     with pytest.raises(ValueError):
-        ledger.post(
+        ledger._post(
             [
                 spend("root", "0.10"),  # valid
                 LedgerLine(EntryType.SPEND, Direction.CREDIT, "root", money("0.10")),
@@ -180,8 +181,8 @@ def test_a_rejected_transaction_writes_nothing() -> None:
 
 def test_verify_chain_detects_a_forged_amount() -> None:
     ledger = Ledger()
-    ledger.post([fund("root", "1.00")])
-    ledger.post([spend("root", "0.25")])
+    ledger._post([fund("root", "1.00")])
+    ledger._post([spend("root", "0.25")])
 
     # Simulate an attacker rewriting history in place.
     forged = dataclasses.replace(ledger._entries[1], amount=money("0.01"))
@@ -193,8 +194,8 @@ def test_verify_chain_detects_a_forged_amount() -> None:
 
 def test_verify_chain_detects_a_broken_link() -> None:
     ledger = Ledger()
-    ledger.post([fund("root", "1.00")])
-    ledger.post([spend("root", "0.25")])
+    ledger._post([fund("root", "1.00")])
+    ledger._post([spend("root", "0.25")])
 
     ledger._entries[1] = dataclasses.replace(ledger._entries[1], prev_hash=GENESIS_HASH)
 
@@ -204,7 +205,7 @@ def test_verify_chain_detects_a_broken_link() -> None:
 
 def test_verify_chain_detects_a_desynced_balance_cache() -> None:
     ledger = Ledger()
-    ledger.post([fund("root", "1.00")])
+    ledger._post([fund("root", "1.00")])
     ledger._balances["root"] = money("9999.00")
 
     with pytest.raises(LedgerIntegrityError, match="cached balance"):
@@ -213,7 +214,7 @@ def test_verify_chain_detects_a_desynced_balance_cache() -> None:
 
 def test_verify_conservation_detects_invented_money() -> None:
     ledger = Ledger()
-    ledger.post([fund("root", "1.00")])
+    ledger._post([fund("root", "1.00")])
     ledger._balances["ghost"] = money("5.00")
 
     with pytest.raises(LedgerIntegrityError, match="conservation violated"):
@@ -225,7 +226,7 @@ def test_verify_conservation_detects_invented_money() -> None:
 
 def test_audit_line_is_fixed_field_and_parseable() -> None:
     ledger = Ledger()
-    (entry,) = ledger.post(
+    (entry,) = ledger._post(
         [
             LedgerLine(
                 EntryType.FUNDING,
@@ -252,7 +253,7 @@ def test_audit_line_is_fixed_field_and_parseable() -> None:
 
 def test_audit_record_is_all_strings() -> None:
     ledger = Ledger()
-    (entry,) = ledger.post([fund("root", "1.00")])
+    (entry,) = ledger._post([fund("root", "1.00")])
     record = entry.to_audit_record()
 
     assert all(isinstance(v, str) for v in record.values())
@@ -262,6 +263,6 @@ def test_audit_record_is_all_strings() -> None:
 
 def test_entries_are_frozen() -> None:
     ledger = Ledger()
-    (entry,) = ledger.post([fund("root", "1.00")])
+    (entry,) = ledger._post([fund("root", "1.00")])
     with pytest.raises(dataclasses.FrozenInstanceError):
         entry.amount = money("2.00")  # type: ignore[misc]

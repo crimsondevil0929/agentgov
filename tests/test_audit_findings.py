@@ -47,14 +47,13 @@ def test_f3_a_low_precision_host_context_cannot_brick_the_ledger(tmp_path: Path)
 # -- F4: what could be written and what could be replayed differed ----------
 
 
-@pytest.mark.xfail(strict=True, raises=(AssertionError, LedgerIntegrityError), reason="F4")
 def test_f4_a_write_the_governance_rules_refuse_is_never_committed(tmp_path: Path) -> None:
     db = str(tmp_path / "f4.db")
     with BudgetManager.open_sqlite(db) as gov:
         gov.open_root("root", money("1"))
         gov.delegate("root", "child", money("0.5"))
         try:
-            gov.ledger.post(
+            gov.ledger._post(
                 [LedgerLine(EntryType.FUNDING, Direction.CREDIT, "child", money("1000"))]
             )
         except (LedgerIntegrityError, ValueError):
@@ -66,7 +65,6 @@ def test_f4_a_write_the_governance_rules_refuse_is_never_committed(tmp_path: Pat
 # -- F5: refunds created spending power --------------------------------------
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F5")
 def test_f5_a_refund_cannot_exceed_what_the_scope_spent() -> None:
     gov = BudgetManager()
     gov.open_root("root", money("1.00"))
@@ -158,7 +156,6 @@ def slow_governor(tmp_path: Path) -> Iterator[BudgetManager]:
         gov.close()
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F8")
 def test_f8_ainvoke_never_blocks_the_event_loop(slow_governor: BudgetManager) -> None:
     metered = Interceptor(slow_governor, "worker", model="claude-opus-5")
     llm = DummyLLM(model="claude-opus-5", latency_seconds=0.01)
@@ -166,7 +163,6 @@ def test_f8_ainvoke_never_blocks_the_event_loop(slow_governor: BudgetManager) ->
     assert stall < 0.15, f"the event loop stalled for {stall:.3f}s"
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F8")
 def test_f8_async_streams_never_block_the_event_loop(slow_governor: BudgetManager) -> None:
     async def events() -> AsyncIterator[SimpleNamespace]:
         yield SimpleNamespace(usage=TokenUsage(input_tokens=100, output_tokens=10))

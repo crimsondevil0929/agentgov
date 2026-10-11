@@ -508,8 +508,11 @@ class AsyncMeteredStream(Generic[T]):
             async for event in events:
                 await render(event)
 
-    The governor's mutex is never held across an ``await``: the hold is taken
-    on entry and resolved on exit, and both are short synchronous sections.
+    The hold is taken on entry and resolved on exit, and both are durable
+    ledger writes, so both run on a worker thread rather than the event loop;
+    the governor's mutex is never held across an ``await``. A task cancelled
+    while the hold is being placed lets the write finish, releases the hold,
+    and then raises the cancellation.
 
     Constructor arguments match :class:`MeteredStream`, except ``call`` may
     return an awaitable, an async context manager, or an async iterable.
@@ -576,13 +579,15 @@ class AsyncMeteredStream(Generic[T]):
 
     async def __aenter__(self) -> AsyncMeteredStream[T]:
         """Authorize, then open the provider's stream."""
-        self._core.authorize()
+        from agentgov._aio import off_loop, off_loop_or_undo
+
+        await off_loop_or_undo(self._core.authorize, lambda _: self._core.resolve())
         try:
             raw = self._call()
             if isinstance(raw, Awaitable):
                 raw = await raw
         except BaseException:
-            self._core.resolve()
+            await off_loop(self._core.resolve)
             raise
 
         try:
@@ -594,7 +599,7 @@ class AsyncMeteredStream(Generic[T]):
                 source = raw
             self._source = source.__aiter__()
         except BaseException:
-            self._core.resolve()
+            await off_loop(self._core.resolve)
             raise
         return self
 
@@ -605,13 +610,15 @@ class AsyncMeteredStream(Generic[T]):
         traceback: TracebackType | None,
     ) -> None:
         """Close the provider's stream and resolve the hold, always."""
+        from agentgov._aio import off_loop
+
         try:
             if self._inner is not None:
                 aexit = getattr(self._inner, "__aexit__", None)
                 if callable(aexit):
                     await aexit(exc_type, exc_value, traceback)
         finally:
-            self._core.resolve()
+            await off_loop(self._core.resolve)
 
     def __aiter__(self) -> AsyncIterator[T]:
         return self
@@ -631,7 +638,9 @@ class AsyncMeteredStream(Generic[T]):
 
     async def aclose(self) -> None:
         """Resolve the hold explicitly, without exiting a context manager."""
-        self._core.resolve()
+        from agentgov._aio import off_loop
+
+        await off_loop(self._core.resolve)
 
 
 def build_call(

@@ -25,6 +25,7 @@ it, and every rate is a :class:`~decimal.Decimal`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -899,9 +900,15 @@ class Interceptor:
     ) -> MeteredCall[R]:
         """Await ``fn`` under budget enforcement and settle its exact cost.
 
-        The async counterpart of :meth:`invoke`. The governor's mutex is
-        never held across the ``await``, so concurrent tasks contend only for
-        the microseconds each ledger write takes.
+        The async counterpart of :meth:`invoke`. The hold and its settlement
+        are durable ledger writes (an fsync, or database round trips and a
+        lock wait), so both run on a worker thread, never on the event loop:
+        other coroutines keep running while they do. The governor's mutex is
+        never held across the ``await`` of ``fn``.
+
+        A task cancelled while the hold is being placed lets the write finish,
+        then releases the hold, then raises the cancellation; one cancelled
+        during ``fn`` releases the hold, as any exception from ``fn`` does.
 
         :param fn: The awaitable model or tool call to make.
         :param args: Positional arguments forwarded to ``fn``.
@@ -909,15 +916,24 @@ class Interceptor:
         :returns: The response together with its usage, settled cost, and
             ledger entry.
         """
+        from agentgov._aio import off_loop, off_loop_or_undo
+
         self._observe_cognitive(fn, args, kwargs)
         hold = self.size_hold(args, kwargs)
         guard = SpendGuard(self._manager, self._scope_id, hold)
-        with guard:
+        await off_loop_or_undo(
+            guard.__enter__, lambda _: guard.__exit__(asyncio.CancelledError, None, None)
+        )
+        try:
             started = time.perf_counter()
             response = await fn(*args, **kwargs)
             latency = time.perf_counter() - started
             usage, cost, applied = self._price(response)
             guard.settle(cost)
+        except BaseException as exc:
+            await off_loop(guard.__exit__, type(exc), exc, exc.__traceback__)
+            raise
+        await off_loop(guard.__exit__, None, None, None)
         self._record_cognitive_result(response)
         return self._result(response, usage, cost, hold, guard, latency, applied)
 

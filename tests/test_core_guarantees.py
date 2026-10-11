@@ -51,6 +51,7 @@ from agentgov.core import (
     LedgerLine,
     WriteBatch,
     _hash_entry,
+    _seal_memo,
     money,
 )
 from agentgov.exceptions import (
@@ -159,6 +160,7 @@ def _governor(path: str) -> tuple[BudgetManager, Authorization, Authorization]:
     gov.delegate("root", "tight", money("0.05"))
     gov.delegate("root", "halted", money("0.05"))
     gov.trip("halted", "operator halt")
+    gov.spend("worker", money("0.02"))  # something a refund can return
     open_hold = gov.authorize("worker", money("0.05"))
     exhausting = gov.authorize("tight", money("0.05"))
     return gov, open_hold, exhausting
@@ -345,8 +347,8 @@ def test_the_reference_is_covered_by_the_hash() -> None:
 
 def _raw_ledger_with_hold() -> tuple[Ledger, LedgerEntry]:
     ledger = Ledger()
-    ledger.post([LedgerLine(EntryType.FUNDING, Direction.CREDIT, "root", money("1.00"))])
-    (hold,) = ledger.post([LedgerLine(EntryType.HOLD, Direction.DEBIT, "root", money("0.30"))])
+    ledger._post([LedgerLine(EntryType.FUNDING, Direction.CREDIT, "root", money("1.00"))])
+    (hold,) = ledger._post([LedgerLine(EntryType.HOLD, Direction.DEBIT, "root", money("0.30"))])
     return ledger, hold
 
 
@@ -359,11 +361,11 @@ def _release(hold: LedgerEntry, **changes: Any) -> LedgerLine:
 
 def test_the_ledger_refuses_to_release_a_hold_twice() -> None:
     ledger, hold = _raw_ledger_with_hold()
-    ledger.post([_release(hold)])
+    ledger._post([_release(hold)])
     head, balance = ledger.head_hash, ledger.balance("root")
 
     with pytest.raises(LedgerIntegrityError, match="not an open hold"):
-        ledger.post([_release(hold)])
+        ledger._post([_release(hold)])
 
     assert ledger.head_hash == head and ledger.balance("root") == balance
     ledger.verify_chain()
@@ -383,7 +385,7 @@ def test_a_release_must_name_an_open_hold_of_its_scope_and_amount(
 ) -> None:
     ledger, hold = _raw_ledger_with_hold()
     with pytest.raises(LedgerIntegrityError, match=message):
-        ledger.post([_release(hold, **changes)])
+        ledger._post([_release(hold, **changes)])
     assert len(ledger) == 2
 
 
@@ -393,15 +395,15 @@ def test_a_spend_can_only_settle_a_hold_its_own_transaction_released() -> None:
         EntryType.SPEND, Direction.DEBIT, "root", money("0.10"), ref=hold.entry_id
     )
     with pytest.raises(LedgerIntegrityError, match="did not release"):
-        ledger.post([settling])
-    ledger.post([_release(hold), settling])  # the capture shape is accepted
+        ledger._post([settling])
+    ledger._post([_release(hold), settling])  # the capture shape is accepted
     ledger.verify_chain()
 
 
 def test_only_releases_and_spends_may_name_a_hold() -> None:
     ledger, hold = _raw_ledger_with_hold()
     with pytest.raises(ValueError, match="names no hold"):
-        ledger.post(
+        ledger._post(
             [
                 LedgerLine(
                     EntryType.REVERSAL, Direction.CREDIT, "root", money("0.01"), ref=hold.entry_id
@@ -429,6 +431,9 @@ def _chain(lines: list[_Line], *, versions: Sequence[str] = ()) -> list[LedgerEn
         sign = {Direction.CREDIT: 1, Direction.DEBIT: -1, Direction.NONE: 0}[direction]
         balances[scope] = balances.get(scope, Decimal(0)) + sign * value
         entry_id, txn, now = uuid.uuid4(), uuid.uuid4(), datetime.now(UTC)
+        # A seal carries a well-formed memo (for no legacy events), so a forged
+        # chain's seal fails only the rule its case names.
+        memo = _seal_memo(()) if kind is EntryType.SEAL else ""
         entry_hash = _hash_entry(
             prev_hash=head,
             sequence=index,
@@ -441,7 +446,7 @@ def _chain(lines: list[_Line], *, versions: Sequence[str] = ()) -> list[LedgerEn
             counterparty_id=None,
             amount=value,
             balance_after=balances[scope],
-            memo="",
+            memo=memo,
             ref=ref,
             version=version,
         )
@@ -459,6 +464,7 @@ def _chain(lines: list[_Line], *, versions: Sequence[str] = ()) -> list[LedgerEn
                 balance_after=balances[scope],
                 prev_hash=head,
                 entry_hash=entry_hash,
+                memo=memo,
                 ref=ref,
                 version=version,
             )

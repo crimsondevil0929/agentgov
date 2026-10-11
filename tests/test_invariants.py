@@ -191,7 +191,7 @@ def test_two_managers_sharing_a_ledger_share_one_mutex() -> None:
 
 def test_raw_ledger_lines_still_validate(gov: BudgetManager) -> None:
     with pytest.raises(ValueError, match="may not be a"):
-        gov.ledger.post([LedgerLine(EntryType.HOLD, Direction.CREDIT, "child", money("0.01"))])
+        gov.ledger._post([LedgerLine(EntryType.HOLD, Direction.CREDIT, "child", money("0.01"))])
     gov.verify_integrity()
 
 

@@ -319,7 +319,7 @@ def test_a_write_outside_a_writer_session_is_refused(pg_dsn: str, gov: BudgetMan
     try:
         ledger = Ledger(store=store)
         with pytest.raises(StorageError, match="outside a writer session"):
-            ledger.post([LedgerLine(EntryType.FUNDING, Direction.CREDIT, "rogue", money("1"))])
+            ledger._post([LedgerLine(EntryType.FUNDING, Direction.CREDIT, "rogue", money("1"))])
         with pytest.raises(StorageError, match="outside a writer session"):
             store.rebuild_caches(nodes=(), control_events=(), authorizations=())
         assert len(ledger) == len(gov.ledger), "nothing reached memory either"

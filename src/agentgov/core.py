@@ -72,6 +72,7 @@ import re
 import threading
 import time
 import uuid
+import warnings
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -638,10 +639,18 @@ class _Totals:
 _HoldKey = tuple[str, Decimal]
 """A hold's scope and amount. Pre-0.1.2 releases carry nothing sharper."""
 
+_CONTROL_TYPES: Final = frozenset({EntryType.CIRCUIT_TRIPPED, EntryType.CIRCUIT_RESET})
+
 
 @dataclass(slots=True)
 class _ChainState:
-    """Balances, totals, head and open holds, as the chain implies them.
+    """Everything the chain implies, and nothing else.
+
+    Money (balances, totals, open holds), position (head, length) and
+    governance (the delegation tree, breaker state, control events) are one
+    state, derived by one set of rules (:class:`_Overlay`): what a write may
+    commit is exactly what a replay accepts, so nothing accepted can later
+    fail to open.
 
     :ivar holds: Open holds, keyed by the ``entry_id`` of the HOLD entry that
         placed them, in the order they were placed.
@@ -650,8 +659,22 @@ class _ChainState:
         the chain determines *how many* holds are open but not *which*; the
         open authorizations table supplies the identities.
     :ivar saw_v1: The chain contains pre-0.1.2 (``AGOV1``) entries.
-    :ivar saw_v2: The chain contains ``AGOV2`` entries.
+    :ivar saw_v2: The chain contains entries written from v0.1.2 on.
     :ivar seal: The migration seal, once written.
+    :ivar nodes: Every scope, as the FUNDING and ALLOCATION entries that
+        created it describe it.
+    :ivar roots: The roots, in the order they were created.
+    :ivar tripped: Halted scopes: when, and why.
+    :ivar events: Every trip and reset, oldest first, including those a
+        pre-0.1.2 governor kept outside the chain (``legacy``).
+    :ivar legacy: Control events a pre-0.1.2 governor kept outside the chain,
+        vouched for by the migration seal.
+    :ivar legacy_applied: Whether ``legacy`` is folded into the state yet. It
+        is folded at the first entry written from v0.1.2 on (the seal), or by
+        :meth:`finish` for a chain that has none.
+    :ivar spent: Each scope's lifetime spend.
+    :ivar refunded: Each scope's lifetime refunds.
+    :ivar hold_counts: How many holds are open in each scope.
     """
 
     balances: dict[str, Decimal] = field(default_factory=dict)
@@ -663,15 +686,58 @@ class _ChainState:
     saw_v1: bool = False
     saw_v2: bool = False
     seal: LedgerEntry | None = None
+    nodes: dict[str, BudgetNode] = field(default_factory=dict)
+    roots: list[str] = field(default_factory=list)
+    tripped: dict[str, tuple[datetime, str]] = field(default_factory=dict)
+    events: list[ControlEvent] = field(default_factory=list)
+    legacy: tuple[ControlEvent, ...] = ()
+    legacy_applied: bool = False
+    spent: dict[str, Decimal] = field(default_factory=dict)
+    refunded: dict[str, Decimal] = field(default_factory=dict)
+    hold_counts: dict[str, int] = field(default_factory=dict)
 
-    def copy(self) -> _ChainState:
-        """An independent copy, for staging changes that may yet be refused."""
-        return dataclasses.replace(
-            self,
-            balances=dict(self.balances),
-            holds=dict(self.holds),
-            ambiguous=set(self.ambiguous),
-        )
+    # -- the lookups an _Overlay layers its staged changes over -----------
+
+    def balance(self, scope_id: str) -> Decimal:
+        return self.balances.get(scope_id, ZERO)
+
+    def open_hold(self, hold_id: uuid.UUID) -> LedgerEntry | None:
+        return self.holds.get(hold_id)
+
+    def iter_holds(self) -> Iterator[tuple[uuid.UUID, LedgerEntry]]:
+        return iter(list(self.holds.items()))
+
+    def is_ambiguous(self, key: _HoldKey) -> bool:
+        return key in self.ambiguous
+
+    def ambiguous_keys(self) -> set[_HoldKey]:
+        return set(self.ambiguous)
+
+    def node(self, scope_id: str) -> BudgetNode | None:
+        return self.nodes.get(scope_id)
+
+    def trip_of(self, scope_id: str) -> tuple[datetime, str] | None:
+        return self.tripped.get(scope_id)
+
+    def spent_by(self, scope_id: str) -> Decimal:
+        return self.spent.get(scope_id, ZERO)
+
+    def refunded_to(self, scope_id: str) -> Decimal:
+        return self.refunded.get(scope_id, ZERO)
+
+    def holds_open_in(self, scope_id: str) -> int:
+        return self.hold_counts.get(scope_id, 0)
+
+    def finish(self) -> None:
+        """Fold in pre-0.1.2 control events, for a chain with no newer entry.
+
+        :raises LedgerIntegrityError: If one names a scope the chain never
+            created.
+        """
+        if not self.legacy_applied:
+            view = _Overlay(self)
+            view.finish()
+            view.merge()
 
 
 def _hold_key(entry: LedgerEntry) -> _HoldKey:
@@ -692,25 +758,46 @@ def _reassign_holds(state: _ChainState, key: _HoldKey, holds: Sequence[LedgerEnt
 
 
 class _Overlay:
-    """A copy-on-write view of a :class:`_ChainState`.
+    """A copy-on-write view of a :class:`_ChainState`: the one rule engine.
 
-    Every entry is verified against the view and folded into it; the base
-    state changes only in :meth:`merge`. A unit of work validates its entries
-    here before anything is durable, a refresh verifies another process's
-    entries here before trusting them, and a full replay is this, started
-    from an empty state. One set of rules for all three.
+    Every entry is verified against the view and folded into it; the state
+    below changes only in :meth:`merge`. A unit of work validates its entries
+    here before anything is durable, a catch-up verifies another process's
+    entries here before trusting them, and a replay is this, started from an
+    empty state. One set of rules for all three, covering the money (hash
+    links, balances, hold pairing, balanced transfers) and the governance
+    (who may be funded, delegated to, released between, halted) alike, so
+    whatever a write commits a replay accepts.
+
+    A view may sit on another view (``base``): an operation staged on top of
+    a batch merges into the batch, or is dropped without touching it.
+
+    The view also records what its entries change in the store's cache
+    tables (:meth:`cache_rows`), so the caches a unit of work writes are the
+    ones its entries imply, whichever path wrote them.
     """
 
     __slots__ = (
         "_base",
         "_closed",
+        "_counts",
+        "_events",
+        "_net",
+        "_nodes",
         "_opened",
+        "_refunded",
+        "_roots",
+        "_row_scopes",
         "_settleable",
+        "_spent",
         "_start_head",
+        "_tripped",
         "_txn",
         "ambiguous",
         "balances",
         "head",
+        "legacy",
+        "legacy_applied",
         "length",
         "saw_v1",
         "saw_v2",
@@ -718,36 +805,107 @@ class _Overlay:
         "totals",
     )
 
-    def __init__(self, base: _ChainState) -> None:
+    def __init__(self, base: _ChainState | _Overlay) -> None:
         self._base = base
-        self._start_head = base.head
+        self._start_head: str = base.head
         self.balances: dict[str, Decimal] = {}
-        self.totals = base.totals
-        self.head = base.head
-        self.length = base.length
-        self.saw_v1 = base.saw_v1
-        self.saw_v2 = base.saw_v2
-        self.seal = base.seal
+        self.totals: _Totals = base.totals
+        self.head: str = base.head
+        self.length: int = base.length
+        self.saw_v1: bool = base.saw_v1
+        self.saw_v2: bool = base.saw_v2
+        self.seal: LedgerEntry | None = base.seal
+        self.legacy: tuple[ControlEvent, ...] = base.legacy
+        self.legacy_applied: bool = base.legacy_applied
         self.ambiguous: set[_HoldKey] = set()
         self._opened: dict[uuid.UUID, LedgerEntry] = {}
         self._closed: set[uuid.UUID] = set()
+        self._nodes: dict[str, BudgetNode] = {}
+        self._row_scopes: set[str] = set()
+        self._roots: list[str] = []
+        self._tripped: dict[str, tuple[datetime, str] | None] = {}
+        self._events: list[ControlEvent] = []
+        self._spent: dict[str, Decimal] = {}
+        self._refunded: dict[str, Decimal] = {}
+        self._counts: dict[str, int] = {}
         self._txn: uuid.UUID | None = None
         self._settleable: set[uuid.UUID] = set()
+        self._net = ZERO
 
     @property
     def start_head(self) -> str:
         """The base's head when this view was taken."""
         return self._start_head
 
+    # -- lookups: staged first, then the base -----------------------------
+
     def balance(self, scope_id: str) -> Decimal:
         found = self.balances.get(scope_id)
-        return found if found is not None else self._base.balances.get(scope_id, ZERO)
+        return found if found is not None else self._base.balance(scope_id)
 
     def open_hold(self, hold_id: uuid.UUID) -> LedgerEntry | None:
         if hold_id in self._closed:
             return None
         found = self._opened.get(hold_id)
-        return found if found is not None else self._base.holds.get(hold_id)
+        return found if found is not None else self._base.open_hold(hold_id)
+
+    def iter_holds(self) -> Iterator[tuple[uuid.UUID, LedgerEntry]]:
+        for hold_id, hold in self._base.iter_holds():
+            if hold_id not in self._closed:
+                yield hold_id, hold
+        yield from list(self._opened.items())
+
+    def is_ambiguous(self, key: _HoldKey) -> bool:
+        return key in self.ambiguous or self._base.is_ambiguous(key)
+
+    def ambiguous_keys(self) -> set[_HoldKey]:
+        return self.ambiguous | self._base.ambiguous_keys()
+
+    def node(self, scope_id: str) -> BudgetNode | None:
+        found = self._nodes.get(scope_id)
+        return found if found is not None else self._base.node(scope_id)
+
+    def trip_of(self, scope_id: str) -> tuple[datetime, str] | None:
+        if scope_id in self._tripped:
+            return self._tripped[scope_id]
+        return self._base.trip_of(scope_id)
+
+    def spent_by(self, scope_id: str) -> Decimal:
+        found = self._spent.get(scope_id)
+        return found if found is not None else self._base.spent_by(scope_id)
+
+    def refunded_to(self, scope_id: str) -> Decimal:
+        found = self._refunded.get(scope_id)
+        return found if found is not None else self._base.refunded_to(scope_id)
+
+    def holds_open_in(self, scope_id: str) -> int:
+        found = self._counts.get(scope_id)
+        return found if found is not None else self._base.holds_open_in(scope_id)
+
+    # -- what the view stages ---------------------------------------------
+
+    @property
+    def opened(self) -> tuple[LedgerEntry, ...]:
+        """HOLD entries this view placed that are still open in it."""
+        return tuple(self._opened.values())
+
+    @property
+    def closed(self) -> tuple[uuid.UUID, ...]:
+        """Holds that were open in the base and this view released."""
+        return tuple(self._closed)
+
+    @property
+    def control_entries(self) -> tuple[ControlEvent, ...]:
+        """The trips and resets this view's entries record (not legacy ones)."""
+        return tuple(e for e in self._events if e.entry_id is not None)
+
+    def cache_rows(self) -> tuple[list[BudgetNode], list[ControlEvent], list[LedgerEntry]]:
+        """The topology rows, control-event rows and placed holds to write
+        for what this view staged."""
+        nodes = [self._nodes[scope] for scope in self._row_scopes if scope in self._nodes]
+        return nodes, list(self.control_entries), list(self._opened.values())
+
+    # -- the rules ----------------------------------------------------------
 
     def apply(
         self,
@@ -755,6 +913,7 @@ class _Overlay:
         *,
         check_hash: bool = True,
         released: set[uuid.UUID] | None = None,
+        writing: bool = False,
     ) -> None:
         """Verify ``entry`` as the next link of the chain, then fold it in.
 
@@ -762,7 +921,10 @@ class _Overlay:
             process built a moment ago.
         :param released: Every hold released so far, when the caller wants a
             double release reported as such rather than as an unknown hold.
-        :raises LedgerIntegrityError: On the first rule the entry breaks.
+        :param writing: The entry is being written now, not replayed: rules
+            that history written before them is exempt from apply too.
+        :raises LedgerIntegrityError: On the first rule the entry breaks. The
+            view may then hold part of the entry; discard it.
         """
         index = self.length + 1
         scope = entry.scope_id
@@ -783,6 +945,7 @@ class _Overlay:
             )
         self._check_version(entry)
         self._check_shape(entry)
+        self._begin_transaction(entry)
 
         expected = _add(self.balance(scope), entry.signed_amount)
         if entry.balance_after != expected:
@@ -793,17 +956,51 @@ class _Overlay:
             )
         if entry.entry_type not in _ZERO_VALUE_TYPES:
             self.balances[scope] = expected
+        if entry.entry_type in _BALANCED_TYPES:
+            self._net = _add(self._net, entry.signed_amount)
 
         self._check_holds(entry, released)
+        self._check_flows(entry, writing=writing)
+        self._check_governance(entry)
         self.totals = _apply_totals(self.totals, (entry,))
         if entry.entry_type is EntryType.SEAL:
             self.seal = entry
         self.head = entry.entry_hash
         self.length = index
 
+    def end_transaction(self) -> None:
+        """Close the transaction the last entry belongs to.
+
+        :raises LedgerIntegrityError: If its transfers do not balance: every
+            delegation and release moves money between two scopes and must net
+            to zero within its transaction.
+        """
+        if self._net != ZERO:
+            raise LedgerIntegrityError(
+                f"transaction {self._txn} does not balance: its transfers net {self._net}"
+            )
+        self._txn = None
+        self._settleable = set()
+
+    def finish(self) -> None:
+        """End a replay: close the last transaction and fold in any pre-0.1.2
+        control events a chain with no newer entry never folded in."""
+        self.end_transaction()
+        if not self.legacy_applied:
+            self._apply_legacy()
+
+    def apply_legacy_event(self, event: ControlEvent) -> None:
+        """A control event a pre-0.1.2 writer added after this view was built."""
+        self.legacy = (*self.legacy, event)
+        self._control(event.event_type, event.scope_id, event.timestamp, event.reason)
+        self._events.append(event)
+
     def merge(self) -> None:
-        """Fold every verified change into the base state."""
+        """Fold every verified change into the state below."""
         base = self._base
+        if isinstance(base, _Overlay):
+            base._absorb(self)
+            return
         base.balances.update(self.balances)
         base.totals = self.totals
         base.head = self.head
@@ -811,12 +1008,58 @@ class _Overlay:
         base.saw_v1 = self.saw_v1
         base.saw_v2 = self.saw_v2
         base.seal = self.seal
+        base.legacy = self.legacy
+        base.legacy_applied = self.legacy_applied
         for hold_id in self._closed:
             base.holds.pop(hold_id, None)
         base.holds.update(self._opened)
         base.ambiguous |= self.ambiguous
+        for scope_id, node in self._nodes.items():
+            current = base.nodes.get(scope_id)
+            if current is None:
+                base.nodes[scope_id] = node
+            else:
+                # In place, so a node a caller holds stays current.
+                current.allocated = node.allocated
+                current.child_ids[:] = node.child_ids
+        base.roots.extend(self._roots)
+        for scope_id, trip in self._tripped.items():
+            if trip is None:
+                base.tripped.pop(scope_id, None)
+            else:
+                base.tripped[scope_id] = trip
+        base.events.extend(self._events)
+        base.spent.update(self._spent)
+        base.refunded.update(self._refunded)
+        base.hold_counts.update(self._counts)
 
-    # -- rules ------------------------------------------------------------
+    def _absorb(self, child: _Overlay) -> None:
+        """Take a view staged on this one as this view's own staged changes."""
+        self.balances.update(child.balances)
+        self.totals = child.totals
+        self.head = child.head
+        self.length = child.length
+        self.saw_v1 = child.saw_v1
+        self.saw_v2 = child.saw_v2
+        self.seal = child.seal
+        self.legacy = child.legacy
+        self.legacy_applied = child.legacy_applied
+        for hold_id in child._closed:
+            if self._opened.pop(hold_id, None) is None:
+                self._closed.add(hold_id)
+        self._opened.update(child._opened)
+        self.ambiguous |= child.ambiguous
+        self._nodes.update(child._nodes)
+        self._row_scopes |= child._row_scopes
+        self._roots.extend(child._roots)
+        self._tripped.update(child._tripped)
+        self._events.extend(child._events)
+        self._spent.update(child._spent)
+        self._refunded.update(child._refunded)
+        self._counts.update(child._counts)
+        self._txn, self._settleable, self._net = child._txn, child._settleable, child._net
+
+    # -- ledger rules -------------------------------------------------------
 
     def _check_version(self, entry: LedgerEntry) -> None:
         if entry.version == _AUDIT_V1:
@@ -881,10 +1124,13 @@ class _Overlay:
         elif not entry.scope_id:
             raise LedgerIntegrityError(f"entry {entry.sequence}: a {kind.value} needs a scope")
 
-    def _check_holds(self, entry: LedgerEntry, released: set[uuid.UUID] | None) -> None:
+    def _begin_transaction(self, entry: LedgerEntry) -> None:
         if entry.transaction_id != self._txn:
+            if self._txn is not None:
+                self.end_transaction()
             self._txn = entry.transaction_id
-            self._settleable = set()
+
+    def _check_holds(self, entry: LedgerEntry, released: set[uuid.UUID] | None) -> None:
         kind = entry.entry_type
         if entry.ref is not None and kind not in _REFERENCING_TYPES:
             raise LedgerIntegrityError(
@@ -892,6 +1138,7 @@ class _Overlay:
             )
         if kind is EntryType.HOLD:
             self._opened[entry.entry_id] = entry
+            self._counts[entry.scope_id] = self.holds_open_in(entry.scope_id) + 1
         elif kind is EntryType.HOLD_VOID:
             if entry.version == _AUDIT_V1:
                 self._release_unnamed(entry)
@@ -938,7 +1185,7 @@ class _Overlay:
                 f"which encumbered {hold.amount}",
                 entry.scope_id,
             )
-        self._close(ref)
+        self._close(ref, hold)
         self._settleable.add(ref)
         if released is not None:
             released.add(ref)
@@ -951,9 +1198,9 @@ class _Overlay:
         second release of the same funds finds none and fails.
         """
         key = _hold_key(entry)
-        for hold_id, hold in (*self._base.holds.items(), *self._opened.items()):
-            if hold_id not in self._closed and _hold_key(hold) == key:
-                self._close(hold_id)
+        for hold_id, hold in self.iter_holds():
+            if _hold_key(hold) == key:
+                self._close(hold_id, hold)
                 self.ambiguous.add(key)
                 return
         raise LedgerIntegrityError(
@@ -962,18 +1209,188 @@ class _Overlay:
             entry.scope_id,
         )
 
-    def _close(self, hold_id: uuid.UUID) -> None:
+    def _close(self, hold_id: uuid.UUID, hold: LedgerEntry) -> None:
         if self._opened.pop(hold_id, None) is None:
             self._closed.add(hold_id)
+        self._counts[hold.scope_id] = self.holds_open_in(hold.scope_id) - 1
+
+    def _check_flows(self, entry: LedgerEntry, *, writing: bool) -> None:
+        """Each scope's lifetime spend and refunds, and the refund bound.
+
+        A refund (REVERSAL) returns money a vendor gave back for something
+        the scope bought, so a scope's lifetime refunds never exceed its
+        lifetime spend; otherwise a refund would mint spending power the
+        delegation tree never granted. Enforced on every write; entries a
+        version before the rule wrote are exempt on replay.
+        """
+        scope = entry.scope_id
+        if entry.entry_type is EntryType.SPEND:
+            self._spent[scope] = _add(self.spent_by(scope), entry.amount)
+        elif entry.entry_type is EntryType.REVERSAL:
+            refunded = _add(self.refunded_to(scope), entry.amount)
+            spent = self.spent_by(scope)
+            if writing and refunded > spent:
+                raise LedgerIntegrityError(
+                    f"entry {entry.sequence} refunds {entry.amount} to {scope!r}, bringing its "
+                    f"lifetime refunds to {refunded}, more than the {spent} it ever spent",
+                    scope,
+                )
+            self._refunded[scope] = refunded
+
+    # -- governance rules ---------------------------------------------------
+
+    def _check_governance(self, entry: LedgerEntry) -> None:
+        if entry.version != _AUDIT_V1 and not self.legacy_applied:
+            # Every pre-0.1.2 control event predates the first newer entry.
+            if entry.entry_type is EntryType.SEAL:
+                self._check_seal(entry)
+            elif self.legacy:
+                raise LedgerIntegrityError(
+                    "control_events holds rows that are not in the chain, and this "
+                    "ledger has no migration seal to vouch for them"
+                )
+            self._apply_legacy()
+
+        kind = entry.entry_type
+        scope = entry.scope_id
+        if kind is EntryType.FUNDING:
+            node = self.node(scope)
+            if node is None:
+                self._nodes[scope] = BudgetNode(
+                    scope_id=scope,
+                    parent_id=None,
+                    depth=0,
+                    allocated=entry.amount,
+                    created_at=entry.timestamp,
+                )
+                self._roots.append(scope)
+            elif node.parent_id is not None:
+                raise LedgerIntegrityError(
+                    f"entry {entry.sequence} funds a scope that is not a root", scope
+                )
+            else:
+                writable = self._writable(scope)
+                writable.allocated = _add(writable.allocated, entry.amount)
+            self._row_scopes.add(scope)
+        elif kind is EntryType.ALLOCATION:
+            self._allocate(entry)
+        elif kind is EntryType.RELEASE:
+            self._release_between(entry)
+        elif kind in _CONTROL_TYPES:
+            self._control(kind.value, scope, entry.timestamp, entry.memo)
+            self._events.append(_event_for(entry))
+        elif kind is not EntryType.SEAL:
+            self._require(scope, entry)
+
+    def _writable(self, scope_id: str) -> BudgetNode:
+        """This view's own copy of a node, to change without touching the base."""
+        staged = self._nodes.get(scope_id)
+        if staged is None:
+            current = self._base.node(scope_id)
+            if current is None:  # callers check first; never trust that silently
+                raise LedgerIntegrityError(f"scope {scope_id!r} is not in the chain", scope_id)
+            staged = dataclasses.replace(current, child_ids=list(current.child_ids))
+            self._nodes[scope_id] = staged
+        return staged
+
+    def _allocate(self, entry: LedgerEntry) -> None:
+        scope, parent_id = entry.scope_id, entry.counterparty_id
+        if entry.direction is Direction.DEBIT:
+            self._require(scope, entry)
+            return
+        if self.node(scope) is not None:
+            raise LedgerIntegrityError(
+                f"entry {entry.sequence} allocates to {scope!r} a second time; a "
+                f"delegation creates a new scope",
+                scope,
+            )
+        parent = self.node(parent_id or "")
+        if parent is None:
+            raise LedgerIntegrityError(
+                f"entry {entry.sequence} delegates from {parent_id!r}, which the chain "
+                f"never created",
+                scope,
+            )
+        self._nodes[scope] = BudgetNode(
+            scope_id=scope,
+            parent_id=parent.scope_id,
+            depth=parent.depth + 1,
+            allocated=entry.amount,
+            created_at=entry.timestamp,
+        )
+        self._row_scopes.add(scope)
+        self._writable(parent.scope_id).child_ids.append(scope)
+
+    def _release_between(self, entry: LedgerEntry) -> None:
+        scope, other = entry.scope_id, entry.counterparty_id or ""
+        node = self._require(scope, entry)
+        child = node if entry.direction is Direction.DEBIT else self.node(other)
+        parent_id = other if entry.direction is Direction.DEBIT else scope
+        if child is None or child.parent_id != parent_id:
+            raise LedgerIntegrityError(
+                f"entry {entry.sequence} releases between {scope!r} and {other!r}, "
+                f"which are not child and parent",
+                scope,
+            )
+
+    def _control(self, event_type: str, scope_id: str, timestamp: datetime, reason: str) -> None:
+        if self.node(scope_id) is None:
+            raise LedgerIntegrityError(f"control event references unregistered scope {scope_id!r}")
+        if event_type == EntryType.CIRCUIT_TRIPPED.value:
+            self._tripped[scope_id] = (timestamp, reason)
+        elif event_type == EntryType.CIRCUIT_RESET.value:
+            self._tripped[scope_id] = None
+
+    def _require(self, scope_id: str, entry: LedgerEntry) -> BudgetNode:
+        node = self.node(scope_id)
+        if node is None:
+            raise LedgerIntegrityError(
+                f"entry {entry.sequence} ({entry.entry_type.value}) names a scope the "
+                f"chain never created",
+                scope_id,
+            )
+        return node
+
+    def _apply_legacy(self) -> None:
+        self.legacy_applied = True
+        for event in self.legacy:
+            self._control(event.event_type, event.scope_id, event.timestamp, event.reason)
+            self._events.append(event)
+
+    def _check_seal(self, entry: LedgerEntry) -> None:
+        match = _SEAL_MEMO.match(entry.memo)
+        if match is None:
+            raise LedgerIntegrityError(f"entry {entry.sequence} is a malformed migration seal")
+        count, digest = int(match.group(1)), match.group(2)
+        if count != len(self.legacy) or digest != _legacy_digest(self.legacy):
+            raise LedgerIntegrityError(
+                f"the pre-0.1.2 control events no longer match the seal written when "
+                f"this ledger was upgraded (entry {entry.sequence}): a legacy trip or "
+                f"reset was edited, added or deleted"
+            )
 
 
-def _replay(entries: Iterable[LedgerEntry]) -> _ChainState:
-    """Rebuild chain state from nothing but the entries, verifying each."""
-    state = _ChainState()
+def _replay(
+    entries: Iterable[LedgerEntry],
+    legacy: Sequence[ControlEvent] = (),
+    *,
+    finish: bool = False,
+) -> _ChainState:
+    """Rebuild chain state from nothing but the entries, verifying each.
+
+    :param legacy: Control events a pre-0.1.2 governor kept outside the chain.
+    :param finish: Fold ``legacy`` in even if no entry written from v0.1.2 on
+        does (a read-only view of an unsealed pre-0.1.2 ledger).
+    """
+    state = _ChainState(legacy=tuple(legacy))
     view = _Overlay(state)
     released: set[uuid.UUID] = set()
     for entry in entries:
         view.apply(entry, released=released)
+    if finish:
+        view.finish()
+    else:
+        view.end_transaction()
     view.merge()
     return state
 
@@ -1093,6 +1510,11 @@ class _Pending:
     def entries(self) -> list[LedgerEntry]:
         return self.batch.entries
 
+    @property
+    def view(self) -> _Overlay:
+        """The chain as of the work posted so far."""
+        return self._view
+
     def balance(self, scope_id: str) -> Decimal:
         """``scope_id``'s balance as of the work posted so far."""
         return self._view.balance(scope_id)
@@ -1203,11 +1625,13 @@ class _Pending:
         if transfer_net != ZERO:
             raise LedgerIntegrityError(f"transfer transaction does not balance: net {transfer_net}")
 
-        # Every rule a replay would enforce, enforced now, before anything is
-        # durable: a pairing violation refuses the work instead of being found
-        # by the next verification.
+        # Every rule a replay would enforce, and those only new writes are held
+        # to, enforced now by the same engine, before anything is durable: a
+        # write a replay would refuse is refused here instead of being found by
+        # the next open, when it can no longer be taken back.
         for entry in built:
-            view.apply(entry, check_hash=False)
+            view.apply(entry, check_hash=False, writing=True)
+        view.end_transaction()
         self.batch.entries.extend(built)
         return tuple(built)
 
@@ -1243,27 +1667,52 @@ class Ledger:
         self._store: PersistenceStore | None = store
         self._entries: list[LedgerEntry] = []
         self._state = _ChainState()
+        self._open_auths: dict[uuid.UUID, Authorization] = {}
+        self._legacy_auth_ids: dict[uuid.UUID, uuid.UUID] = {}
         if store is not None:
             # Fail closed: a database that has been tampered with, or that
             # was corrupted by a crash mid-write, must never be trusted
             # silently. Refuse to start rather than serve a wrong balance.
-            self._adopt(store.load_entries())
+            image = store.load()
+            self._adopt(image.entries, _legacy_events(image), finish=store.read_only)
 
     @classmethod
-    def _from_entries(cls, store: PersistenceStore, entries: Sequence[LedgerEntry]) -> Ledger:
+    def _from_entries(
+        cls,
+        store: PersistenceStore,
+        entries: Sequence[LedgerEntry],
+        legacy: Sequence[ControlEvent] = (),
+        *,
+        finish: bool = False,
+    ) -> Ledger:
         """A ledger over ``store`` holding ``entries``, already read from it."""
         ledger = cls()
         ledger._store = store
-        ledger._adopt(entries)
+        ledger._adopt(entries, legacy, finish=finish)
         return ledger
 
-    def _adopt(self, entries: Iterable[LedgerEntry]) -> None:
+    def _adopt(
+        self,
+        entries: Iterable[LedgerEntry],
+        legacy: Sequence[ControlEvent] = (),
+        *,
+        finish: bool = False,
+    ) -> None:
         """Replace this ledger's contents with ``entries``, verified first."""
         loaded = list(entries)
-        state = _replay(loaded)
+        state = _replay(loaded, legacy, finish=finish)
         with self._lock:
             self._entries = loaded
             self._state = state
+            self._open_auths = {
+                hold_id: _authorization_for(hold) for hold_id, hold in state.holds.items()
+            }
+            self._legacy_auth_ids = {}
+
+    def _authorization_id(self, hold_id: uuid.UUID) -> uuid.UUID:
+        """The authorization that names a hold: the hold's own id, except for
+        holds a pre-0.1.2 governor placed under ids of its own."""
+        return self._legacy_auth_ids.get(hold_id, hold_id)
 
     # -- compatibility views of the chain state ---------------------------
 
@@ -1375,10 +1824,12 @@ class Ledger:
     ) -> tuple[LedgerEntry, ...]:
         """Atomically commit ``lines`` as one transaction.
 
-        Validation happens in full before anything is written, so a rejected
-        transaction leaves no partial trace. Balances are threaded through the
-        transaction, which lets a single transaction both credit and debit the
-        same scope (as a capture does: void the hold, post the spend).
+        .. deprecated:: 1.0
+           Write through :class:`BudgetManager`, whose operations check a
+           scope's funds and breaker before they write. This method checks
+           every rule a replay enforces, so it can no longer commit anything
+           a later open would refuse, but it bypasses the governor: it is
+           removed in 1.0.
 
         :param lines: One or more legs to commit together.
         :param transaction_id: Optional caller-supplied transaction id;
@@ -1386,9 +1837,24 @@ class Ledger:
         :returns: The committed entries, in the order given.
         :raises ValueError: If ``lines`` is empty, an amount is non-positive
             or out of range, or a ``(entry_type, direction)`` pair is illegal.
-        :raises LedgerIntegrityError: If a transfer transaction's debits and
-            credits do not balance, or a release names a hold that is not open.
+        :raises LedgerIntegrityError: If the lines break any rule of the
+            ledger or of the delegation tree.
         """
+        warnings.warn(
+            "Ledger.post() bypasses the governor and is removed in agentgov 1.0; "
+            "write through BudgetManager instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._post(lines, transaction_id=transaction_id)
+
+    def _post(
+        self,
+        lines: Sequence[LedgerLine],
+        *,
+        transaction_id: uuid.UUID | None = None,
+    ) -> tuple[LedgerEntry, ...]:
+        """Commit ``lines`` as one transaction, in a unit of work of its own."""
         with self._lock:
             pending = self._begin()
             built = pending.post(lines, transaction_id=transaction_id)
@@ -1407,17 +1873,27 @@ class Ledger:
         in memory and on disk. Memory is only touched once the write returns.
         """
         batch = pending.batch
+        view = pending.view
+        # The cache rows this work writes are the ones its entries imply,
+        # derived by the same engine that checked them, never assembled by
+        # hand alongside: a write cannot leave a cache the chain contradicts.
+        nodes, controls, opened = view.cache_rows()
+        batch.nodes = nodes
+        batch.control_events = controls
+        batch.opened = [_authorization_for(hold) for hold in opened]
+        batch.closed = [self._authorization_id(hold_id) for hold_id in view.closed]
         if not batch:
             return
         with self._lock:
-            if pending._view.start_head != self._state.head:
+            if view.start_head != self._state.head:
                 raise RuntimeError(
                     "unit of work was built against a stale ledger head; "
                     "hold the ledger lock from begin to commit"
                 )
             if self._store is not None:
                 self._store.commit(batch)
-            pending._view.merge()
+            view.merge()
+            self._follow_holds(view)
             self._entries.extend(batch.entries)
             # Formatting a line costs more than hashing it; skip both
             # renderings when nothing is listening.
@@ -1438,8 +1914,23 @@ class Ledger:
             view = _Overlay(self._state)
             for entry in entries:
                 view.apply(entry)
+            view.end_transaction()
             view.merge()
+            self._follow_holds(view)
             self._entries.extend(entries)
+
+    def _follow_holds(self, view: _Overlay) -> None:
+        """Open and close authorizations as a merged view's holds did. Lock held.
+
+        Kept here, beside the chain state, so every path that writes the
+        chain keeps them in step: what is open is exactly what the chain
+        holds open, whoever wrote it.
+        """
+        for hold_id in view.closed:
+            self._open_auths.pop(self._authorization_id(hold_id), None)
+            self._legacy_auth_ids.pop(hold_id, None)
+        for hold in view.opened:
+            self._open_auths[hold.entry_id] = _authorization_for(hold)
 
     def _reassign_holds(self, key: _HoldKey, holds: Sequence[LedgerEntry]) -> None:
         """Name which holds of an ambiguous pre-0.1.2 key are the open ones."""
@@ -1466,8 +1957,13 @@ class Ledger:
         :raises LedgerIntegrityError: If the entries do not form a valid chain.
         """
         with self._lock:
-            state = _replay(self._entries)
+            state = self._replayed()
             return state.balances, state.totals
+
+    def _replayed(self) -> _ChainState:
+        """The state the entries imply, rebuilt from nothing. Lock held."""
+        live = self._state
+        return _replay(self._entries, live.legacy, finish=live.legacy_applied)
 
     def verify_chain(self) -> None:
         """Verify the hash chain, the running balances, hold pairing and caches.
@@ -1478,11 +1974,12 @@ class Ledger:
             twice, or a cached figure that disagrees with a full replay.
         """
         with self._lock:
-            replayed = _replay(self._entries)
+            replayed = self._replayed()
             live = self._state
 
             if replayed.head != live.head:
                 raise LedgerIntegrityError("head hash does not match the chain")
+            _compare_governance(replayed, live)
 
             for scope_id, cached in live.balances.items():
                 if replayed.balances.get(scope_id, ZERO) != cached:
@@ -1520,6 +2017,47 @@ class Ledger:
                     f"{t.holds_open} + spent {t.spent} - reversed {t.reversed_} "
                     f"= {left}, but funded = {t.funded}"
                 )
+
+
+def _compare_governance(replayed: _ChainState, live: _ChainState) -> None:
+    """The live tree, breakers and control events must be what the chain implies."""
+    for scope_id, node in live.nodes.items():
+        expected = replayed.nodes.get(scope_id)
+        if expected is None:
+            raise LedgerIntegrityError(
+                "scope is registered but the chain never created it", scope_id
+            )
+        if (node.parent_id, node.depth, node.allocated) != (
+            expected.parent_id,
+            expected.depth,
+            expected.allocated,
+        ):
+            raise LedgerIntegrityError(
+                f"topology disagrees with the chain: registered with parent "
+                f"{node.parent_id!r}, depth {node.depth}, allocation {node.allocated}; "
+                f"the chain implies parent {expected.parent_id!r}, depth "
+                f"{expected.depth}, allocation {expected.allocated}",
+                scope_id,
+            )
+    unregistered = sorted(replayed.nodes.keys() - live.nodes.keys())
+    if unregistered:
+        raise LedgerIntegrityError(
+            f"the chain created scope(s) {', '.join(unregistered)} that are not registered"
+        )
+    if set(live.tripped) != set(replayed.tripped):
+        raise LedgerIntegrityError(
+            f"breaker state disagrees with the chain: halted here "
+            f"{sorted(live.tripped)}, halted by the chain {sorted(replayed.tripped)}"
+        )
+    if [e.event_id for e in live.events] != [e.event_id for e in replayed.events]:
+        raise LedgerIntegrityError("control events disagree with the chain")
+    if (live.spent, live.refunded) != (replayed.spent, replayed.refunded):
+        raise LedgerIntegrityError("lifetime spend or refunds disagree with the chain")
+
+
+def _legacy_events(image: StoreImage) -> tuple[ControlEvent, ...]:
+    """The control events in ``image`` that a pre-0.1.2 governor kept outside the chain."""
+    return tuple(event for event in image.control_events if event.entry_id is None)
 
 
 def _compare_holds(replayed: _ChainState, live: _ChainState) -> None:
@@ -1666,187 +2204,6 @@ def _seal_memo(events: Sequence[ControlEvent]) -> str:
     return f"pre-0.1.2 control events: n={len(events)} sha256={_legacy_digest(events)}"
 
 
-class _Governance:
-    """The delegation tree, breaker state and control events the chain implies.
-
-    Nothing here is read from a side table. A scope exists because a FUNDING
-    or ALLOCATION entry created it, has the parent that entry names, and is
-    halted because its last control entry is a trip.
-    """
-
-    __slots__ = (
-        "_legacy",
-        "_legacy_applied",
-        "chain_events",
-        "events",
-        "nodes",
-        "roots",
-        "tripped",
-    )
-
-    def __init__(self, legacy: Sequence[ControlEvent] = ()) -> None:
-        self.nodes: dict[str, BudgetNode] = {}
-        self.roots: list[str] = []
-        self.tripped: dict[str, tuple[datetime, str]] = {}
-        self.events: list[ControlEvent] = []
-        self.chain_events: list[ControlEvent] = []
-        self._legacy = tuple(legacy)
-        self._legacy_applied = False
-
-    @classmethod
-    def from_chain(
-        cls, entries: Iterable[LedgerEntry], legacy: Sequence[ControlEvent] = ()
-    ) -> _Governance:
-        governance = cls(legacy)
-        for entry in entries:
-            governance.apply(entry)
-        governance.finish()
-        return governance
-
-    def copy(self) -> _Governance:
-        """An independent copy, for staging changes that may yet be refused."""
-        clone = _Governance(self._legacy)
-        clone.nodes = {
-            scope_id: dataclasses.replace(node, child_ids=list(node.child_ids))
-            for scope_id, node in self.nodes.items()
-        }
-        clone.roots = list(self.roots)
-        clone.tripped = dict(self.tripped)
-        clone.events = list(self.events)
-        clone.chain_events = list(self.chain_events)
-        clone._legacy_applied = self._legacy_applied
-        return clone
-
-    def finish(self) -> None:
-        """Apply pre-0.1.2 control events to a chain that has no newer entries."""
-        if not self._legacy_applied:
-            self._apply_legacy()
-
-    def apply_legacy_event(self, event: ControlEvent) -> None:
-        """A control event a pre-0.1.2 writer added after this view was built."""
-        self._legacy = (*self._legacy, event)
-        self._control(event.event_type, event.scope_id, event.timestamp, event.reason)
-        self.events.append(event)
-
-    def apply(self, entry: LedgerEntry) -> None:
-        if entry.version != _AUDIT_V1 and not self._legacy_applied:
-            # Every pre-0.1.2 control event predates the first newer entry.
-            if entry.entry_type is EntryType.SEAL:
-                self._check_seal(entry)
-            elif self._legacy:
-                raise LedgerIntegrityError(
-                    "control_events holds rows that are not in the chain, and this "
-                    "ledger has no migration seal to vouch for them"
-                )
-            self._apply_legacy()
-
-        kind = entry.entry_type
-        scope = entry.scope_id
-        if kind is EntryType.FUNDING:
-            node = self.nodes.get(scope)
-            if node is None:
-                self.nodes[scope] = BudgetNode(
-                    scope_id=scope,
-                    parent_id=None,
-                    depth=0,
-                    allocated=entry.amount,
-                    created_at=entry.timestamp,
-                )
-                self.roots.append(scope)
-            elif node.parent_id is not None:
-                raise LedgerIntegrityError(
-                    f"entry {entry.sequence} funds a scope that is not a root", scope
-                )
-            else:
-                node.allocated = _add(node.allocated, entry.amount)
-        elif kind is EntryType.ALLOCATION:
-            self._allocate(entry)
-        elif kind is EntryType.RELEASE:
-            self._release(entry)
-        elif kind in (EntryType.CIRCUIT_TRIPPED, EntryType.CIRCUIT_RESET):
-            self._control(kind.value, scope, entry.timestamp, entry.memo)
-            event = _event_for(entry)
-            self.events.append(event)
-            self.chain_events.append(event)
-        elif kind is not EntryType.SEAL:
-            self._require(scope, entry)
-
-    def _allocate(self, entry: LedgerEntry) -> None:
-        scope, parent_id = entry.scope_id, entry.counterparty_id
-        if entry.direction is Direction.DEBIT:
-            self._require(scope, entry)
-            return
-        if scope in self.nodes:
-            raise LedgerIntegrityError(
-                f"entry {entry.sequence} allocates to {scope!r} a second time; a "
-                f"delegation creates a new scope",
-                scope,
-            )
-        parent = self.nodes.get(parent_id or "")
-        if parent is None:
-            raise LedgerIntegrityError(
-                f"entry {entry.sequence} delegates from {parent_id!r}, which the chain "
-                f"never created",
-                scope,
-            )
-        self.nodes[scope] = BudgetNode(
-            scope_id=scope,
-            parent_id=parent.scope_id,
-            depth=parent.depth + 1,
-            allocated=entry.amount,
-            created_at=entry.timestamp,
-        )
-        parent.child_ids.append(scope)
-
-    def _release(self, entry: LedgerEntry) -> None:
-        scope, other = entry.scope_id, entry.counterparty_id or ""
-        node = self._require(scope, entry)
-        child = node if entry.direction is Direction.DEBIT else self.nodes.get(other)
-        parent_id = other if entry.direction is Direction.DEBIT else scope
-        if child is None or child.parent_id != parent_id:
-            raise LedgerIntegrityError(
-                f"entry {entry.sequence} releases between {scope!r} and {other!r}, "
-                f"which are not child and parent",
-                scope,
-            )
-
-    def _control(self, event_type: str, scope_id: str, timestamp: datetime, reason: str) -> None:
-        if scope_id not in self.nodes:
-            raise LedgerIntegrityError(f"control event references unregistered scope {scope_id!r}")
-        if event_type == EntryType.CIRCUIT_TRIPPED.value:
-            self.tripped[scope_id] = (timestamp, reason)
-        elif event_type == EntryType.CIRCUIT_RESET.value:
-            self.tripped.pop(scope_id, None)
-
-    def _require(self, scope_id: str, entry: LedgerEntry) -> BudgetNode:
-        node = self.nodes.get(scope_id)
-        if node is None:
-            raise LedgerIntegrityError(
-                f"entry {entry.sequence} ({entry.entry_type.value}) names a scope the "
-                f"chain never created",
-                scope_id,
-            )
-        return node
-
-    def _apply_legacy(self) -> None:
-        self._legacy_applied = True
-        for event in self._legacy:
-            self._control(event.event_type, event.scope_id, event.timestamp, event.reason)
-            self.events.append(event)
-
-    def _check_seal(self, entry: LedgerEntry) -> None:
-        match = _SEAL_MEMO.match(entry.memo)
-        if match is None:
-            raise LedgerIntegrityError(f"entry {entry.sequence} is a malformed migration seal")
-        count, digest = int(match.group(1)), match.group(2)
-        if count != len(self._legacy) or digest != _legacy_digest(self._legacy):
-            raise LedgerIntegrityError(
-                f"the pre-0.1.2 control events no longer match the seal written when "
-                f"this ledger was upgraded (entry {entry.sequence}): a legacy trip or "
-                f"reset was edited, added or deleted"
-            )
-
-
 class JoinedTransaction:
     """A governor's part in a transaction someone else owns.
 
@@ -1904,11 +2261,14 @@ class JoinedTransaction:
 
 
 @dataclass(slots=True)
-class _BreakerState:
-    """Per-scope circuit-breaker and velocity state."""
+class _Velocity:
+    """A scope's recent authorizations, for the runaway-loop detector.
 
-    tripped_at: datetime | None = None
-    reason: str = ""
+    The one piece of breaker state that is this governor's own: whether a
+    scope is halted is the chain's, but how fast this process has been
+    calling is not.
+    """
+
     call_times: deque[float] = field(default_factory=deque)
 
 
@@ -1980,8 +2340,8 @@ class BudgetManager:
 
     :param ledger: The ledger to record against; a fresh one is created when
         omitted. Its mutex becomes this manager's mutex. A ledger that already
-        holds entries is not re-read: this manager derives its topology,
-        breaker state and open holds from those entries.
+        holds entries is not re-read: its topology, breaker state and open
+        holds are already part of its chain state.
     :param policy: Governance limits; defaults to :class:`GovernancePolicy`.
     :param store: A durable backend. Pass the *same* store given to ``ledger``
         (or omit ``ledger`` and let this constructor build one).
@@ -2024,12 +2384,13 @@ class BudgetManager:
             # process cannot slip a commit between the entries and the
             # caches that describe them.
             image = store.load()
+            legacy = _legacy_events(image)
             if ledger is None:
-                ledger = Ledger._from_entries(store, image.entries)
+                ledger = Ledger._from_entries(store, image.entries, legacy, finish=store.read_only)
             elif shared is not None and (len(ledger), ledger.head_hash) != _image_head(image):
                 # A ledger read from a shared store before this snapshot may
                 # be behind it; serve the snapshot, which the caches match.
-                ledger._adopt(image.entries)
+                ledger._adopt(image.entries, legacy)
         elif ledger is None:
             ledger = Ledger()
         self._ledger = ledger
@@ -2042,13 +2403,7 @@ class BudgetManager:
         self._shared: SharedStore | None = shared
         self._writing = False
         self._dirty = False
-        self._nodes: dict[str, BudgetNode] = {}
-        self._roots: list[str] = []
-        self._breakers: dict[str, _BreakerState] = {}
-        self._open_auths: dict[uuid.UUID, Authorization] = {}
-        self._control_events: list[ControlEvent] = []
-        self._legacy_events: tuple[ControlEvent, ...] = ()
-        self._governance: _Governance | None = None
+        self._velocity: dict[str, _Velocity] = {}
         self._repairs: tuple[str, ...] = ()
         self._schema_version = ""
         self._control_high_water = 0
@@ -2056,11 +2411,6 @@ class BudgetManager:
 
         if store is not None and image is not None:
             self._restore_from_store(store, image, repair=repair)
-        elif len(self._ledger):
-            self._adopt_governance(_Governance.from_chain(self._ledger.entries()))
-            self._open_auths = {
-                hold.entry_id: _authorization_for(hold) for hold in self._ledger.open_holds()
-            }
 
     @classmethod
     def open_sqlite(
@@ -2190,12 +2540,31 @@ class BudgetManager:
         """
         self._ledger.close()
 
+    # -- the chain state, as this manager serves it -----------------------
+
+    @property
+    def _state(self) -> _ChainState:
+        return self._ledger._state
+
+    @property
+    def _nodes(self) -> dict[str, BudgetNode]:
+        return self._ledger._state.nodes
+
+    @property
+    def _roots(self) -> list[str]:
+        return self._ledger._state.roots
+
+    @property
+    def _open_auths(self) -> dict[uuid.UUID, Authorization]:
+        """Open authorizations by id: the chain's open holds, kept by the ledger."""
+        return self._ledger._open_auths
+
     # -- restore ----------------------------------------------------------
 
     def _restore_from_store(
         self, store: PersistenceStore, image: StoreImage, *, repair: bool
     ) -> None:
-        """Derive state from the chain and check the store's caches against it.
+        """Check the store's caches against the chain, already verified.
 
         Called once, from the constructor, before this manager is visible to
         any other code.
@@ -2226,27 +2595,21 @@ class BudgetManager:
                 # opened from must not be erased.
                 with self._shared.writer():
                     image = store.load()
-                    self._ledger._adopt(image.entries)
+                    self._ledger._adopt(image.entries, _legacy_events(image))
                     restored = self._derive(image, repair=True)
                     if restored.problems:
-                        restored.rebuild(store)
+                        restored.rebuild(store, self._state)
             else:
-                restored.rebuild(store)
+                restored.rebuild(store, self._state)
             self._repairs = tuple(restored.problems)
             for problem in restored.problems:
                 audit_log.warning(f"{_AUDIT_VERSION}|repair|{_escape(problem)}")
 
         self._schema_version = restored.schema_version
         self._control_high_water = restored.control_high_water
-        for key, chosen in restored.identities.items():
-            self._ledger._reassign_holds(key, chosen)
-        self._legacy_events = restored.legacy
-        self._adopt_governance(restored.governance)
-        self._open_auths = restored.authorizations
-        if store.read_only:
-            self._governance = restored.governance
-        elif self._ledger._state.saw_v1 and not self._ledger._state.saw_v2:
-            self._seal(restored.legacy)
+        self._adopt_authorizations(restored.authorizations, restored.identities)
+        if not store.read_only and self._state.saw_v1 and not self._state.saw_v2:
+            self._seal()
 
         # Fail closed. Everything served was just derived from a verified
         # replay of the chain, so replaying it a second time would prove
@@ -2254,26 +2617,38 @@ class BudgetManager:
         self._verify_derived()
 
     def _derive(self, image: StoreImage, *, repair: bool) -> _Restored:
-        """The governance, authorizations and cache disagreements ``image``
-        implies, against this manager's (already verified) ledger."""
-        legacy = tuple(event for event in image.control_events if event.entry_id is None)
+        """The authorizations and cache disagreements ``image`` implies,
+        against this manager's (already verified) chain state."""
+        state = self._state
+        problems = _node_row_problems(state, image.nodes)
+        problems += _control_row_problems(state, image.control_events)
         entries = self._ledger.entries()
-        governance = _Governance.from_chain(entries, legacy)
-        problems = _node_row_problems(governance, image.nodes)
-        problems += _control_row_problems(governance, image.control_events)
         auths, auth_problems, identities = self._reconcile_authorizations(
             image.authorizations, _HoldIndex(lambda: entries), repairing=repair
         )
         problems += auth_problems
         return _Restored(
-            governance=governance,
             authorizations=auths,
             identities=identities,
-            legacy=legacy,
             problems=problems,
             schema_version=image.schema_version,
             control_high_water=image.control_high_water,
         )
+
+    def _adopt_authorizations(
+        self,
+        authorizations: dict[uuid.UUID, Authorization],
+        identities: dict[_HoldKey, list[LedgerEntry]],
+    ) -> None:
+        """Serve these open authorizations. Lock held, or not yet shared."""
+        for key, chosen in identities.items():
+            _reassign_holds(self._state, key, chosen)
+        self._ledger._open_auths = authorizations
+        self._ledger._legacy_auth_ids = {
+            auth.entry.entry_id: auth_id
+            for auth_id, auth in authorizations.items()
+            if auth_id != auth.entry.entry_id
+        }
 
     def _verify_derived(self) -> None:
         """The checks a fresh derivation from the chain does not already imply.
@@ -2284,21 +2659,9 @@ class BudgetManager:
         """
         self._ledger.verify_conservation()
         self._verify_tree()
-        held = {auth.entry.entry_id for auth in self._open_auths.values()}
-        if held != set(self._ledger._state.holds):
-            raise LedgerIntegrityError("open authorizations disagree with the chain's open holds")
+        self._verify_authorizations()
 
-    def _adopt_governance(self, governance: _Governance) -> None:
-        self._nodes = governance.nodes
-        self._roots = governance.roots
-        self._control_events = governance.events
-        breakers = {scope_id: _BreakerState() for scope_id in governance.nodes}
-        for scope_id, (tripped_at, reason) in governance.tripped.items():
-            breakers[scope_id].tripped_at = tripped_at
-            breakers[scope_id].reason = reason
-        self._breakers = breakers
-
-    def _seal(self, legacy: Sequence[ControlEvent]) -> None:
+    def _seal(self) -> None:
         """Commit a pre-0.1.2 database's unchained control events into the chain."""
         with self._lock:
             pending = self._ledger._begin()
@@ -2309,11 +2672,11 @@ class BudgetManager:
                         direction=Direction.NONE,
                         scope_id="",
                         amount=ZERO,
-                        memo=_seal_memo(legacy),
+                        memo=_seal_memo(self._state.legacy),
                     )
                 ]
             )
-            self._ledger._commit(pending)
+            self._commit(pending)
 
     def _reconcile_authorizations(
         self,
@@ -2321,7 +2684,7 @@ class BudgetManager:
         index: _HoldIndex,
         *,
         repairing: bool,
-        state: _ChainState | None = None,
+        state: _ChainState | _Overlay | None = None,
     ) -> tuple[dict[uuid.UUID, Authorization], list[str], dict[_HoldKey, list[LedgerEntry]]]:
         """Match stored authorization rows against the chain's open holds.
 
@@ -2331,14 +2694,13 @@ class BudgetManager:
         could leave behind, and releasing it again would hand the same funds
         back twice; it is reported, never served.
 
-        :param state: The chain state to match against; this ledger's own
-            when omitted.
+        :param state: The chain to match against: this ledger's own when
+            omitted, or a view of it with new entries staged.
         :returns: The authorizations to serve (repaired when ``repairing``),
             the disagreements found, and the open-hold identities to adopt for
             ambiguous pre-0.1.2 keys.
         """
-        if state is None:
-            state = self._ledger._state
+        view: _ChainState | _Overlay = self._state if state is None else state
         problems: list[str] = []
         result: dict[uuid.UUID, Authorization] = {}
         ambiguous_rows: dict[_HoldKey, list[Authorization]] = {}
@@ -2349,7 +2711,7 @@ class BudgetManager:
                 problems.append(f"two open authorizations name hold {row.entry_id}")
                 continue
             named.add(row.entry_id)
-            hold = state.holds.get(row.entry_id) or index.hold(row.entry_id)
+            hold = view.open_hold(row.entry_id) or index.hold(row.entry_id)
             if hold is None:
                 problems.append(
                     f"open authorization {row.authorization_id} references missing hold "
@@ -2371,15 +2733,16 @@ class BudgetManager:
                 entry=hold,
             )
             key = _hold_key(hold)
-            if hold.entry_id not in state.holds and index.released(hold.entry_id):
+            is_open = view.open_hold(hold.entry_id) is not None
+            if not is_open and index.released(hold.entry_id):
                 problems.append(
                     f"open authorization {row.authorization_id} references hold "
                     f"{hold.entry_id}, which the chain shows was already released; "
                     f"acting on it would return the same funds twice"
                 )
-            elif key in state.ambiguous:
+            elif view.is_ambiguous(key):
                 ambiguous_rows.setdefault(key, []).append(authorization)
-            elif hold.entry_id not in state.holds:
+            elif not is_open:
                 problems.append(
                     f"open authorization {row.authorization_id} references hold "
                     f"{hold.entry_id}, which the chain shows was already released; "
@@ -2388,8 +2751,9 @@ class BudgetManager:
             else:
                 result[row.authorization_id] = authorization
 
-        for hold_id, hold in state.holds.items():
-            if _hold_key(hold) in state.ambiguous or hold_id in named:
+        open_holds = list(view.iter_holds())
+        for hold_id, hold in open_holds:
+            if view.is_ambiguous(_hold_key(hold)) or hold_id in named:
                 continue
             problems.append(
                 f"hold {hold_id} of {hold.amount} in {hold.scope_id!r} is open in the chain "
@@ -2400,22 +2764,22 @@ class BudgetManager:
                 result[hold_id] = _authorization_for(hold)
 
         identities: dict[_HoldKey, list[LedgerEntry]] = {}
-        for key in sorted(state.ambiguous, key=repr):
-            open_holds = [e for e in state.holds.values() if _hold_key(e) == key]
+        for key in sorted(view.ambiguous_keys(), key=repr):
+            in_key = [e for _, e in open_holds if _hold_key(e) == key]
             candidates = ambiguous_rows.get(key, [])
-            if len(candidates) != len(open_holds):
+            if len(candidates) != len(in_key):
                 scope_id, amount = key
                 problems.append(
-                    f"{len(open_holds)} hold(s) of {amount} are open in {scope_id!r} but "
+                    f"{len(in_key)} hold(s) of {amount} are open in {scope_id!r} but "
                     f"{len(candidates)} authorization(s) name one"
                 )
-            kept = candidates[: len(open_holds)]
+            kept = candidates[: len(in_key)]
             chosen = [authorization.entry for authorization in kept]
             chosen_ids = {hold.entry_id for hold in chosen}
             for authorization in kept:
                 result[authorization.authorization_id] = authorization
-            for hold in open_holds:
-                if len(chosen) == len(open_holds):
+            for hold in in_key:
+                if len(chosen) == len(in_key):
                     break
                 if hold.entry_id not in chosen_ids:
                     chosen.append(hold)
@@ -2631,7 +2995,6 @@ class BudgetManager:
         self._require_node(scope_id)
         hold = self._open_auths.get(claim.hold_id) if claim.hold_id is not None else None
         pending = self._ledger._begin()
-        trip: LedgerEntry | None = None
         if claim.amount == ZERO and hold is None:
             (settling,) = pending.post(
                 [LedgerLine(EntryType.ANCHOR, Direction.NONE, scope_id, ZERO, memo=claim.memo)]
@@ -2651,7 +3014,6 @@ class BudgetManager:
                         ref=ref,
                     )
                 )
-                pending.batch.closed.append(hold.authorization_id)
             if claim.amount > ZERO:
                 lines.append(
                     LedgerLine(
@@ -2665,20 +3027,16 @@ class BudgetManager:
                 )
             *_, settling = pending.post(lines)
             if settling.balance_after < ZERO:
-                trip = self._stage_trip(
+                self._stage_trip(
                     pending,
                     scope_id,
                     f"settled claim {claim.amount} overdrew the scope by "
                     f"{settling.balance_after.copy_negate()}",
                 )
-            elif hold is not None and self._exhausted(pending, scope_id, settling=hold):
-                trip = self._stage_trip(pending, scope_id, "spend envelope exhausted")
+            elif hold is not None and self._exhausted(pending, scope_id):
+                self._stage_trip(pending, scope_id, "spend envelope exhausted")
         pending.batch.redeemed.append(claim.claim_id)
-        self._ledger._commit(pending)
-        if hold is not None:
-            self._open_auths.pop(hold.authorization_id, None)
-        if trip is not None:
-            self._apply_trip(trip)
+        self._commit(pending)
         return settling
 
     def _joinable(self) -> JoinableStore:
@@ -2717,27 +3075,6 @@ class BudgetManager:
             self._unusable = str(exc)
             raise
 
-    def _governance_view(self) -> _Governance:
-        """The governance a writer serves, shaped for :meth:`_catch_up` to
-        stage new entries on.
-
-        A read-only view keeps its :class:`_Governance`; a writer keeps the same
-        facts in the structures it mutates directly (breakers, nodes, events),
-        so the view is assembled from those, aliasing rather than copying them.
-        A writer's pre-0.1.2 control events were sealed into the chain before
-        it could write, so nothing legacy remains to apply.
-        """
-        view = _Governance(self._legacy_events)
-        view._legacy_applied = True
-        view.nodes, view.roots, view.events = self._nodes, self._roots, self._control_events
-        view.tripped = {
-            scope_id: (state.tripped_at, state.reason)
-            for scope_id, state in self._breakers.items()
-            if state.tripped_at is not None
-        }
-        view.chain_events = [e for e in self._control_events if e.entry_id is not None]
-        return view
-
     def _catch_up(self, store: PersistenceStore) -> int:
         ledger = self._ledger
         before = len(ledger)
@@ -2752,54 +3089,35 @@ class BudgetManager:
                 f"the ledger was rewritten under this reader: entry {before} no longer "
                 f"carries the head this view verified"
             )
-        following = self._governance
-        base = following if following is not None else self._governance_view()
-        governance = base
-        if delta.legacy_control_events and ledger._state.saw_v2:
+        if delta.legacy_control_events and self._state.saw_v2:
             raise LedgerIntegrityError(
                 "control_events gained rows outside the chain after the ledger was sealed"
             )
 
-        # Stage: verify everything against copies. Nothing this view serves
+        # Stage: verify everything in a view over the live state, by the same
+        # rules every write and replay follows. Nothing this manager serves
         # changes until all of it has checked out.
-        state = ledger._state.copy()
-        view = _Overlay(state)
+        view = _Overlay(self._state)
         for entry in delta.entries:
             view.apply(entry)
-        view.merge()
-        if delta.entries or delta.legacy_control_events:
-            governance = governance.copy()
-            for entry in delta.entries:
-                governance.apply(entry)
-            for event in delta.legacy_control_events:
-                governance.apply_legacy_event(event)
+        view.end_transaction()
+        for event in delta.legacy_control_events:
+            view.apply_legacy_event(event)
         verified = ledger._entries
         auths, problems, identities = self._reconcile_authorizations(
             delta.authorizations,
             _HoldIndex(lambda: itertools.chain(verified, delta.entries)),
             repairing=False,
-            state=state,
+            state=view,
         )
         if problems:
             raise LedgerIntegrityError(problems[0])
-        for key, chosen in identities.items():
-            _reassign_holds(state, key, chosen)
 
         # Publish. Nothing below can fail.
-        if delta.entries:
-            ledger._publish([*verified, *delta.entries], state)
-        else:
-            ledger._publish(verified, state)
-        if governance is not base:
-            if following is not None:
-                self._governance = governance
-            self._nodes, self._roots = governance.nodes, governance.roots
-            self._control_events = governance.events
-            self._sync_breakers(governance)
-        if delta.legacy_control_events:
-            self._legacy_events = (*self._legacy_events, *delta.legacy_control_events)
+        view.merge()
+        ledger._entries.extend(delta.entries)
+        self._adopt_authorizations(auths, identities)
         self._control_high_water = delta.control_high_water
-        self._open_auths = auths
         return len(delta.entries)
 
     def _reload(self, store: PersistenceStore) -> None:
@@ -2811,24 +3129,10 @@ class BudgetManager:
         """
         fresh = BudgetManager(policy=self._policy, store=store)
         self._ledger._publish(fresh._ledger._entries, fresh._ledger._state)
-        self._nodes, self._roots = fresh._nodes, fresh._roots
-        self._control_events = fresh._control_events
-        for scope_id, state in fresh._breakers.items():
-            previous = self._breakers.get(scope_id)
-            if previous is not None:
-                state.call_times = previous.call_times
-        self._breakers = fresh._breakers
-        self._open_auths = fresh._open_auths
-        self._legacy_events = fresh._legacy_events
-        self._governance = fresh._governance
+        self._ledger._open_auths = fresh._ledger._open_auths
+        self._ledger._legacy_auth_ids = fresh._ledger._legacy_auth_ids
         self._schema_version = fresh._schema_version
         self._control_high_water = fresh._control_high_water
-
-    def _sync_breakers(self, governance: _Governance) -> None:
-        for scope_id in governance.nodes:
-            state = self._breakers.setdefault(scope_id, _BreakerState())
-            tripped = governance.tripped.get(scope_id)
-            state.tripped_at, state.reason = tripped if tripped is not None else (None, "")
 
     # -- accessors --------------------------------------------------------
 
@@ -2856,7 +3160,7 @@ class BudgetManager:
     def control_events(self) -> tuple[ControlEvent, ...]:
         """Every circuit-breaker trip and reset, oldest first."""
         with self._lock:
-            return tuple(self._control_events)
+            return tuple(self._state.events)
 
     def node(self, scope_id: str) -> BudgetNode:
         """Return the :class:`BudgetNode` for ``scope_id``.
@@ -2869,7 +3173,7 @@ class BudgetManager:
     def scopes(self) -> tuple[str, ...]:
         """Every registered scope id, in registration order."""
         with self._lock:
-            return tuple(self._nodes)
+            return tuple(self._state.nodes)
 
     def available(self, scope_id: str) -> Decimal:
         """Return ``scope_id``'s spendable balance, net of outstanding holds.
@@ -2898,10 +3202,11 @@ class BudgetManager:
         :raises UnknownScopeError: If no such scope is registered.
         """
         with self._lock:
-            frontier = list(self._require_node(scope_id).child_ids)
+            nodes = self._state.nodes
+            frontier = deque(self._require_node(scope_id).child_ids)
             order: list[BudgetNode] = []
             while frontier:
-                child = self._nodes[frontier.pop(0)]
+                child = nodes[frontier.popleft()]
                 order.append(child)
                 frontier.extend(child.child_ids)
         yield from order
@@ -2912,11 +3217,12 @@ class BudgetManager:
         :raises UnknownScopeError: If no such scope is registered.
         """
         with self._lock:
+            nodes = self._state.nodes
             chain: list[str] = []
             cursor: str | None = self._require_node(scope_id).scope_id
             while cursor is not None:
                 chain.append(cursor)
-                cursor = self._nodes[cursor].parent_id
+                cursor = nodes[cursor].parent_id
             return tuple(chain)
 
     def audit_trail(self, scope_id: str | None = None) -> tuple[LedgerEntry, ...]:
@@ -2953,10 +3259,10 @@ class BudgetManager:
         _require_scope_id(scope_id)
 
         with self._mutating():
-            if scope_id in self._nodes:
+            if scope_id in self._state.nodes:
                 raise DuplicateScopeError(scope_id)
             pending = self._ledger._begin()
-            (entry,) = pending.post(
+            pending.post(
                 [
                     LedgerLine(
                         entry_type=EntryType.FUNDING,
@@ -2968,20 +3274,8 @@ class BudgetManager:
                     )
                 ]
             )
-            node = BudgetNode(
-                scope_id=scope_id,
-                parent_id=None,
-                depth=0,
-                allocated=amount,
-                created_at=entry.timestamp,
-            )
-            pending.batch.nodes.append(node)
-            self._ledger._commit(pending)
-
-            self._nodes[scope_id] = node
-            self._roots.append(scope_id)
-            self._breakers[scope_id] = _BreakerState()
-            return node
+            self._commit(pending)
+            return self._state.nodes[scope_id]
 
     def fund(
         self,
@@ -3025,10 +3319,7 @@ class BudgetManager:
                     )
                 ]
             )
-            allocated = _add(node.allocated, credited)
-            pending.batch.nodes.append(dataclasses.replace(node, allocated=allocated))
-            self._ledger._commit(pending)
-            node.allocated = allocated
+            self._commit(pending)
             return entry
 
     def delegate(
@@ -3065,7 +3356,7 @@ class BudgetManager:
 
         with self._mutating():
             parent = self._require_node(parent_id)
-            if child_id in self._nodes:
+            if child_id in self._state.nodes:
                 raise DuplicateScopeError(child_id)
             self._assert_not_halted(parent_id)
 
@@ -3084,7 +3375,7 @@ class BudgetManager:
 
             note = memo or f"sub-budget delegated to {child_id}"
             pending = self._ledger._begin()
-            entries = pending.post(
+            pending.post(
                 [
                     LedgerLine(
                         entry_type=EntryType.ALLOCATION,
@@ -3104,20 +3395,8 @@ class BudgetManager:
                     ),
                 ]
             )
-            child = BudgetNode(
-                scope_id=child_id,
-                parent_id=parent_id,
-                depth=depth,
-                allocated=granted,
-                created_at=entries[1].timestamp,
-            )
-            pending.batch.nodes.append(child)
-            self._ledger._commit(pending)
-
-            self._nodes[child_id] = child
-            self._breakers[child_id] = _BreakerState()
-            parent.child_ids.append(child_id)
-            return child
+            self._commit(pending)
+            return self._state.nodes[child_id]
 
     def release(
         self,
@@ -3154,7 +3433,8 @@ class BudgetManager:
                 )
 
             note = memo or f"unused budget returned to {node.parent_id}"
-            self._ledger.post(
+            pending = self._ledger._begin()
+            pending.post(
                 [
                     LedgerLine(
                         entry_type=EntryType.RELEASE,
@@ -3174,6 +3454,7 @@ class BudgetManager:
                     ),
                 ]
             )
+            self._commit(pending)
             return returned
 
     # -- authorize / capture ---------------------------------------------
@@ -3245,11 +3526,8 @@ class BudgetManager:
                     )
                 ]
             )
-            auth = _authorization_for(entry)
-            pending.batch.opened.append(auth)
-            self._ledger._commit(pending)
-            self._open_auths[auth.authorization_id] = auth
-            return auth
+            self._commit(pending)
+            return self._open_auths[entry.entry_id]
 
     def capture(
         self,
@@ -3320,31 +3598,26 @@ class BudgetManager:
                     ),
                 ]
             )
-            pending.batch.closed.append(authorization.authorization_id)
 
             overdraft = (
                 spend_entry.balance_after.copy_negate()
                 if spend_entry.balance_after < ZERO
                 else None
             )
-            trip = None
             if overdraft is not None:
-                trip = self._stage_trip(
+                self._stage_trip(
                     pending,
                     scope_id,
                     f"settled cost {settled} overran authorization "
                     f"{authorization.amount}; overdrawn by {overdraft}",
                 )
-            elif self._exhausted(pending, scope_id, settling=authorization):
-                trip = self._stage_trip(pending, scope_id, "spend envelope exhausted")
+            elif self._exhausted(pending, scope_id):
+                self._stage_trip(pending, scope_id, "spend envelope exhausted")
 
-            self._ledger._commit(pending)
-            # Only now that the settlement is durable does the hold leave the
-            # open set: a failed commit above leaves it open for a retry or an
-            # operator to reconcile, instead of orphaning it.
-            del self._open_auths[authorization.authorization_id]
-            if trip is not None:
-                self._apply_trip(trip)
+            # Only once the settlement is durable does the hold leave the open
+            # set: a failed commit leaves it open for a retry or an operator to
+            # reconcile, instead of orphaning it.
+            self._commit(pending)
 
             if overdraft is not None:
                 raise DenialOfWalletError(
@@ -3402,12 +3675,17 @@ class BudgetManager:
         Posts a compensating credit. History is never rewritten: the original
         spend stays in the chain and the refund sits beside it.
 
+        A refund returns money the scope spent, so a scope's lifetime refunds
+        can never exceed its lifetime spend: a refund larger than that would
+        grant spending power its parent never delegated.
+
         :param scope_id: The scope receiving the credit.
         :param amount: The refunded amount.
         :param memo: Free-form audit context.
         :returns: The committed :attr:`EntryType.REVERSAL` entry.
         :raises UnknownScopeError: If no such scope is registered.
-        :raises ValueError: If ``amount`` is not positive.
+        :raises ValueError: If ``amount`` is not positive, or exceeds what the
+            scope has spent and not already had refunded.
         """
         credited = _credit(amount)
         if credited <= ZERO:
@@ -3415,7 +3693,17 @@ class BudgetManager:
 
         with self._mutating():
             self._require_node(scope_id)
-            entries = self._ledger.post(
+            spent = self._state.spent_by(scope_id)
+            refunded = self._state.refunded_to(scope_id)
+            refundable = _subtract(spent, refunded)
+            if credited > refundable:
+                raise ValueError(
+                    f"cannot refund {credited} to {scope_id!r}: it has spent {spent} and been "
+                    f"refunded {refunded}, so at most {refundable} remains refundable; a refund "
+                    f"returns money a scope spent and cannot grant more"
+                )
+            pending = self._ledger._begin()
+            (entry,) = pending.post(
                 [
                     LedgerLine(
                         entry_type=EntryType.REVERSAL,
@@ -3427,7 +3715,8 @@ class BudgetManager:
                     )
                 ]
             )
-            return entries[0]
+            self._commit(pending)
+            return entry
 
     def anchor(self, scope_id: str, memo: str) -> LedgerEntry:
         """Commit an external record into the chain, moving no money.
@@ -3451,7 +3740,8 @@ class BudgetManager:
             raise ValueError("an anchor must carry the record it commits to")
         with self._mutating():
             self._require_node(scope_id)
-            (entry,) = self._ledger.post(
+            pending = self._ledger._begin()
+            (entry,) = pending.post(
                 [
                     LedgerLine(
                         entry_type=EntryType.ANCHOR,
@@ -3462,6 +3752,7 @@ class BudgetManager:
                     )
                 ]
             )
+            self._commit(pending)
             return entry
 
     # -- reconciliation ---------------------------------------------------
@@ -3589,19 +3880,14 @@ class BudgetManager:
         """
         with self._mutating():
             self._require_node(scope_id)
-            state = self._breakers[scope_id]
-            if state.tripped_at is None:
+            if self._state.trip_of(scope_id) is None:
                 return
             pending = self._ledger._begin()
-            entry = self._stage_control(
-                pending, EntryType.CIRCUIT_RESET, scope_id, "operator reset"
-            )
-            self._ledger._commit(pending)
-            state.tripped_at = None
-            state.reason = ""
-            state.call_times.clear()
-            self._control_events.append(_event_for(entry))
-            self._log_control(entry)
+            self._stage_control(pending, EntryType.CIRCUIT_RESET, scope_id, "operator reset")
+            self._commit(pending)
+            velocity = self._velocity.get(scope_id)
+            if velocity is not None:
+                velocity.call_times.clear()
 
     # -- verification -----------------------------------------------------
 
@@ -3649,20 +3935,23 @@ class BudgetManager:
         :raises LedgerIntegrityError: On the first violation found.
         """
         with self._lock:
+            # The tree's own shape first: cheap, and its messages name the
+            # exact defect, where a replay could only say the tree differs.
+            self._verify_tree()
             self._ledger.verify_chain()
             self._ledger.verify_conservation()
-            self._verify_tree()
-            self._verify_against_chain()
+            self._verify_authorizations()
 
     def _verify_tree(self) -> None:
         """The delegation tree is a tree: parents registered, children listed,
         depths consistent, and no cycles. Lock held."""
-        for scope_id, node in self._nodes.items():
+        nodes = self._state.nodes
+        for scope_id, node in nodes.items():
             if node.parent_id is None:
-                if scope_id not in self._roots:
+                if scope_id not in self._state.roots:
                     raise LedgerIntegrityError("parentless scope is not a root", scope_id)
                 continue
-            parent = self._nodes.get(node.parent_id)
+            parent = nodes.get(node.parent_id)
             if parent is None:
                 raise LedgerIntegrityError(f"parent {node.parent_id!r} is not registered", scope_id)
             if scope_id not in parent.child_ids:
@@ -3679,71 +3968,50 @@ class BudgetManager:
                 if cursor in seen:
                     raise LedgerIntegrityError("delegation cycle detected", scope_id)
                 seen.add(cursor)
-                cursor = self._nodes[cursor].parent_id
+                cursor = nodes[cursor].parent_id
 
-    def _verify_against_chain(self) -> None:
-        """The tree, breakers and open holds must be what the chain implies."""
-        derived = _Governance.from_chain(self._ledger.entries(), self._legacy_events)
-        for scope_id, node in self._nodes.items():
-            expected = derived.nodes.get(scope_id)
-            if expected is None:
-                raise LedgerIntegrityError(
-                    "scope is registered but the chain never created it", scope_id
-                )
-            if (node.parent_id, node.depth, node.allocated) != (
-                expected.parent_id,
-                expected.depth,
-                expected.allocated,
-            ):
-                raise LedgerIntegrityError(
-                    f"topology disagrees with the chain: registered with parent "
-                    f"{node.parent_id!r}, depth {node.depth}, allocation {node.allocated}; "
-                    f"the chain implies parent {expected.parent_id!r}, depth "
-                    f"{expected.depth}, allocation {expected.allocated}",
-                    scope_id,
-                )
-        unregistered = sorted(derived.nodes.keys() - self._nodes.keys())
-        if unregistered:
-            raise LedgerIntegrityError(
-                f"the chain created scope(s) {', '.join(unregistered)} that are not registered"
-            )
-
-        halted = {s for s, state in self._breakers.items() if state.tripped_at is not None}
-        if halted != set(derived.tripped):
-            raise LedgerIntegrityError(
-                f"breaker state disagrees with the chain: halted here "
-                f"{sorted(halted)}, halted by the chain {sorted(derived.tripped)}"
-            )
-        if [e.event_id for e in self._control_events] != [e.event_id for e in derived.events]:
-            raise LedgerIntegrityError("control events disagree with the chain")
-
+    def _verify_authorizations(self) -> None:
+        """Every open hold has exactly one authorization, and nothing else does."""
         held = {auth.entry.entry_id for auth in self._open_auths.values()}
-        if held != set(self._ledger._state.holds):
+        if held != set(self._state.holds):
             raise LedgerIntegrityError("open authorizations disagree with the chain's open holds")
 
     # -- internals --------------------------------------------------------
 
+    def _commit(self, pending: _Pending) -> None:
+        """Make a unit of work durable, then visible, here and in the ledger.
+
+        The ledger writes the entries with the cache rows they imply and only
+        then merges them; this manager then follows what they opened, closed
+        and recorded. Lock held.
+        """
+        controls = [e for e in pending.entries if e.entry_type in _CONTROL_TYPES]
+        self._ledger._commit(pending)
+        for entry in controls:
+            self._log_control(entry)
+
     def _require_node(self, scope_id: str) -> BudgetNode:
         """Return the node for ``scope_id`` or raise. Caller holds the lock."""
-        node = self._nodes.get(scope_id)
+        node = self._state.nodes.get(scope_id)
         if node is None:
             raise UnknownScopeError(scope_id)
         return node
 
     def _halted_by(self, scope_id: str) -> str | None:
         """Nearest tripped scope at or above ``scope_id``. Caller holds the lock."""
+        nodes, tripped = self._state.nodes, self._state.tripped
         cursor: str | None = scope_id
         while cursor is not None:
-            if self._breakers[cursor].tripped_at is not None:
+            if cursor in tripped:
                 return cursor
-            cursor = self._nodes[cursor].parent_id
+            cursor = nodes[cursor].parent_id
         return None
 
     def _assert_not_halted(self, scope_id: str) -> None:
         """Raise if ``scope_id`` is halted. Caller holds the lock."""
         tripped = self._halted_by(scope_id)
         if tripped is not None:
-            raise CircuitOpenError(scope_id, tripped, self._breakers[tripped].reason)
+            raise CircuitOpenError(scope_id, tripped, self._state.tripped[tripped][1])
 
     def _record_velocity(self, scope_id: str) -> None:
         """Record an authorization and trip on runaway loops. Lock held."""
@@ -3753,7 +4021,7 @@ class BudgetManager:
             return
 
         now = time.monotonic()
-        times = self._breakers[scope_id].call_times
+        times = self._velocity.setdefault(scope_id, _Velocity()).call_times
         times.append(now)
         cutoff = now - window
         while times and times[0] < cutoff:
@@ -3766,17 +4034,15 @@ class BudgetManager:
 
     def _trip(self, scope_id: str, reason: str) -> None:
         """Latch the breaker for ``scope_id`` in its own unit of work. Lock held."""
-        if self._breakers[scope_id].tripped_at is not None:
+        if self._state.trip_of(scope_id) is not None:
             return
         pending = self._ledger._begin()
-        entry = self._stage_trip(pending, scope_id, reason)
-        self._ledger._commit(pending)
-        if entry is not None:
-            self._apply_trip(entry)
+        self._stage_trip(pending, scope_id, reason)
+        self._commit(pending)
 
     def _stage_trip(self, pending: _Pending, scope_id: str, reason: str) -> LedgerEntry | None:
         """Add a trip to a unit of work, unless the scope is already latched."""
-        if self._breakers[scope_id].tripped_at is not None:
+        if pending.view.trip_of(scope_id) is not None:
             return None
         return self._stage_control(pending, EntryType.CIRCUIT_TRIPPED, scope_id, reason)
 
@@ -3794,16 +4060,7 @@ class BudgetManager:
                 )
             ]
         )
-        pending.batch.control_events.append(_event_for(entry))
         return entry
-
-    def _apply_trip(self, entry: LedgerEntry) -> None:
-        """Latch in memory a trip that is already durable. Lock held."""
-        state = self._breakers[entry.scope_id]
-        state.tripped_at = entry.timestamp
-        state.reason = entry.memo
-        self._control_events.append(_event_for(entry))
-        self._log_control(entry)
 
     def _log_control(self, entry: LedgerEntry) -> None:
         audit_log.warning(
@@ -3822,21 +4079,19 @@ class BudgetManager:
             },
         )
 
-    def _exhausted(self, pending: _Pending, scope_id: str, *, settling: Authorization) -> bool:
-        """Whether settling this authorization leaves the scope spent out.
+    def _exhausted(self, pending: _Pending, scope_id: str) -> bool:
+        """Whether the work in ``pending`` leaves the scope spent out.
 
-        Only once every other hold on the scope has settled, so a transient
-        zero caused by an in-flight authorization is not mistaken for
-        exhaustion.
+        Only once every hold on the scope has settled, so a transient zero
+        caused by an in-flight authorization is not mistaken for exhaustion.
+        The count of open holds is kept per scope, so this costs nothing in
+        the number of holds elsewhere.
         """
         if not self._policy.trip_on_exhaustion:
             return False
         if pending.balance(scope_id) > ZERO:
             return False
-        return not any(
-            auth.scope_id == scope_id and auth.authorization_id != settling.authorization_id
-            for auth in self._open_auths.values()
-        )
+        return pending.view.holds_open_in(scope_id) == 0
 
     def _require_open_authorization(self, authorization: Authorization, detail: str) -> None:
         """Raise if this authorization was already settled. Lock held.
@@ -3868,9 +4123,7 @@ class BudgetManager:
                 )
             ]
         )
-        pending.batch.closed.append(authorization.authorization_id)
-        self._ledger._commit(pending)
-        del self._open_auths[authorization.authorization_id]
+        self._commit(pending)
         return entry
 
 
@@ -3895,21 +4148,19 @@ def _image_head(image: StoreImage) -> tuple[int, str]:
 
 @dataclass(frozen=True, slots=True)
 class _Restored:
-    """What a store's image implies, derived against a verified chain."""
+    """What a store's image implies, checked against a verified chain."""
 
-    governance: _Governance
     authorizations: dict[uuid.UUID, Authorization]
     identities: dict[_HoldKey, list[LedgerEntry]]
-    legacy: tuple[ControlEvent, ...]
     problems: list[str]
     schema_version: str
     control_high_water: int
 
-    def rebuild(self, store: PersistenceStore) -> None:
+    def rebuild(self, store: PersistenceStore, state: _ChainState) -> None:
         """Replace the store's cache tables with what the chain implies."""
         store.rebuild_caches(
-            nodes=tuple(self.governance.nodes.values()),
-            control_events=tuple(self.governance.chain_events),
+            nodes=tuple(state.nodes.values()),
+            control_events=tuple(e for e in state.events if e.entry_id is not None),
             authorizations=tuple(self.authorizations.values()),
         )
 
@@ -3958,11 +4209,11 @@ class _HoldIndex:
         return entry_id in self._released
 
 
-def _node_row_problems(governance: _Governance, rows: Sequence[PersistedNode]) -> list[str]:
+def _node_row_problems(state: _ChainState, rows: Sequence[PersistedNode]) -> list[str]:
     """Stored topology rows that disagree with the chain."""
     problems: list[str] = []
     stored = {row.scope_id: row for row in rows}
-    for scope_id, node in governance.nodes.items():
+    for scope_id, node in state.nodes.items():
         row = stored.get(scope_id)
         if row is None:
             problems.append(f"scope {scope_id!r} is in the chain but missing from the nodes table")
@@ -3977,12 +4228,12 @@ def _node_row_problems(governance: _Governance, rows: Sequence[PersistedNode]) -
                 f"depth {row.depth}, allocation {row.allocated}; the chain implies parent "
                 f"{node.parent_id!r}, depth {node.depth}, allocation {node.allocated}"
             )
-    for scope_id in sorted(stored.keys() - governance.nodes.keys()):
+    for scope_id in sorted(stored.keys() - state.nodes.keys()):
         problems.append(f"the nodes table lists scope {scope_id!r}, which the chain never created")
     return problems
 
 
-def _control_row_problems(governance: _Governance, rows: Sequence[ControlEvent]) -> list[str]:
+def _control_row_problems(state: _ChainState, rows: Sequence[ControlEvent]) -> list[str]:
     """Stored control-event rows that disagree with the chain's control entries."""
     problems: list[str] = []
     stored: dict[uuid.UUID, ControlEvent] = {}
@@ -3992,7 +4243,7 @@ def _control_row_problems(governance: _Governance, rows: Sequence[ControlEvent])
         if row.entry_id in stored:
             problems.append(f"control_events records chain entry {row.entry_id} twice")
         stored[row.entry_id] = row
-    chained = {e.entry_id: e for e in governance.chain_events if e.entry_id is not None}
+    chained = {e.entry_id: e for e in state.events if e.entry_id is not None}
     for entry_id, event in chained.items():
         found = stored.get(entry_id)
         if found is None:

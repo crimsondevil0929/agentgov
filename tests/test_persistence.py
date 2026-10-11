@@ -246,7 +246,7 @@ def test_appending_a_duplicate_sequence_number_is_rejected(db_path: str) -> None
     store's PRIMARY KEY constraint is a second, independent backstop."""
     store = SqliteStore(db_path)
     ledger = Ledger(store=store)
-    ledger.post([LedgerLine(EntryType.FUNDING, Direction.CREDIT, "root", money("1.00"))])
+    ledger._post([LedgerLine(EntryType.FUNDING, Direction.CREDIT, "root", money("1.00"))])
     duplicate = replace(ledger.entries()[0], entry_hash="forced-duplicate")
     with pytest.raises(LedgerIntegrityError, match="failed to durably append"):
         store.append_entries([duplicate])
