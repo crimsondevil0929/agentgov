@@ -66,3 +66,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Benchmark fixtures and local results (benchmarks/baseline/ is committed)
+benchmarks/.fixtures/
+benchmarks/results/

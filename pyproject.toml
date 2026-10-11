@@ -72,6 +72,10 @@ dev = [
     # The PostgreSQL store's integration tests. The runtime dependency is the
     # `postgres` extra; this puts the driver in every dev environment.
     "psycopg[binary]>=3.2",
+    # Property and model-based tests: "whatever the governor accepts, a
+    # replay reproduces" is a property over every sequence of operations, not
+    # a list of examples (tests/test_model.py).
+    "hypothesis>=6.100",
 ]
 
 [tool.pytest.ini_options]
