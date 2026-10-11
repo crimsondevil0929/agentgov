@@ -795,8 +795,8 @@ and races them: writes get refused, and the ledger still balances to the cent.
   scale out further.
 - **Tested on PostgreSQL 14, 16, 17 and 18,** connected directly and, the whole suite,
   behind PgBouncer in transaction mode ([docs/OPERATIONS.md](docs/OPERATIONS.md)).
-- **The CLI does not read PostgreSQL yet.** Use `open_postgres(..., read_only=True)` and
-  `verify_integrity()` for an audit.
+- **The CLI reads PostgreSQL by URL**: `agentgov verify 'postgresql://...?schema=agentgov'`,
+  and `inspect`, `audit`, `export`, `checkpoint` and `repair` the same way.
 
 [`tests/test_postgres_store.py`](tests/test_postgres_store.py) pins the store's contract:
 install, restart, tamper evidence, least privilege, and every failure above.

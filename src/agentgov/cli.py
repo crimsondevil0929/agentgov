@@ -17,7 +17,7 @@ Two commands, aimed at two different readers:
     on any phantom line — billed spend with no local authorization — so it too
     belongs in a pipeline.
 
-``agentgov repair <db>``
+``agentgov repair <ledger>``
     For an operator whose governor refused to open because a cache table
     (topology, control events, open authorizations) disagrees with the chain:
     rebuilds those tables from the chain and says what it changed. Moves no
@@ -305,7 +305,7 @@ def _command_audit(args: argparse.Namespace, out: TextIO) -> int:
     if kind == "postgres":
         from agentgov.postgres import PostgresStore
 
-        store = PostgresStore(target, schema=options.get("schema", "agentgov"))
+        store = PostgresStore(target, **options)
     elif kind == "sqlite":
         from agentgov.storage import SqliteStore
 
@@ -388,7 +388,7 @@ def _command_reconcile(args: argparse.Namespace, out: TextIO) -> int:
 
 def _command_repair(args: argparse.Namespace, out: TextIO) -> int:
     """Rebuild the cache tables from the chain, and report what changed."""
-    manager = BudgetManager.open_sqlite(args.path, repair=True)
+    manager = open_url(args.path, repair=True, auditor=False)
     try:
         if not manager.repairs:
             out.write(
@@ -481,7 +481,7 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
         return 2
     if args.ledger:
         try:
-            ledger = BudgetManager.open_sqlite(args.ledger, read_only=True)
+            ledger = open_url(args.ledger, read_only=True, auditor=False)
         except AgentGovError as exc:
             unreadable["agentgov ledger"] = Check(
                 "agentgov ledger", "fail", f"the ledger does not verify: {exc}", Failure.LEDGER
@@ -608,7 +608,7 @@ def build_parser() -> argparse.ArgumentParser:
         "repair",
         help="rebuild cache tables that disagree with the chain; moves no money",
     )
-    repair.add_argument("path", help="path to the SQLite ledger")
+    repair.add_argument("path", help=_TARGET)
     repair.set_defaults(handler=_command_repair)
 
     audit = subcommands.add_parser(
