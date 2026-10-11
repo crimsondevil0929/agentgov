@@ -31,12 +31,19 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, Decimal, localcontext
 from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Any, Final, Generic, Self, TypeVar
 
 from agentgov.cognitive import CognitiveBreaker
-from agentgov.core import QUANTUM, Authorization, BudgetManager, LedgerEntry, money
+from agentgov.core import (
+    _ROUNDING,
+    QUANTUM,
+    Authorization,
+    BudgetManager,
+    LedgerEntry,
+    money,
+)
 
 if TYPE_CHECKING:
     # Imported lazily at call time in stream()/astream(): streaming
@@ -220,13 +227,16 @@ class ModelPricing:
         :param usage: The token counts to price.
         :returns: The cost in USD, quantized to :data:`~agentgov.core.QUANTUM`.
         """
-        raw = (
-            self.input_usd_per_mtok * usage.input_tokens
-            + self.output_usd_per_mtok * usage.output_tokens
-            + self.cache_read_usd_per_mtok * usage.cache_read_input_tokens
-            + self.cache_write_usd_per_mtok * usage.cache_creation_input_tokens
-        ) / _PER_MILLION
-        return raw.quantize(QUANTUM, rounding=ROUND_CEILING)
+        # The ledger's rounding context, never the calling thread's: a host
+        # that lowered its own precision must not change what a call costs.
+        with localcontext(_ROUNDING):
+            raw = (
+                self.input_usd_per_mtok * usage.input_tokens
+                + self.output_usd_per_mtok * usage.output_tokens
+                + self.cache_read_usd_per_mtok * usage.cache_read_input_tokens
+                + self.cache_write_usd_per_mtok * usage.cache_creation_input_tokens
+            ) / _PER_MILLION
+            return raw.quantize(QUANTUM, rounding=ROUND_CEILING)
 
     def estimate(self, input_tokens: int, max_output_tokens: int) -> Decimal:
         """Compute a worst-case pre-flight cost for an authorization hold.
@@ -259,8 +269,8 @@ def _rates(
         model_id=model_id,
         input_usd_per_mtok=inp,
         output_usd_per_mtok=Decimal(output_rate),
-        cache_read_usd_per_mtok=Decimal(cache_read) if cache_read else inp / 10,
-        cache_write_usd_per_mtok=inp * Decimal("1.25"),
+        cache_read_usd_per_mtok=Decimal(cache_read) if cache_read else _ROUNDING.divide(inp, 10),
+        cache_write_usd_per_mtok=_ROUNDING.multiply(inp, Decimal("1.25")),
     )
 
 
@@ -744,7 +754,9 @@ class Interceptor:
         estimate = self._pricing.cost_of(
             TokenUsage(input_tokens=estimate_tokens(text), output_tokens=max_output)
         )
-        buffered = (estimate * self._safety_buffer).quantize(QUANTUM, rounding=ROUND_CEILING)
+        buffered = _ROUNDING.multiply(estimate, self._safety_buffer).quantize(
+            QUANTUM, rounding=ROUND_CEILING, context=_ROUNDING
+        )
         # Never reserve less than the static ceiling would have: the payload
         # heuristic is allowed to raise a hold, not to quietly weaken one.
         return max(buffered, self.hold_amount)

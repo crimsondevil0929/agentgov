@@ -409,13 +409,15 @@ def test_a_governor_killed_holding_the_lock_frees_it_and_leaves_nothing(pg_dsn: 
     child.start()
     try:
         assert written.wait(60)
-        with (
-            BudgetManager.open_postgres(pg_dsn, read_only=True) as reader,
-            pytest.raises(StorageError, match="waiting for the writer lock"),
-        ):
+        with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
             store = PostgresStore(pg_dsn, lock_timeout=0.3)
             try:
-                BudgetManager(store=store)  # opening a writer needs the lock too
+                # Opening needs no lock: the committed ledger is served at once,
+                # without what the frozen governor wrote and never committed.
+                writer = BudgetManager(store=store)
+                assert writer.ledger.entries() == before
+                with pytest.raises(StorageError, match="waiting for the writer lock"):
+                    writer.spend("agent", "0.01")  # writing does need it
             finally:
                 store.close()
         assert reader.ledger.entries() == before

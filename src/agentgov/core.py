@@ -74,10 +74,20 @@ import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import (
+    ROUND_CEILING,
+    ROUND_FLOOR,
+    ROUND_HALF_EVEN,
+    Context,
+    Decimal,
+    DivisionByZero,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+)
 from enum import Enum, unique
 from typing import TYPE_CHECKING, Final
 
@@ -141,8 +151,40 @@ never in floating point.
 ZERO: Final = Decimal("0")
 MAX_AMOUNT: Final = Decimal("1000000000000")
 """Hard ceiling on any single amount (1e12 USD). A request above this is
-rejected as malformed rather than quantized, which keeps ``Decimal`` well
-inside its default 28-digit context and catches unit-confusion bugs."""
+rejected as malformed rather than quantized, which catches unit-confusion
+bugs and keeps every total far inside the ledger's own context."""
+
+_ARITHMETIC: Final = Context(
+    prec=50,
+    rounding=ROUND_HALF_EVEN,
+    Emin=-999999,
+    Emax=999999,
+    traps=[InvalidOperation, DivisionByZero, Overflow, Inexact],
+)
+"""The context every balance and total is computed in.
+
+Never the calling thread's: :mod:`decimal` contexts are thread-local and
+belong to the host application, which may lower the precision for its own
+formatting. Ledger arithmetic that followed it could write a rounded balance
+that no replay reproduces, and a ledger that cannot be replayed cannot be
+opened. Fifty digits hold any sum of amounts under :data:`MAX_AMOUNT` many
+times over, and :class:`~decimal.Inexact` is trapped, so an operation that
+would round raises instead of being written.
+"""
+
+_ROUNDING: Final = Context(
+    prec=50,
+    rounding=ROUND_HALF_EVEN,
+    Emin=-999999,
+    Emax=999999,
+    traps=[InvalidOperation, DivisionByZero, Overflow],
+)
+"""The context for the ledger's deliberate rounding: quantizing an amount to
+:data:`QUANTUM` (costs up, credits down) and pricing tokens. The same as
+:data:`_ARITHMETIC` except that rounding is the point, so it is not trapped."""
+
+_add = _ARITHMETIC.add
+_subtract = _ARITHMETIC.subtract
 
 GENESIS_HASH: Final = "0" * 64
 """``prev_hash`` of the first entry in a chain."""
@@ -199,9 +241,11 @@ def _coerce(
             raise ValueError(f"{label} is not a valid decimal: {value!r}") from exc
     if not value.is_finite():
         raise ValueError(f"{label} must be finite, got {value}")
-    if abs(value) > MAX_AMOUNT:
+    if value.copy_abs() > MAX_AMOUNT:
         raise ValueError(f"{label} exceeds the maximum of {MAX_AMOUNT}: {value}")
-    return value.quantize(QUANTUM, rounding=rounding)
+    # In the ledger's own context, never the caller's: a host thread at low
+    # precision would otherwise refuse (or round) an exact amount.
+    return value.quantize(QUANTUM, rounding=rounding, context=_ROUNDING)
 
 
 def _cost(value: Decimal | int | str) -> Decimal:
@@ -398,7 +442,8 @@ class LedgerEntry:
         if self.direction is Direction.CREDIT:
             return self.amount
         if self.direction is Direction.DEBIT:
-            return -self.amount
+            # copy_negate is exact; unary minus would round to the caller's context.
+            return self.amount.copy_negate()
         return ZERO
 
     def recompute_hash(self) -> str:
@@ -517,6 +562,30 @@ def _hash_entry(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+_LOG_UNSAFE: Final = re.compile(r"[^\x20-\x5b\x5d-\x7b\x7d\x7e]")
+"""Anything but printable ASCII, and the two characters printable ASCII
+that the line format itself uses: ``|`` and ``\\``."""
+
+
+def _escape(text: str) -> str:
+    """Make free text safe to place in one field of an audit line (CWE-117).
+
+    Scope ids and memos can come from model output. Unescaped, a newline in a
+    memo starts a new line in the log, and that line can be a well-formed
+    forgery of an entry that was never written. Text that is printable ASCII
+    and contains neither ``|`` nor ``\\`` is placed as it is, which covers
+    every ordinary id and memo. Anything else is written as the body of a
+    JSON string with every non-ASCII character escaped, and ``|`` escaped as
+    ``\\u007c`` and DEL as ``\\u007f``: one token, no control characters, and
+    reversible, since a field holds a backslash only when it is escaped this
+    way (``json.loads('"' + field + '"')`` recovers the text).
+    """
+    if _LOG_UNSAFE.search(text) is None:
+        return text
+    body = json.dumps(text, ensure_ascii=True)[1:-1]
+    return body.replace("|", "\\u007c").replace("\x7f", "\\u007f")
+
+
 def format_audit_line(entry: LedgerEntry) -> str:
     """Render an entry as a single fixed-field audit log line.
 
@@ -526,6 +595,11 @@ def format_audit_line(entry: LedgerEntry) -> str:
         AGOV2|seq=0000000007|txn=<uuid>|ts=...Z|type=spend|dir=DR
               |scope=agent.research|cpty=-|amt=0.00004500|bal=0.09991000|h=1a2b3c4d
               |ref=<uuid>
+
+    The scope, counterparty and memo are free text, and are escaped so that
+    each stays one field of one line whatever it contains (see
+    :func:`_escape`); the structured record passed alongside it as ``extra``
+    carries them unescaped.
 
     :param entry: The entry to render.
     :returns: One line of audit output, with no trailing newline.
@@ -537,13 +611,13 @@ def format_audit_line(entry: LedgerEntry) -> str:
         f"|ts={_iso(entry.timestamp)}"
         f"|type={entry.entry_type.value}"
         f"|dir={entry.direction.value}"
-        f"|scope={entry.scope_id}"
-        f"|cpty={entry.counterparty_id or '-'}"
+        f"|scope={_escape(entry.scope_id)}"
+        f"|cpty={_escape(entry.counterparty_id) if entry.counterparty_id else '-'}"
         f"|amt={entry.amount}"
         f"|bal={entry.balance_after}"
         f"|h={entry.entry_hash[:16]}"
         + (f"|ref={entry.ref}" if entry.ref is not None else "")
-        + (f"|memo={entry.memo}" if entry.memo else "")
+        + (f"|memo={_escape(entry.memo)}" if entry.memo else "")
     )
 
 
@@ -710,7 +784,7 @@ class _Overlay:
         self._check_version(entry)
         self._check_shape(entry)
 
-        expected = self.balance(scope) + entry.signed_amount
+        expected = _add(self.balance(scope), entry.signed_amount)
         if entry.balance_after != expected:
             raise LedgerIntegrityError(
                 f"entry {entry.sequence} records a balance of {entry.balance_after}, "
@@ -915,15 +989,15 @@ def _apply_totals(totals: _Totals, entries: Iterable[LedgerEntry]) -> _Totals:
     for entry in entries:
         match entry.entry_type:
             case EntryType.FUNDING:
-                funded += entry.amount
+                funded = _add(funded, entry.amount)
             case EntryType.SPEND:
-                spent += entry.amount
+                spent = _add(spent, entry.amount)
             case EntryType.REVERSAL:
-                reversed_ += entry.amount
+                reversed_ = _add(reversed_, entry.amount)
             case EntryType.HOLD:
-                holds += entry.amount
+                holds = _add(holds, entry.amount)
             case EntryType.HOLD_VOID:
-                holds -= entry.amount
+                holds = _subtract(holds, entry.amount)
             case _:
                 pass
     return _Totals(funded=funded, spent=spent, reversed_=reversed_, holds_open=holds)
@@ -1074,17 +1148,16 @@ class _Pending:
                     f"releases and the spends that settle them"
                 )
 
-            if line.entry_type in _BALANCED_TYPES:
-                transfer_net += amount if line.direction is Direction.CREDIT else -amount
-
             if line.direction is Direction.CREDIT:
                 signed = amount
             elif line.direction is Direction.DEBIT:
-                signed = -amount
+                signed = amount.copy_negate()
             else:
                 signed = ZERO
+            if line.entry_type in _BALANCED_TYPES:
+                transfer_net = _add(transfer_net, signed)
             current = running.get(line.scope_id, view.balance(line.scope_id))
-            balance_after = current + signed
+            balance_after = _add(current, signed)
             if line.entry_type not in _ZERO_VALUE_TYPES:
                 running[line.scope_id] = balance_after
 
@@ -1436,9 +1509,11 @@ class Ledger:
         :raises LedgerIntegrityError: If the identity does not hold exactly.
         """
         with self._lock:
-            total_balance = sum(self._state.balances.values(), ZERO)
+            total_balance = ZERO
+            for balance in self._state.balances.values():
+                total_balance = _add(total_balance, balance)
             t = self._state.totals
-            left = total_balance + t.holds_open + t.spent - t.reversed_
+            left = _subtract(_add(_add(total_balance, t.holds_open), t.spent), t.reversed_)
             if left != t.funded:
                 raise LedgerIntegrityError(
                     f"conservation violated: balances {total_balance} + holds "
@@ -1683,7 +1758,7 @@ class _Governance:
                     f"entry {entry.sequence} funds a scope that is not a root", scope
                 )
             else:
-                node.allocated += entry.amount
+                node.allocated = _add(node.allocated, entry.amount)
         elif kind is EntryType.ALLOCATION:
             self._allocate(entry)
         elif kind is EntryType.RELEASE:
@@ -1936,51 +2011,56 @@ class BudgetManager:
         repair: bool = False,
     ) -> None:
         shared = _shared_store(store) if store is not None and not store.read_only else None
-        # A shared ledger is opened under its writer lock: the entries and the
-        # caches are read in one pass no other governor can commit into, and a
-        # repair cannot erase rows another governor has just written.
-        with shared.writer() if shared is not None else nullcontext():
-            image: StoreImage | None = None
+        # Opened without the fleet's writer lock. The committed prefix of a
+        # chain never changes (the append-only triggers see to that on a
+        # shared store, the single writer on SQLite), so one consistent
+        # snapshot of every table can be verified and served on its own. The
+        # first mutation catches up with whatever was committed since, under
+        # the lock, as every mutation does. Only a repair takes the lock, and
+        # it re-reads under it before writing (_restore_from_store).
+        image: StoreImage | None = None
+        if store is not None:
+            # One consistent read of every table: a live writer in another
+            # process cannot slip a commit between the entries and the
+            # caches that describe them.
+            image = store.load()
             if ledger is None:
-                if store is not None:
-                    # One consistent read of every table: a live writer in
-                    # another process cannot slip a commit between the entries
-                    # and the caches that describe them.
-                    image = store.load()
-                    ledger = Ledger._from_entries(store, image.entries)
-                else:
-                    ledger = Ledger()
-            self._ledger = ledger
-            self._policy = policy if policy is not None else GovernancePolicy()
-            # One mutex for the whole control plane. Sharing the ledger's lock
-            # (rather than nesting a second one under it) removes any
-            # possibility of a lock-ordering deadlock.
-            self._lock = self._ledger.lock
-            self._store: PersistenceStore | None = store
-            self._shared: SharedStore | None = shared
-            self._writing = False
-            self._dirty = False
-            self._nodes: dict[str, BudgetNode] = {}
-            self._roots: list[str] = []
-            self._breakers: dict[str, _BreakerState] = {}
-            self._open_auths: dict[uuid.UUID, Authorization] = {}
-            self._control_events: list[ControlEvent] = []
-            self._legacy_events: tuple[ControlEvent, ...] = ()
-            self._governance: _Governance | None = None
-            self._repairs: tuple[str, ...] = ()
-            self._schema_version = ""
-            self._control_high_water = 0
-            self._unusable: str | None = None
+                ledger = Ledger._from_entries(store, image.entries)
+            elif shared is not None and (len(ledger), ledger.head_hash) != _image_head(image):
+                # A ledger read from a shared store before this snapshot may
+                # be behind it; serve the snapshot, which the caches match.
+                ledger._adopt(image.entries)
+        elif ledger is None:
+            ledger = Ledger()
+        self._ledger = ledger
+        self._policy = policy if policy is not None else GovernancePolicy()
+        # One mutex for the whole control plane. Sharing the ledger's lock
+        # (rather than nesting a second one under it) removes any possibility
+        # of a lock-ordering deadlock.
+        self._lock = self._ledger.lock
+        self._store: PersistenceStore | None = store
+        self._shared: SharedStore | None = shared
+        self._writing = False
+        self._dirty = False
+        self._nodes: dict[str, BudgetNode] = {}
+        self._roots: list[str] = []
+        self._breakers: dict[str, _BreakerState] = {}
+        self._open_auths: dict[uuid.UUID, Authorization] = {}
+        self._control_events: list[ControlEvent] = []
+        self._legacy_events: tuple[ControlEvent, ...] = ()
+        self._governance: _Governance | None = None
+        self._repairs: tuple[str, ...] = ()
+        self._schema_version = ""
+        self._control_high_water = 0
+        self._unusable: str | None = None
 
-            if store is not None:
-                self._restore_from_store(
-                    store, image if image is not None else store.load(), repair=repair
-                )
-            elif len(self._ledger):
-                self._adopt_governance(_Governance.from_chain(self._ledger.entries()))
-                self._open_auths = {
-                    hold.entry_id: _authorization_for(hold) for hold in self._ledger.open_holds()
-                }
+        if store is not None and image is not None:
+            self._restore_from_store(store, image, repair=repair)
+        elif len(self._ledger):
+            self._adopt_governance(_Governance.from_chain(self._ledger.entries()))
+            self._open_auths = {
+                hold.entry_id: _authorization_for(hold) for hold in self._ledger.open_holds()
+            }
 
     @classmethod
     def open_sqlite(
@@ -2125,19 +2205,8 @@ class BudgetManager:
             inconsistent. A corrupted or partially written database is
             refused, never trusted.
         """
-        self._schema_version = image.schema_version
-        self._control_high_water = image.control_high_water
-        legacy = tuple(event for event in image.control_events if event.entry_id is None)
-        entries = self._ledger.entries()
-        governance = _Governance.from_chain(entries, legacy)
-
-        problems = _node_row_problems(governance, image.nodes)
-        problems += _control_row_problems(governance, image.control_events)
-        auths, auth_problems, identities = self._reconcile_authorizations(
-            image.authorizations, _HoldIndex(lambda: entries), repairing=repair
-        )
-        problems += auth_problems
-
+        restored = self._derive(image, repair=repair)
+        problems = restored.problems
         if problems:
             more = f" (and {len(problems) - 1} more)" if len(problems) > 1 else ""
             if not repair:
@@ -2150,29 +2219,74 @@ class BudgetManager:
                 raise LedgerIntegrityError(
                     f"{problems[0]}{more}; a read-only store cannot be repaired"
                 )
-            store.rebuild_caches(
-                nodes=tuple(governance.nodes.values()),
-                control_events=tuple(governance.chain_events),
-                authorizations=tuple(auths.values()),
-            )
-            self._repairs = tuple(problems)
-            for problem in problems:
-                audit_log.warning(f"{_AUDIT_VERSION}|repair|{problem}")
+            if self._shared is not None:
+                # A repair rewrites cache rows, so on a shared ledger it is
+                # made under the writer lock, from a read made under it: rows
+                # another governor committed after the snapshot this view was
+                # opened from must not be erased.
+                with self._shared.writer():
+                    image = store.load()
+                    self._ledger._adopt(image.entries)
+                    restored = self._derive(image, repair=True)
+                    if restored.problems:
+                        restored.rebuild(store)
+            else:
+                restored.rebuild(store)
+            self._repairs = tuple(restored.problems)
+            for problem in restored.problems:
+                audit_log.warning(f"{_AUDIT_VERSION}|repair|{_escape(problem)}")
 
-        for key, chosen in identities.items():
+        self._schema_version = restored.schema_version
+        self._control_high_water = restored.control_high_water
+        for key, chosen in restored.identities.items():
             self._ledger._reassign_holds(key, chosen)
-        self._legacy_events = legacy
-        self._adopt_governance(governance)
-        self._open_auths = auths
+        self._legacy_events = restored.legacy
+        self._adopt_governance(restored.governance)
+        self._open_auths = restored.authorizations
         if store.read_only:
-            self._governance = governance
+            self._governance = restored.governance
         elif self._ledger._state.saw_v1 and not self._ledger._state.saw_v2:
-            self._seal(legacy)
+            self._seal(restored.legacy)
 
-        # Fail closed: the same standard the ledger's own chain check holds
-        # itself to. A restored governor that does not check out is refused,
-        # not served with degraded confidence.
-        self.verify_integrity()
+        # Fail closed. Everything served was just derived from a verified
+        # replay of the chain, so replaying it a second time would prove
+        # nothing new; what remains is what the derivation does not imply.
+        self._verify_derived()
+
+    def _derive(self, image: StoreImage, *, repair: bool) -> _Restored:
+        """The governance, authorizations and cache disagreements ``image``
+        implies, against this manager's (already verified) ledger."""
+        legacy = tuple(event for event in image.control_events if event.entry_id is None)
+        entries = self._ledger.entries()
+        governance = _Governance.from_chain(entries, legacy)
+        problems = _node_row_problems(governance, image.nodes)
+        problems += _control_row_problems(governance, image.control_events)
+        auths, auth_problems, identities = self._reconcile_authorizations(
+            image.authorizations, _HoldIndex(lambda: entries), repairing=repair
+        )
+        problems += auth_problems
+        return _Restored(
+            governance=governance,
+            authorizations=auths,
+            identities=identities,
+            legacy=legacy,
+            problems=problems,
+            schema_version=image.schema_version,
+            control_high_water=image.control_high_water,
+        )
+
+    def _verify_derived(self) -> None:
+        """The checks a fresh derivation from the chain does not already imply.
+
+        Conservation, the tree's own shape, and that every open hold has
+        exactly one authorization. Costs time proportional to scopes and open
+        holds, not to history.
+        """
+        self._ledger.verify_conservation()
+        self._verify_tree()
+        held = {auth.entry.entry_id for auth in self._open_auths.values()}
+        if held != set(self._ledger._state.holds):
+            raise LedgerIntegrityError("open authorizations disagree with the chain's open holds")
 
     def _adopt_governance(self, governance: _Governance) -> None:
         self._nodes = governance.nodes
@@ -2390,7 +2504,9 @@ class BudgetManager:
         joins the session it is already in.
 
         A session that wrote and then did not commit may have left memory ahead
-        of the database, so the next mutation re-reads the ledger in full.
+        of the database, so the next mutation re-reads the ledger in full. It
+        does so before taking the writer lock, from a snapshot, the way a
+        governor opens; the lock is then held only to catch up from it.
         """
         with self._lock:
             shared = self._shared
@@ -2398,6 +2514,8 @@ class BudgetManager:
                 yield
                 return
             self._require_following()
+            if self._dirty:
+                self._follow(shared)
             session: WriterSession | None = None
             self._writing = True
             try:
@@ -2550,7 +2668,8 @@ class BudgetManager:
                 trip = self._stage_trip(
                     pending,
                     scope_id,
-                    f"settled claim {claim.amount} overdrew the scope by {-settling.balance_after}",
+                    f"settled claim {claim.amount} overdrew the scope by "
+                    f"{settling.balance_after.copy_negate()}",
                 )
             elif hold is not None and self._exhausted(pending, scope_id, settling=hold):
                 trip = self._stage_trip(pending, scope_id, "spend envelope exhausted")
@@ -2770,7 +2889,7 @@ class BudgetManager:
         with self._lock:
             total = self._ledger.balance(scope_id)
             for node in self.descendants(scope_id):
-                total += self._ledger.balance(node.scope_id)
+                total = _add(total, self._ledger.balance(node.scope_id))
             return total
 
     def descendants(self, scope_id: str) -> Iterator[BudgetNode]:
@@ -2906,11 +3025,10 @@ class BudgetManager:
                     )
                 ]
             )
-            pending.batch.nodes.append(
-                dataclasses.replace(node, allocated=node.allocated + credited)
-            )
+            allocated = _add(node.allocated, credited)
+            pending.batch.nodes.append(dataclasses.replace(node, allocated=allocated))
             self._ledger._commit(pending)
-            node.allocated += credited
+            node.allocated = allocated
             return entry
 
     def delegate(
@@ -3204,7 +3322,11 @@ class BudgetManager:
             )
             pending.batch.closed.append(authorization.authorization_id)
 
-            overdraft = -spend_entry.balance_after if spend_entry.balance_after < ZERO else None
+            overdraft = (
+                spend_entry.balance_after.copy_negate()
+                if spend_entry.balance_after < ZERO
+                else None
+            )
             trip = None
             if overdraft is not None:
                 trip = self._stage_trip(
@@ -3227,7 +3349,7 @@ class BudgetManager:
             if overdraft is not None:
                 raise DenialOfWalletError(
                     settled,
-                    settled - overdraft,
+                    _subtract(settled, overdraft),
                     scope_id,
                     overspent=True,
                 )
@@ -3529,36 +3651,35 @@ class BudgetManager:
         with self._lock:
             self._ledger.verify_chain()
             self._ledger.verify_conservation()
-
-            for scope_id, node in self._nodes.items():
-                if node.parent_id is None:
-                    if scope_id not in self._roots:
-                        raise LedgerIntegrityError("parentless scope is not a root", scope_id)
-                    continue
-                parent = self._nodes.get(node.parent_id)
-                if parent is None:
-                    raise LedgerIntegrityError(
-                        f"parent {node.parent_id!r} is not registered", scope_id
-                    )
-                if scope_id not in parent.child_ids:
-                    raise LedgerIntegrityError(
-                        f"not listed as a child of {node.parent_id!r}", scope_id
-                    )
-                if node.depth != parent.depth + 1:
-                    raise LedgerIntegrityError(
-                        f"depth {node.depth} is inconsistent with parent depth {parent.depth}",
-                        scope_id,
-                    )
-                # Walking to a root also proves the graph is acyclic.
-                seen = {scope_id}
-                cursor: str | None = node.parent_id
-                while cursor is not None:
-                    if cursor in seen:
-                        raise LedgerIntegrityError("delegation cycle detected", scope_id)
-                    seen.add(cursor)
-                    cursor = self._nodes[cursor].parent_id
-
+            self._verify_tree()
             self._verify_against_chain()
+
+    def _verify_tree(self) -> None:
+        """The delegation tree is a tree: parents registered, children listed,
+        depths consistent, and no cycles. Lock held."""
+        for scope_id, node in self._nodes.items():
+            if node.parent_id is None:
+                if scope_id not in self._roots:
+                    raise LedgerIntegrityError("parentless scope is not a root", scope_id)
+                continue
+            parent = self._nodes.get(node.parent_id)
+            if parent is None:
+                raise LedgerIntegrityError(f"parent {node.parent_id!r} is not registered", scope_id)
+            if scope_id not in parent.child_ids:
+                raise LedgerIntegrityError(f"not listed as a child of {node.parent_id!r}", scope_id)
+            if node.depth != parent.depth + 1:
+                raise LedgerIntegrityError(
+                    f"depth {node.depth} is inconsistent with parent depth {parent.depth}",
+                    scope_id,
+                )
+            # Walking to a root also proves the graph is acyclic.
+            seen = {scope_id}
+            cursor: str | None = node.parent_id
+            while cursor is not None:
+                if cursor in seen:
+                    raise LedgerIntegrityError("delegation cycle detected", scope_id)
+                seen.add(cursor)
+                cursor = self._nodes[cursor].parent_id
 
     def _verify_against_chain(self) -> None:
         """The tree, breakers and open holds must be what the chain implies."""
@@ -3687,7 +3808,8 @@ class BudgetManager:
     def _log_control(self, entry: LedgerEntry) -> None:
         audit_log.warning(
             f"{entry.version}|ctrl={entry.entry_type.value}|ts={_iso(entry.timestamp)}"
-            f"|scope={entry.scope_id}|head={entry.prev_hash[:16]}|reason={entry.memo}",
+            f"|scope={_escape(entry.scope_id)}|head={entry.prev_hash[:16]}"
+            f"|reason={_escape(entry.memo)}",
             extra={
                 "agentgov_control": {
                     "event_id": str(entry.entry_id),
@@ -3762,6 +3884,34 @@ def _shared_store(store: PersistenceStore) -> SharedStore | None:
     from agentgov.storage import SharedStore  # deferred: storage imports this module
 
     return store if isinstance(store, SharedStore) else None
+
+
+def _image_head(image: StoreImage) -> tuple[int, str]:
+    """The length and head hash of the chain in ``image``."""
+    if not image.entries:
+        return 0, GENESIS_HASH
+    return len(image.entries), image.entries[-1].entry_hash
+
+
+@dataclass(frozen=True, slots=True)
+class _Restored:
+    """What a store's image implies, derived against a verified chain."""
+
+    governance: _Governance
+    authorizations: dict[uuid.UUID, Authorization]
+    identities: dict[_HoldKey, list[LedgerEntry]]
+    legacy: tuple[ControlEvent, ...]
+    problems: list[str]
+    schema_version: str
+    control_high_water: int
+
+    def rebuild(self, store: PersistenceStore) -> None:
+        """Replace the store's cache tables with what the chain implies."""
+        store.rebuild_caches(
+            nodes=tuple(self.governance.nodes.values()),
+            control_events=tuple(self.governance.chain_events),
+            authorizations=tuple(self.authorizations.values()),
+        )
 
 
 def _authorization_for(hold: LedgerEntry) -> Authorization:

@@ -31,7 +31,6 @@ from tests.ledger_fixtures import UNLIMITED, build_sqlite, copy_to_postgres
 # -- F3: the caller's decimal context reached the ledger --------------------
 
 
-@pytest.mark.xfail(strict=True, raises=(AssertionError, LedgerIntegrityError), reason="F3")
 def test_f3_a_low_precision_host_context_cannot_brick_the_ledger(tmp_path: Path) -> None:
     db = str(tmp_path / "f3.db")
     with BudgetManager.open_sqlite(db) as gov:
@@ -98,7 +97,6 @@ def audit_stream() -> Iterator[io.StringIO]:
         log.setLevel(previous)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F6")
 def test_f6_an_audit_line_is_one_line_whatever_the_memo(audit_stream: io.StringIO) -> None:
     forged = "AGOV2|seq=0000000099|type=funding|dir=CR|scope=ops|amt=1000000"
     gov = BudgetManager()
@@ -202,7 +200,6 @@ def _write_while(dsn: str, seconds: float, out: Any, ready: Any) -> None:
     out.put(samples)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F1")
 def test_f1_a_governor_opening_does_not_stall_other_governors(pg_dsn: str, tmp_path: Path) -> None:
     copy_to_postgres(build_sqlite(tmp_path / "big.db", spends=12_000), pg_dsn)
     ctx = multiprocessing.get_context("spawn")

@@ -298,15 +298,20 @@ class PostgresStore:
     # -- schema -----------------------------------------------------------
 
     def _open(self) -> str:
-        if self._read_only:
-            with self._reading():
-                version = self._installed_version()
-            if version is None:
-                raise StorageError(
-                    f"schema {self._schema!r} holds no agentgov ledger; open it for writing "
-                    f"once to create one"
-                )
+        # The version is read without the writer lock: an installed schema is
+        # only ever read here, and taking the fleet's lock just to look would
+        # make every governor that opens wait on, and stall, every writer.
+        with self._reading():
+            version = self._installed_version()
+        if version is not None:
             return version
+        if self._read_only:
+            raise StorageError(
+                f"schema {self._schema!r} holds no agentgov ledger; open it for writing "
+                f"once to create one"
+            )
+        # Not installed: install under the writer lock, re-checking under it,
+        # so governors starting together cannot race the DDL.
         with self.writer():
             version = self._installed_version()
             if version is None:
@@ -326,10 +331,14 @@ class PostgresStore:
     def _installed_version(self) -> str | None:
         conn = self._conn
         with self._errors("read the ledger's schema version"):
-            row = conn.execute(
-                "SELECT to_regclass(%s)", (f"{self._schema}.schema_meta",)
-            ).fetchone()
-            if row is None or row[0] is None:
+            # A plain scan of the catalog, not to_regclass(): name lookups go
+            # through the session's catalog cache, which keeps a "no such
+            # relation" answer until it processes invalidations, and waiting
+            # on an advisory lock does not process them. A governor that
+            # looked before another installed the schema would then still see
+            # nothing under the lock, and run the DDL a second time.
+            row = conn.execute(self._sql.has_schema_meta, (self._schema,)).fetchone()
+            if row is None:
                 return None
             found = conn.execute(self._sql.get_version).fetchone()
         version = None if found is None else str(found[0])
@@ -894,6 +903,11 @@ class _Statements:
             k2=sql.Literal(keys[1]),
         )
         self.get_version = sql.SQL("SELECT value FROM {} WHERE key = 'schema_version'").format(meta)
+        self.has_schema_meta = sql.SQL(
+            "SELECT 1 FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = 'schema_meta'"
+        )
         self.set_version = sql.SQL(
             "INSERT INTO {} (key, value) VALUES ('schema_version', %s) "
             "ON CONFLICT (key) DO UPDATE SET value = excluded.value"
