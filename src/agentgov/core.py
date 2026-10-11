@@ -72,7 +72,6 @@ import logging
 import re
 import threading
 import time
-import unicodedata
 import uuid
 import warnings
 from collections import Counter, deque
@@ -301,6 +300,15 @@ class Direction(Enum):
     reset, an external anchor, the migration seal."""
 
 
+_DIRECTIONS: Final = {member.value: member for member in Direction}
+
+
+def _direction(value: str) -> Direction:
+    """``Direction(value)``, without the call's cost: rows decode by the thousand."""
+    found = _DIRECTIONS.get(value)
+    return found if found is not None else Direction(value)
+
+
 @unique
 class EntryType(Enum):
     """The event a :class:`LedgerEntry` records."""
@@ -353,6 +361,15 @@ class EntryType(Enum):
     the chain, by digest (``memo``), so a governor can open from the snapshot
     instead of replaying history. AGOV3 only. Moves no money and belongs to
     no scope (``scope_id == ""``)."""
+
+
+_ENTRY_TYPES: Final = {member.value: member for member in EntryType}
+
+
+def _entry_type(value: str) -> EntryType:
+    """``EntryType(value)``, without the call's cost: rows decode by the thousand."""
+    found = _ENTRY_TYPES.get(value)
+    return found if found is not None else EntryType(value)
 
 
 _LEGAL_DIRECTIONS: Final[Mapping[EntryType, frozenset[Direction]]] = {
@@ -537,10 +554,11 @@ class LedgerEntry:
 
 def _iso(moment: datetime) -> str:
     """Format a UTC datetime as a fixed-width ISO-8601 instant."""
-    moment = moment.astimezone(UTC)
+    if moment.tzinfo is not UTC:
+        moment = moment.astimezone(UTC)
     if moment.year < 1000:  # strftime pads these per platform; keep its answer
         return moment.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-    return moment.replace(tzinfo=None).isoformat(timespec="microseconds") + "Z"
+    return moment.isoformat(timespec="microseconds")[:-6] + "Z"  # "+00:00" -> "Z"
 
 
 def _parse_iso(text: str) -> datetime:
@@ -552,8 +570,8 @@ def _parse_iso(text: str) -> datetime:
     :meth:`LedgerEntry.recompute_hash` disagree with the stored hash even
     though nothing was tampered with.
     """
-    if _INSTANT.match(text):  # what _iso writes
-        return datetime.fromisoformat(text[:-1]).replace(tzinfo=UTC)
+    if _INSTANT.match(text):  # what _iso writes; fromisoformat reads "Z" as UTC
+        return datetime.fromisoformat(text)
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
 
 
@@ -590,19 +608,26 @@ def _check_text(text: str, label: str, *, limit: int, identifier: bool) -> str |
     UTF-8 bytes, and free of NUL (which PostgreSQL cannot store). A scope id
     is an identifier, so it may hold no control character at all.
     """
-    try:
-        size = len(text.encode("utf-8"))
-    except UnicodeEncodeError:
-        return f"the {label} is not valid Unicode text (it holds a lone surrogate)"
+    if text.isascii():
+        size = len(text)
+    else:
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError:
+            return f"the {label} is not valid Unicode text (it holds a lone surrogate)"
     if size > limit:
         return f"the {label} is {size} bytes of UTF-8; at most {limit} are allowed"
     if identifier:
-        if any(unicodedata.category(c) == "Cc" for c in text):
+        if _CONTROL.search(text):
             return f"the {label} holds a control character"
     elif "\x00" in text:
         return f"the {label} holds a NUL character"
     return None
 
+
+_CONTROL: Final = re.compile("[\x00-\x1f\x7f-\x9f]")
+"""Unicode's control characters, general category ``Cc``: C0, DEL and C1.
+The set is closed by Unicode's stability policy."""
 
 _escape_json: Final = json.encoder.encode_basestring
 
@@ -4183,6 +4208,9 @@ class BudgetManager:
             with self._queue_lock:
                 self._leading = False
                 self._settled.notify_all()  # the next with work queued leads
+        # A checkpoint come due, now that the units' callers have their
+        # results and the next unit is free to begin.
+        self._after_mutation()
         result = request.outcome()
         return result
 
@@ -4194,7 +4222,7 @@ class BudgetManager:
         lock was awaited rides along."""
         batch: list[_Request] = []
         try:
-            with self._mutating():
+            with self._mutating(then=False):
                 while len(batch) < self._BATCH:
                     with self._queue_lock:
                         room = self._BATCH - len(batch)
@@ -4224,7 +4252,7 @@ class BudgetManager:
                 self._settled.notify_all()
 
     @contextmanager
-    def _mutating(self) -> Iterator[None]:
+    def _mutating(self, *, then: bool = True) -> Iterator[None]:
         """Hold this manager's lock for a mutation — and, on a shared ledger,
         the fleet's writer lock too, with this view caught up under it.
 
@@ -4241,6 +4269,10 @@ class BudgetManager:
         of the database, so the next mutation re-reads the ledger in full. It
         does so before taking the writer lock, from a snapshot, the way a
         governor opens; the lock is then held only to catch up from it.
+
+        :param then: Do the work an outermost mutation makes due (a
+            checkpoint) on the way out. A unit of work shared by queued
+            callers does it once their results are out, and the lock free.
         """
         with self._lock:
             if self._depth:
@@ -4275,7 +4307,8 @@ class BudgetManager:
                             self._recover(shared)
             finally:
                 self._depth -= 1
-        self._after_mutation()
+        if then:
+            self._after_mutation()
 
     def _catch_up_ahead(self, store: SharedStore) -> None:
         """Catch up from a snapshot, without the writer lock. Lock held."""

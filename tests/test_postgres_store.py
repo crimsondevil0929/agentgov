@@ -18,6 +18,8 @@ from typing import Any, LiteralString
 
 import psycopg
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from psycopg import sql
 
 from agentgov.core import (
@@ -770,3 +772,74 @@ def test_money_round_trips_exactly(pg_dsn: str, gov: BudgetManager) -> None:
         assert loaded == [e.to_audit_record() for e in gov.ledger.entries()]
         assert any(r["amount"] == "0.00000000" for r in loaded)
         assert any(r["amount"] == "0.00000001" for r in loaded)
+
+
+def test_a_units_writes_read_back_exactly_whatever_their_text(pg_admin_dsn: str) -> None:
+    """A unit of work's writes are sent as literals, with its COMMIT: every
+    text reads back exactly, quotes and backslashes included, whether the
+    server treats backslashes in plain literals as escapes or not."""
+    from agentgov.postgres import _literal
+
+    texts = st.text(alphabet=st.characters(codec="utf-8", exclude_characters="\x00"), max_size=40)
+    with admin(pg_admin_dsn) as conn:
+
+        @settings(max_examples=150, deadline=None)
+        @given(
+            values=st.lists(
+                texts | st.uuids() | st.integers(-(2**63), 2**63 - 1) | st.none(),
+                min_size=1,
+                max_size=8,
+            )
+        )
+        def read_back(values: list[object]) -> None:
+            for conforming in ("on", "off"):
+                conn.execute(f"SET standard_conforming_strings = {conforming}")
+                row = conn.execute("SELECT " + ", ".join(_literal(v) for v in values)).fetchone()
+                assert row is not None and list(row) == values
+
+        read_back()
+    with pytest.raises(StorageError, match=r"NUL"):
+        _literal("a\x00b")
+    for unsupported in (True, 1.5, b"x"):
+        with pytest.raises(TypeError):
+            _literal(unsupported)
+
+
+def test_text_with_quotes_and_backslashes_round_trips_through_a_governor(
+    pg_dsn: str, gov: BudgetManager
+) -> None:
+    memo = "it's \\ a 'quoted' \\' memo \\\\ E'\\x41' ''"
+    gov.delegate("org", "o'brien\\", "1.00", memo=memo)
+    gov.anchor("o'brien\\", memo)
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
+        assert reader.available("o'brien\\") == money("1.00")
+        assert [e.memo for e in reader.ledger.entries()][-3:] == [memo] * 3
+        reader.verify_integrity()
+
+
+def test_the_tail_is_read_by_its_index_on_a_ledger_never_analyzed(
+    pg_dsn: str, gov: BudgetManager
+) -> None:
+    """A new ledger has no statistics until autovacuum analyzes it, and the
+    planner's default guess for ``sequence >= n`` is a third of the table:
+    a full scan and a sort, under the writer lock. The reads after a
+    sequence are planned as the primary key's index scan regardless."""
+    with admin(pg_dsn) as conn:
+        conn.execute("ALTER TABLE agentgov.entries SET (autovacuum_enabled = false)")
+        while len(gov.ledger) < 300:
+            gov.spend("agent", "0.001", memo="x" * 40)
+        store = gov.store
+        assert isinstance(store, PostgresStore)
+        for name in ("begin", "read"):
+            parts = store._templates(store._conn)[name].split("; ")
+            settings_ = [part for part in parts if part.startswith("SET LOCAL enable_")]
+            (tail,) = [part for part in parts if part.startswith("SELECT sequence")]
+            query = "EXPLAIN " + tail.replace("<AFTER>", str(len(gov.ledger) - 10))
+            with conn.transaction():
+                unhinted = "\n".join(str(row[0]) for row in conn.execute(query).fetchall())
+                for setting in settings_:
+                    conn.execute(setting)
+                plan = "\n".join(str(row[0]) for row in conn.execute(query).fetchall())
+            assert "Seq Scan" in unhinted, "the hazard: without the settings, a full scan"
+            assert plan.startswith("Index Scan using entries_pkey"), plan
+            assert "Sort" not in plan

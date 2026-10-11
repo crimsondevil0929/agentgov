@@ -83,12 +83,13 @@ from agentgov.core import (
     Authorization,
     BudgetNode,
     ControlEvent,
-    Direction,
     EntryType,
     LedgerEntry,
     SettlementClaim,
     WriteBatch,
     _amount_text,
+    _direction,
+    _entry_type,
     _iso,
     _parse_iso,
 )
@@ -604,10 +605,19 @@ class PostgresStore:
         if self._rendered is None:
             entries = self._sql.select_entries_from.as_string(conn)
             control = self._sql.select_control.as_string(conn).replace("%s", "<CONTROL>")
+            # What is read after a sequence is the tail of the chain, in
+            # order: the primary key's index scan, which streams it sorted.
+            # A ledger the server has not yet analyzed (a new one, under
+            # load, for up to autovacuum's minute) has no statistics to say
+            # the tail is short, and the planner's default guess is a third
+            # of the table: a scan of all of it and a sort, under the writer
+            # lock. So, in this transaction only, nothing else is offered.
+            index_only = "SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off"
             self._rendered = {
                 "begin": "; ".join(
                     (
                         self._sql.begin_locked.as_string(conn),
+                        index_only,
                         entries.replace("%s", "<AFTER>"),
                         control,
                     )
@@ -615,11 +625,13 @@ class PostgresStore:
                 "read": "; ".join(
                     (
                         "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                        index_only,
                         entries.replace("%s", "<AFTER>"),
                         control,
                         "ROLLBACK",
                     )
                 ),
+                **{name: part.as_string(conn) for name, part in self._sql.writes.items()},
             }
         return self._rendered
 
@@ -640,7 +652,7 @@ class PostgresStore:
         statement inserted before it, so the chain check holds within it);
         each node's last state; the control rows; and the open holds, less
         those opened and closed again within the session."""
-        mogrify = psycopg.ClientCursor(self._conn).mogrify
+        text = self._templates(self._conn)
         entries = [entry for batch in batches for entry in batch.entries]
         nodes: dict[str, BudgetNode] = {}
         controls: list[ControlEvent] = []
@@ -657,35 +669,20 @@ class PostgresStore:
                     closed.append(authorization_id)
         statements = []
         if entries:
-            statements.append(
-                mogrify(
-                    self._sql.insert_entries(len(entries)),
-                    [value for entry in entries for value in _entry_row(entry)],
-                )
-            )
+            rows = ", ".join([_values(_entry_row(entry)) for entry in entries])
+            statements.append(text["entries"] + rows)
         if nodes:
-            statements.append(
-                mogrify(
-                    self._sql.upsert_nodes(len(nodes)),
-                    [value for node in nodes.values() for value in _node_row(node)],
-                )
-            )
+            rows = ", ".join([_values(_node_row(node)) for node in nodes.values()])
+            statements.append(text["nodes"] + rows + text["nodes_conflict"])
         if controls:
-            statements.append(
-                mogrify(
-                    self._sql.insert_controls(len(controls)),
-                    [value for event in controls for value in _control_row(event)],
-                )
-            )
+            rows = ", ".join([_values(_control_row(event)) for event in controls])
+            statements.append(text["controls"] + rows)
         if opened:
-            statements.append(
-                mogrify(
-                    self._sql.insert_authorizations(len(opened)),
-                    [value for auth in opened.values() for value in _authorization_row(auth)],
-                )
-            )
+            rows = ", ".join([_values(_authorization_row(auth)) for auth in opened.values()])
+            statements.append(text["authorizations"] + rows)
         if closed:
-            statements.append(mogrify(self._sql.delete_authorizations, (closed,)))
+            ids = ", ".join([_literal(authorization_id) for authorization_id in closed])
+            statements.append(text["close"] + ids + ")")
         return statements
 
     def _end(self, session: _Session) -> None:
@@ -1374,8 +1371,8 @@ def _entry(row: Any) -> LedgerEntry:
         entry_id=row[1],
         transaction_id=row[2],
         timestamp=_parse_iso(row[3]),
-        entry_type=EntryType(row[4]),
-        direction=Direction(row[5]),
+        entry_type=_entry_type(row[4]),
+        direction=_direction(row[5]),
         scope_id=row[6],
         counterparty_id=row[7],
         amount=Decimal(row[8]),
@@ -1399,6 +1396,34 @@ def _audit_mark(row: Any) -> AuditMark:
         recorded_at=_parse_iso(str(row[6])),
         signature=row[7],
     )
+
+
+def _literal(value: object) -> str:
+    """``value`` (an int, a UUID, text or ``None``) as an SQL literal.
+
+    For the writes a unit of work sends with its COMMIT, as one simple query.
+    Text is escaped as Unicode, before psycopg encodes the message, so no
+    client encoding can split a quote; with a backslash in it, it takes the
+    ``E''`` form, so it reads the same whatever ``standard_conforming_strings``
+    says. PostgreSQL text cannot hold NUL, nor a simple query carry one.
+    """
+    if value is None:
+        return "NULL"
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise StorageError("PostgreSQL text cannot hold a NUL (0x00) character")
+        if "\\" in value:
+            return "E'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+        return "'" + value.replace("'", "''") + "'"
+    if isinstance(value, uuid.UUID):
+        return f"'{value}'::uuid"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    raise TypeError(f"no SQL literal for {type(value).__name__}")
+
+
+def _values(row: Sequence[object]) -> str:
+    return "(" + ", ".join([_literal(value) for value in row]) + ")"
 
 
 def _entry_row(entry: LedgerEntry) -> tuple[object, ...]:
@@ -1577,11 +1602,27 @@ class _Statements:
         self.delete_authorization = sql.SQL("DELETE FROM {} WHERE authorization_id = %s").format(
             auths
         )
-        self.delete_authorizations = sql.SQL(
-            "DELETE FROM {} WHERE authorization_id = ANY(%s)"
-        ).format(auths)
-        self._nodes_table, self._control_table, self._auths_table = nodes, control, auths
-        self._multi: dict[tuple[str, int], sql.Composed] = {}
+        # What a unit of work's writes are made of: each is completed with
+        # rows of literals (see _literal) and sent with its COMMIT.
+        self.writes: dict[str, sql.Composable] = {
+            "entries": sql.SQL("INSERT INTO {} ({}) VALUES ").format(entries, columns),
+            "nodes": sql.SQL(
+                "INSERT INTO {} (scope_id, parent_id, depth, allocated, created_at) VALUES "
+            ).format(nodes),
+            "nodes_conflict": sql.SQL(
+                " ON CONFLICT (scope_id) DO UPDATE SET parent_id = excluded.parent_id, "
+                "depth = excluded.depth, allocated = excluded.allocated"
+            ),
+            "controls": sql.SQL(
+                "INSERT INTO {} "
+                "(event_id, timestamp, event_type, scope_id, reason, ledger_head_hash, entry_id) "
+                "VALUES "
+            ).format(control),
+            "authorizations": sql.SQL(
+                "INSERT INTO {} (authorization_id, scope_id, amount, opened_at, entry_id) VALUES "
+            ).format(auths),
+            "close": sql.SQL("DELETE FROM {} WHERE authorization_id IN (").format(auths),
+        }
         self.select_authorizations = sql.SQL(
             "SELECT authorization_id, scope_id, amount, opened_at, entry_id FROM {}"
         ).format(auths)
@@ -1646,53 +1687,6 @@ class _Statements:
         limit = sql.SQL(" LIMIT %(limit)s") if "limit" in criteria else sql.SQL("")
         return sql.SQL("SELECT {} FROM {} WHERE {} ORDER BY sequence ASC{}").format(
             self._entries_columns, self._entries_table, sql.SQL(" AND ").join(clauses), limit
-        )
-
-    def _rows(
-        self, key: str, prefix: sql.Composable, width: int, count: int, suffix: str = ""
-    ) -> sql.Composed:
-        """``prefix VALUES (...), ... suffix`` for ``count`` rows of ``width``."""
-        statement = self._multi.get((key, count))
-        if statement is None:
-            row = sql.SQL("({})").format(sql.SQL(", ").join([sql.Placeholder()] * width))
-            statement = sql.SQL("{} VALUES {}{}").format(
-                prefix, sql.SQL(", ").join([row] * count), sql.SQL(suffix)
-            )
-            self._multi[(key, count)] = statement
-        return statement
-
-    def upsert_nodes(self, count: int) -> sql.Composed:
-        """One upsert of ``count`` nodes, each a different scope."""
-        return self._rows(
-            "nodes",
-            sql.SQL("INSERT INTO {} (scope_id, parent_id, depth, allocated, created_at)").format(
-                self._nodes_table
-            ),
-            5,
-            count,
-            " ON CONFLICT (scope_id) DO UPDATE SET parent_id = excluded.parent_id, "
-            "depth = excluded.depth, allocated = excluded.allocated",
-        )
-
-    def insert_controls(self, count: int) -> sql.Composed:
-        return self._rows(
-            "controls",
-            sql.SQL(
-                "INSERT INTO {} "
-                "(event_id, timestamp, event_type, scope_id, reason, ledger_head_hash, entry_id)"
-            ).format(self._control_table),
-            7,
-            count,
-        )
-
-    def insert_authorizations(self, count: int) -> sql.Composed:
-        return self._rows(
-            "authorizations",
-            sql.SQL(
-                "INSERT INTO {} (authorization_id, scope_id, amount, opened_at, entry_id)"
-            ).format(self._auths_table),
-            5,
-            count,
         )
 
     def insert_entries(self, count: int) -> sql.Composed:

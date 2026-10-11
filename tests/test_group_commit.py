@@ -199,3 +199,40 @@ def test_many_threads_on_one_governor_stay_exact(
     assert [gov.available(s) for s in "abcd"] == [money("10") - money("0.004") * 100] * 4
     assert sessions[0] < 800, f"{sessions[0]} units of work for 800 mutations"
     gov.verify_integrity()
+
+
+def test_a_checkpoint_come_due_waits_for_the_units_callers_to_have_their_results(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A unit of work that makes a checkpoint due releases its callers first:
+    only the caller that led it runs the checkpoint, and the lock is free
+    meanwhile for the next unit."""
+    gov = BudgetManager.open_postgres(
+        pg_dsn, policy=GovernancePolicy(max_calls_per_window=0, checkpoint_every=8), auditor=False
+    )
+    try:
+        gov.open_root("root", money("100"))
+        for name in "abcd":
+            gov.delegate("root", name, money("10"))
+        started, release = threading.Event(), threading.Event()
+        original = BudgetManager.checkpoint
+
+        def held(self: BudgetManager) -> int:
+            started.set()
+            assert release.wait(20)
+            return original(self)
+
+        monkeypatch.setattr(BudgetManager, "checkpoint", held)
+        runs = _queued(gov, [functools.partial(gov.authorize, s, money("1")) for s in "abcdabcd"])
+        assert started.wait(10), "eight holds past the last checkpoint make one due"
+        deadline = time.monotonic() + 10
+        while sum(run.is_alive() for run in runs) > 1:
+            assert time.monotonic() < deadline, "callers waited on the checkpoint"
+            time.sleep(0.005)
+        assert gov.spend("a", money("1")).amount == money("1"), "the next unit ran meanwhile"
+        release.set()
+        assert all(run.outcome().scope_id in "abcd" for run in runs)  # type: ignore[attr-defined]
+        assert gov.ledger._state.last_checkpoint is not None
+    finally:
+        release.set()
+        gov.close()
