@@ -372,5 +372,5 @@ def test_audit_logging_emits_one_record_per_entry(
     records = [r for r in caplog.records if r.name == "agentgov.audit"]
     # allocation (2 legs) + hold + hold_void + spend
     assert len(records) == 5
-    assert all(r.message.startswith("AGOV2|") for r in records)
+    assert all(r.message.startswith("AGOV3|") for r in records)
     assert all(hasattr(r, "agentgov_entry") for r in records)

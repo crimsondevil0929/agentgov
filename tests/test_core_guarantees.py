@@ -63,6 +63,7 @@ from agentgov.exceptions import (
 from agentgov.interceptor import Interceptor, TokenUsage, pricing_for
 from agentgov.storage import SqliteStore
 from agentgov.streaming import MeteredStream
+from tests.ledger_fixtures import memory_history
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -331,15 +332,15 @@ def test_an_authorization_is_its_hold_and_its_settlement_names_it() -> None:
     assert release.entry_type is EntryType.HOLD_VOID
     assert release.ref == auth.entry.entry_id
     assert spend.ref == auth.entry.entry_id
-    assert release.version == spend.version == "AGOV2"
+    assert release.version == spend.version == "AGOV3"
 
 
 def test_the_reference_is_covered_by_the_hash() -> None:
     gov = BudgetManager()
     gov.open_root("root", money("1.00"))
     gov.capture(gov.authorize("root", money("0.30")), money("0.10"))
-    released = gov.ledger._entries[-2]
-    gov.ledger._entries[-2] = replace(released, ref=uuid.uuid4())
+    released = memory_history(gov.ledger)[-2]
+    memory_history(gov.ledger)[-2] = replace(released, ref=uuid.uuid4())
 
     with pytest.raises(LedgerIntegrityError, match="tampered with"):
         gov.verify_integrity()
@@ -403,6 +404,15 @@ def test_a_spend_can_only_settle_a_hold_its_own_transaction_released() -> None:
 def test_only_releases_and_spends_may_name_a_hold() -> None:
     ledger, hold = _raw_ledger_with_hold()
     with pytest.raises(ValueError, match="names no hold"):
+        ledger._post(
+            [
+                LedgerLine(
+                    EntryType.FUNDING, Direction.CREDIT, "root", money("0.01"), ref=hold.entry_id
+                )
+            ]
+        )
+    # From AGOV3 a refund may name the spend it reverses, and only a spend.
+    with pytest.raises(LedgerIntegrityError, match="is not a spend"):
         ledger._post(
             [
                 LedgerLine(
@@ -767,7 +777,7 @@ def test_a_legacy_database_is_upgraded_and_sealed_on_its_first_writable_open(
 
     with BudgetManager.open_sqlite(path) as gov:
         seal = gov.audit_trail()[-1]
-        assert seal.entry_type is EntryType.SEAL and seal.version == "AGOV2"
+        assert seal.entry_type is EntryType.SEAL and seal.version == "AGOV3"
         assert seal.scope_id == "" and seal.amount == 0
         assert "n=1" in seal.memo, "the one legacy control event is sealed"
         assert gov.is_halted("idle"), "a pre-upgrade halt still stands"
@@ -775,10 +785,10 @@ def test_a_legacy_database_is_upgraded_and_sealed_on_its_first_writable_open(
         # The pre-upgrade hold settles through the new, named path.
         (legacy,) = gov._open_auths.values()
         spend = gov.capture(legacy, money("0.01"))
-        assert spend.ref == legacy.entry.entry_id and spend.version == "AGOV2"
+        assert spend.ref == legacy.entry.entry_id and spend.version == "AGOV3"
         gov.verify_integrity()
 
-    assert _schema_version(path) == "2"
+    assert _schema_version(path) == "3"
     with BudgetManager.open_sqlite(path) as reopened:
         reopened.verify_integrity()
         assert [e.entry_type for e in reopened.audit_trail()].count(EntryType.SEAL) == 1
@@ -1013,7 +1023,7 @@ def test_editing_an_anchor_breaks_verification() -> None:
     gov = BudgetManager()
     gov.open_root("root", money("1.00"))
     gov.anchor("root", "escrow:1111")
-    gov.ledger._entries[-1] = replace(gov.ledger._entries[-1], memo="escrow:2222")
+    memory_history(gov.ledger)[-1] = replace(memory_history(gov.ledger)[-1], memo="escrow:2222")
     with pytest.raises(LedgerIntegrityError, match="tampered with"):
         gov.verify_integrity()
 
@@ -1265,7 +1275,7 @@ def _forge_after(last: LedgerEntry, kind: EntryType, scope_id: str) -> LedgerEnt
         prev_hash=last.entry_hash,
         entry_hash="",
         memo="forged",
-        version="AGOV2",
+        version=last.version,
     )
     return replace(entry, entry_hash=entry.recompute_hash())
 
@@ -1307,8 +1317,8 @@ def _fail_in_reload(path: str) -> str:
 
 @pytest.mark.parametrize(
     "fail",
-    [_fail_on_new_entry, _fail_in_governance, _fail_in_reconciliation, _fail_in_reload],
-    ids=["entry", "governance", "reconciliation", "reload"],
+    [_fail_on_new_entry, _fail_in_governance, _fail_in_reload],
+    ids=["entry", "governance", "reload"],
 )
 def test_a_failed_refresh_changes_nothing_the_view_serves(
     tmp_path: Path, fail: Callable[[str], str]
@@ -1338,6 +1348,22 @@ def test_a_failed_refresh_changes_nothing_the_view_serves(
         reader.refresh()
     assert _served(reader) == served
     reader.close()
+
+
+def test_a_cache_row_lost_under_a_reader_is_caught_by_the_next_open(tmp_path: Path) -> None:
+    """A refresh follows holds from the entries, which name them; it does not
+    re-read the authorization table every time. The table is a cache, and the
+    next open (or the auditor) is where a damaged one is refused."""
+    path = str(tmp_path / "g.db")
+    with BudgetManager.open_sqlite(path) as writer:
+        writer.open_root("root", money("1.00"))
+    reader = BudgetManager.open_sqlite(path, read_only=True)
+    message = _fail_in_reconciliation(path)
+    assert reader.refresh() > 0
+    assert [a.scope_id for a in reader.stale_authorizations(0)] == ["kid"]
+    reader.close()
+    with pytest.raises(LedgerIntegrityError, match=message):
+        BudgetManager.open_sqlite(path, read_only=True)
 
 
 def test_refresh_is_a_no_op_for_a_writer_and_for_an_in_memory_manager(tmp_path: Path) -> None:
@@ -1439,7 +1465,7 @@ def test_the_per_row_store_writers_still_round_trip(tmp_path: Path) -> None:
     assert [e.event_id for e in store.load_control_events()] == [event.event_id]
     (auth,) = store.load_open_authorizations()
     assert (auth.authorization_id, auth.entry_id) == (auth_id, hold_id)
-    assert store.schema_version == "2"
+    assert store.schema_version == "3"
 
     store.delete_authorization(auth_id)
     assert store.load_open_authorizations() == ()

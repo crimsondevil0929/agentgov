@@ -13,6 +13,7 @@ import sqlite3
 from pathlib import Path
 
 from agentgov import BudgetManager, GovernancePolicy, money
+from agentgov.core import Ledger, LedgerEntry
 
 UNLIMITED = GovernancePolicy(max_calls_per_window=0)
 
@@ -39,6 +40,7 @@ _TABLES = {
         "event_id, timestamp, event_type, scope_id, reason, ledger_head_hash, entry_id"
     ),
     "open_authorizations": "authorization_id, scope_id, amount, opened_at, entry_id",
+    "snapshots": "sequence, digest, body, signature",
 }
 
 
@@ -55,7 +57,13 @@ def copy_to_postgres(sqlite_path: str | Path, dsn: str, *, schema: str = "agentg
     copied = 0
     try:
         with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            present = {
+                row[0]
+                for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
             for table, columns in _TABLES.items():
+                if table not in present:
+                    continue
                 rows = source.execute(f"SELECT {columns} FROM {table}").fetchall()  # noqa: S608
                 if table == "entries":
                     rows.sort(key=lambda row: row[0])
@@ -70,3 +78,11 @@ def copy_to_postgres(sqlite_path: str | Path, dsn: str, *, schema: str = "agentg
     finally:
         source.close()
     return copied
+
+
+def memory_history(ledger: Ledger) -> list[LedgerEntry]:
+    """The entry list of a ledger that keeps its history in memory (one with
+    no store), for tests that rewrite history in place."""
+    entries = ledger._entries
+    assert entries is not None, "only a ledger without a store keeps its entries in memory"
+    return entries

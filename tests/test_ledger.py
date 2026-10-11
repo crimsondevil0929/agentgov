@@ -18,6 +18,7 @@ from agentgov.core import (
     money,
 )
 from agentgov.exceptions import LedgerIntegrityError
+from tests.ledger_fixtures import memory_history
 
 
 def fund(scope: str, amount: str) -> LedgerLine:
@@ -185,8 +186,8 @@ def test_verify_chain_detects_a_forged_amount() -> None:
     ledger._post([spend("root", "0.25")])
 
     # Simulate an attacker rewriting history in place.
-    forged = dataclasses.replace(ledger._entries[1], amount=money("0.01"))
-    ledger._entries[1] = forged
+    forged = dataclasses.replace(memory_history(ledger)[1], amount=money("0.01"))
+    memory_history(ledger)[1] = forged
 
     with pytest.raises(LedgerIntegrityError, match="tampered with"):
         ledger.verify_chain()
@@ -197,7 +198,9 @@ def test_verify_chain_detects_a_broken_link() -> None:
     ledger._post([fund("root", "1.00")])
     ledger._post([spend("root", "0.25")])
 
-    ledger._entries[1] = dataclasses.replace(ledger._entries[1], prev_hash=GENESIS_HASH)
+    memory_history(ledger)[1] = dataclasses.replace(
+        memory_history(ledger)[1], prev_hash=GENESIS_HASH
+    )
 
     with pytest.raises(LedgerIntegrityError, match="broken chain link"):
         ledger.verify_chain()
@@ -240,7 +243,7 @@ def test_audit_line_is_fixed_field_and_parseable() -> None:
     line = format_audit_line(entry)
     fields = dict(part.split("=", 1) for part in line.split("|")[1:])
 
-    assert line.startswith("AGOV2|")
+    assert line.startswith("AGOV3|")
     assert fields["seq"] == "0000000001"
     assert fields["type"] == "funding"
     assert fields["dir"] == "CR"

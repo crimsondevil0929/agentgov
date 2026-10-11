@@ -154,8 +154,8 @@ def test_a_repair_re_reads_under_the_lock_and_erases_nothing_written_since(
 
         raced = False
 
-        def load(self) -> StoreImage:
-            image = super().load()
+        def load(self, **kwargs: Any) -> StoreImage:
+            image = super().load(**kwargs)
             if not Racing.raced:
                 Racing.raced = True
                 seeded.delegate("org", "late-arrival", money("1"))
@@ -195,9 +195,9 @@ def test_a_governor_left_dirty_re_reads_before_it_takes_the_lock(
     full_reads_under_the_lock: list[bool] = []
     original_load = PostgresStore.load
 
-    def watched_load(self: PostgresStore) -> StoreImage:
+    def watched_load(self: PostgresStore, **kwargs: Any) -> StoreImage:
         full_reads_under_the_lock.append(self._session is not None)
-        return original_load(self)
+        return original_load(self, **kwargs)
 
     monkeypatch.setattr(PostgresStore, "load", watched_load)
     seeded.spend("agent", money("2"))

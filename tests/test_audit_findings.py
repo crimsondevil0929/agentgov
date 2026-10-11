@@ -98,13 +98,17 @@ def audit_stream() -> Iterator[io.StringIO]:
 def test_f6_an_audit_line_is_one_line_whatever_the_memo(audit_stream: io.StringIO) -> None:
     forged = "AGOV2|seq=0000000099|type=funding|dir=CR|scope=ops|amt=1000000"
     gov = BudgetManager()
-    gov.open_root("ops\r\nAGOV2|seq=0000000098|type=funding", money("5"))
-    gov.anchor("ops\r\nAGOV2|seq=0000000098|type=funding", f"x\n{forged}\u2028{forged}")
+    scope = "ops|AGOV2|seq=0000000098|type=funding"
+    gov.open_root(scope, money("5"))
+    gov.anchor(scope, f"x\n{forged}\u2028{forged}\r{forged}")
     lines = audit_stream.getvalue().splitlines()
     assert len(lines) == len(gov.audit_trail())
     assert not any(
         line.startswith("AGOV2|seq=00000000") and "|amt=1000000" in line for line in lines
     )
+    # A scope id cannot carry a line break at all.
+    with pytest.raises(ValueError, match="control character"):
+        gov.open_root("ops\r\nAGOV2|seq=0000000097|type=funding", money("5"))
 
 
 # -- F8: the async paths wrote the ledger on the event loop -----------------
@@ -206,7 +210,9 @@ def test_f1_a_governor_opening_does_not_stall_other_governors(pg_dsn: str, tmp_p
         assert ready.wait(60)
         time.sleep(0.5)
         opened_at = time.monotonic()
-        BudgetManager.open_postgres(pg_dsn).close()
+        # A full replay from genesis: the slowest open there is, and even it
+        # holds no lock another governor waits on.
+        BudgetManager.open_postgres(pg_dsn, verify="full").close()
         open_seconds = time.monotonic() - opened_at
         samples: list[tuple[float, float]] = out.get(timeout=120)
     finally:

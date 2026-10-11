@@ -9,7 +9,6 @@ ones its entries imply.
 
 from __future__ import annotations
 
-import dataclasses
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -21,9 +20,9 @@ import pytest
 from agentgov import BudgetManager, money
 from agentgov.core import (
     GENESIS_HASH,
+    BudgetNode,
     Direction,
     EntryType,
-    Ledger,
     LedgerEntry,
     LedgerLine,
     WriteBatch,
@@ -32,6 +31,7 @@ from agentgov.core import (
     _replay,
 )
 from agentgov.exceptions import LedgerIntegrityError
+from agentgov.storage import SqliteStore
 
 ROOT_FUNDING = LedgerLine(EntryType.FUNDING, Direction.CREDIT, "root", money("1"))
 
@@ -208,33 +208,45 @@ def test_available_never_exceeds_what_a_scope_was_granted() -> None:
 def test_history_written_before_the_bound_still_opens(tmp_path: Path) -> None:
     """A refund 0.4.0 accepted without a spend is history, not a defect."""
     db = tmp_path / "old.db"
-    with BudgetManager.open_sqlite(str(db)) as gov:
-        gov.open_root("root", money("1"))
+    now = datetime.now(UTC)
+    funding = dict(
+        sequence=1,
+        entry_id=uuid.uuid4(),
+        transaction_id=uuid.uuid4(),
+        timestamp=now,
+        entry_type=EntryType.FUNDING,
+        direction=Direction.CREDIT,
+        scope_id="root",
+        counterparty_id=None,
+        amount=money("1"),
+        balance_after=money("1"),
+        memo="root envelope issued",
+        ref=None,
+        version="AGOV2",
+    )
+    first_hash = _hash_entry(prev_hash=GENESIS_HASH, **funding)  # type: ignore[arg-type]
+    first = LedgerEntry(prev_hash=GENESIS_HASH, entry_hash=first_hash, **funding)  # type: ignore[arg-type]
     # What 0.4.0's refund() wrote: an unbounded REVERSAL, valid in every other way.
-    ledger = Ledger()
-    with BudgetManager.open_sqlite(str(db)) as gov:
-        ledger = gov.ledger
-        head = ledger.head_hash
-        entry = ledger.entries()[-1]
-        fields = dict(
-            sequence=entry.sequence + 1,
-            entry_id=uuid.uuid4(),
-            transaction_id=uuid.uuid4(),
-            timestamp=datetime.now(UTC),
-            entry_type=EntryType.REVERSAL,
-            direction=Direction.CREDIT,
-            scope_id="root",
-            counterparty_id=None,
-            amount=money("1000"),
-            balance_after=gov.available("root") + money("1000"),
-            memo="vendor refund",
-            ref=None,
-            version="AGOV2",
+    reversal = dict(
+        funding,
+        sequence=2,
+        entry_id=uuid.uuid4(),
+        transaction_id=uuid.uuid4(),
+        entry_type=EntryType.REVERSAL,
+        amount=money("1000"),
+        balance_after=money("1001"),
+        memo="vendor refund",
+    )
+    second_hash = _hash_entry(prev_hash=first_hash, **reversal)  # type: ignore[arg-type]
+    second = LedgerEntry(prev_hash=first_hash, entry_hash=second_hash, **reversal)  # type: ignore[arg-type]
+    store = SqliteStore(db)
+    store.commit(
+        WriteBatch(
+            entries=[first, second],
+            nodes=[BudgetNode("root", None, 0, money("1"), created_at=now)],
         )
-        digest = _hash_entry(prev_hash=head, **fields)  # type: ignore[arg-type]
-        legacy = LedgerEntry(prev_hash=head, entry_hash=digest, **fields)  # type: ignore[arg-type]
-        assert gov.store is not None
-        gov.store.commit(dataclasses.replace(_batch(), entries=[legacy]))
+    )
+    store.close()
     with BudgetManager.open_sqlite(str(db)) as reopened:
         reopened.verify_integrity()
         assert reopened.available("root") == money("1001")

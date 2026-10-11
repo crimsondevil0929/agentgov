@@ -34,12 +34,21 @@ from hypothesis.stateful import (
     RuleBasedStateMachine,
     consumes,
     invariant,
+    multiple,
     precondition,
     rule,
 )
 
 from agentgov import BudgetManager, GovernancePolicy
-from agentgov.core import QUANTUM, Authorization, Direction, EntryType, LedgerLine, WriteBatch
+from agentgov.core import (
+    QUANTUM,
+    Authorization,
+    Direction,
+    EntryType,
+    LedgerEntry,
+    LedgerLine,
+    WriteBatch,
+)
 from agentgov.exceptions import (
     CircuitOpenError,
     DenialOfWalletError,
@@ -57,7 +66,7 @@ pytestmark = pytest.mark.filterwarnings("error::DeprecationWarning")
 EXACT = decimal.Context(prec=60, traps=[decimal.Inexact, decimal.InvalidOperation])
 ROUNDED = decimal.Context(prec=60, traps=[decimal.InvalidOperation])
 MAX_DEPTH = 3
-NAMES = ["a", "b", "c", "d", "e", "agent.research", "task/7", "pipe|name", "line\nbreak", "é"]
+NAMES = ["a", "b", "c", "d", "e", "agent.research", "task/7", "pipe|name", "spaced name", "\u00e9"]
 
 
 def floor(value: Decimal) -> Decimal:
@@ -97,6 +106,7 @@ class _Model:
     tripped: set[str] = field(default_factory=set)
     spent: dict[str, Decimal] = field(default_factory=dict)
     refunded: dict[str, Decimal] = field(default_factory=dict)
+    spend_refunds: dict[uuid.UUID, Decimal] = field(default_factory=dict)
 
     def halted(self, scope: str) -> bool:
         cursor: str | None = scope
@@ -123,6 +133,7 @@ class GovernorMachine(RuleBasedStateMachine):
     """A governor under random operations, host contexts and write failures."""
 
     holds = Bundle("holds")
+    spends = Bundle("spends")
 
     def __init__(self) -> None:
         super().__init__()
@@ -326,39 +337,45 @@ class GovernorMachine(RuleBasedStateMachine):
             m.tripped.add(scope)
         return overdrawn
 
-    @rule(auth=consumes(holds), cost=st.decimals(-1, 1, places=10))
-    def capture(self, auth: Authorization | None, cost: Decimal) -> None:
+    @rule(target=spends, auth=consumes(holds), cost=st.decimals(-1, 1, places=10))
+    def capture(self, auth: Authorization | None, cost: Decimal) -> Any:
         if auth is None:
-            return
+            return multiple()
         m = self.model
         settled = ceil(cost)
         if settled < 0:
             with pytest.raises(ValueError):
                 self.call(self.gov.capture, auth, cost)
-            return
+            return multiple()
         if auth.authorization_id not in m.holds:
             with pytest.raises(DoubleSpendError):
                 self.call(self.gov.capture, auth, cost)
-            return
+            return multiple()
         if self.failed_write():
             self.store.armed = True
             with pytest.raises(StorageError):
                 self.call(self.gov.capture, auth, cost)
-            return
+            return multiple()
         if settled == 0:
             self.call(self.gov.capture, auth, cost)
             scope, held = m.holds.pop(auth.authorization_id)
             m.add(scope, held)
-            return
+            return multiple()
         scope, held = m.holds[auth.authorization_id]
         if EXACT.add(m.balance[scope], EXACT.subtract(held, settled)) < 0:
             with pytest.raises(DenialOfWalletError) as raised:
                 self.call(self.gov.capture, auth, cost)
             assert raised.value.overspent
+            entry = next(
+                e
+                for e in reversed(self.gov.ledger.entries())
+                if e.entry_type is EntryType.SPEND and e.ref == auth.entry.entry_id
+            )
         else:
             entry = self.call(self.gov.capture, auth, cost)
             assert entry.amount == settled
         self._settle(auth, settled)
+        return entry
 
     @rule(auth=consumes(holds))
     def void(self, auth: Authorization | None) -> None:
@@ -385,29 +402,54 @@ class GovernorMachine(RuleBasedStateMachine):
         with pytest.raises(DoubleSpendError):
             self.call(self.gov.capture, auth, Decimal("0.01"))
 
-    @rule(name=st.sampled_from(NAMES), amount=st.decimals(-1, 1, places=10))
-    def refund(self, name: str, amount: Decimal) -> None:
+    @rule(spend=spends, amount=st.decimals(-1, 1, places=10))
+    def refund(self, spend: LedgerEntry, amount: Decimal) -> None:
+        """A refund that names the spend it reverses."""
         m = self.model
+        name = spend.scope_id
         credited = floor(amount)
         if credited <= 0:
             with pytest.raises(ValueError):
-                self.call(self.gov.refund, name, amount)
+                self.call(self.gov.refund, name, amount, reverses=spend)
             return
-        if name not in m.nodes:
-            with pytest.raises(UnknownScopeError):
-                self.call(self.gov.refund, name, amount)
-            return
+        left = EXACT.subtract(spend.amount, m.spend_refunds.get(spend.entry_id, Decimal(0)))
         refundable = EXACT.subtract(m.spent.get(name, Decimal(0)), m.refunded.get(name, Decimal(0)))
-        if credited > refundable:
+        if credited > left or credited > refundable:
             with pytest.raises(ValueError, match="cannot refund"):
-                self.call(self.gov.refund, name, amount)
+                self.call(self.gov.refund, name, amount, reverses=spend)
             return
         if self.failed_write():
             self.store.armed = True
             with pytest.raises(StorageError):
-                self.call(self.gov.refund, name, amount)
+                self.call(self.gov.refund, name, amount, reverses=spend)
             return
-        self.call(self.gov.refund, name, amount)
+        entry = self.call(self.gov.refund, name, amount, reverses=spend)
+        assert entry.ref == spend.entry_id
+        m.spend_refunds[spend.entry_id] = EXACT.add(
+            m.spend_refunds.get(spend.entry_id, Decimal(0)), credited
+        )
+        m.refunded[name] = EXACT.add(m.refunded.get(name, Decimal(0)), credited)
+        m.add(name, credited)
+
+    @rule(name=st.sampled_from(NAMES), amount=st.decimals(0, 1, places=10))
+    def refund_naming_no_spend(self, name: str, amount: Decimal) -> None:
+        """Deprecated, still bounded by everything the scope spent."""
+        m = self.model
+        credited = floor(amount)
+        if credited <= 0 or name not in m.nodes:
+            return
+        refundable = EXACT.subtract(m.spent.get(name, Decimal(0)), m.refunded.get(name, Decimal(0)))
+        with pytest.warns(DeprecationWarning, match="names no spend"):
+            if credited > refundable:
+                with pytest.raises(ValueError, match="cannot refund"):
+                    self.call(self.gov.refund, name, amount)
+                return
+            if self.failed_write():
+                self.store.armed = True
+                with pytest.raises(StorageError):
+                    self.call(self.gov.refund, name, amount)
+                return
+            self.call(self.gov.refund, name, amount)
         m.refunded[name] = EXACT.add(m.refunded.get(name, Decimal(0)), credited)
         m.add(name, credited)
 
@@ -418,6 +460,9 @@ class GovernorMachine(RuleBasedStateMachine):
                 self.call(self.gov.anchor, name, memo)
         elif name not in self.model.nodes:
             with pytest.raises(UnknownScopeError):
+                self.call(self.gov.anchor, name, memo)
+        elif "\x00" in memo:  # PostgreSQL cannot store a NUL, so no entry holds one
+            with pytest.raises(ValueError, match="NUL"):
                 self.call(self.gov.anchor, name, memo)
         elif self.failed_write():
             self.store.armed = True

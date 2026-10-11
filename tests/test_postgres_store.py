@@ -80,7 +80,7 @@ def test_the_store_is_a_shared_store_and_sqlite_is_not(pg_dsn: str) -> None:
     try:
         assert isinstance(store, SharedStore)
         assert store.schema == "agentgov"
-        assert store.schema_version == "pg1"
+        assert store.schema_version == "pg2"
     finally:
         store.close()
     single = SqliteStore(":memory:")
@@ -109,6 +109,9 @@ def test_a_fresh_database_starts_empty_and_installs_its_schema(pg_dsn: str) -> N
         "open_authorizations",
         "join_key",
         "claims",
+        "snapshots",
+        "audit_marks",
+        "idempotency",
     }
 
 
@@ -703,8 +706,8 @@ def test_a_capture_after_another_governor_voided_the_hold_is_a_double_spend(
 
 
 def test_money_round_trips_exactly(pg_dsn: str, gov: BudgetManager) -> None:
-    """Text columns, not numeric: a zero-value entry's amount comes back as
-    the ``0`` it was hashed with, not ``0E-8``."""
+    """Text columns, not numeric: every amount comes back exactly as it was
+    hashed. AGOV3 writes fixed-point text: ``0.00000000``, ``0.00000001``."""
     gov.anchor("agent", "digest")
     gov.spend("agent", Decimal("0.00000001"))
     with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
@@ -712,4 +715,5 @@ def test_money_round_trips_exactly(pg_dsn: str, gov: BudgetManager) -> None:
         # which are what the hashes cover.
         loaded = [e.to_audit_record() for e in reader.ledger.entries()]
         assert loaded == [e.to_audit_record() for e in gov.ledger.entries()]
-        assert any(r["amount"] == "0" for r in loaded)
+        assert any(r["amount"] == "0.00000000" for r in loaded)
+        assert any(r["amount"] == "0.00000001" for r in loaded)

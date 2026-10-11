@@ -18,7 +18,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from agentgov import BudgetManager, money
-from agentgov.core import _escape, format_audit_line
+from agentgov.core import MAX_ID_BYTES, MAX_MEMO_BYTES, _check_text, _escape, format_audit_line
 
 HOSTILE = [
     "line\nbreak",
@@ -69,12 +69,23 @@ def _fields(line: str) -> dict[str, str]:
     return fields
 
 
+def _allowed(text: str, *, identifier: bool) -> bool:
+    limit = MAX_ID_BYTES if identifier else MAX_MEMO_BYTES
+    return _check_text(text, "text", limit=limit, identifier=identifier) is None
+
+
 @pytest.mark.parametrize("text", HOSTILE)
 def test_each_entry_is_one_line_with_its_fields_intact(text: str, audit_lines: io.StringIO) -> None:
+    # Hostile text goes wherever an AGOV3 entry admits it: memos admit all but
+    # NUL and lone surrogates, scope ids no control character either.
+    in_scope = _allowed(text, identifier=True)
+    memo = text if _allowed(text, identifier=False) else "plain"
+    root = f"root {text}" if in_scope else "root"
+    child = f"child {text}" if in_scope else "child"
     gov = BudgetManager()
-    gov.open_root(f"root {text}", money("1"), memo=f"fund {text}")
-    gov.delegate(f"root {text}", f"child {text}", money("0.5"), memo=text)
-    gov.anchor(f"child {text}", text)
+    gov.open_root(root, money("1"), memo=f"fund {memo}")
+    gov.delegate(root, child, money("0.5"), memo=memo)
+    gov.anchor(child, memo)
     entries = gov.audit_trail()
     lines = audit_lines.getvalue().splitlines()
     assert len(lines) == len(entries)
@@ -86,6 +97,22 @@ def test_each_entry_is_one_line_with_its_fields_intact(text: str, audit_lines: i
         assert _unescape(fields["memo"]) == entry.memo
         if entry.counterparty_id:
             assert _unescape(fields["cpty"]) == entry.counterparty_id
+
+
+@pytest.mark.parametrize("text", [t for t in HOSTILE if not _allowed(t, identifier=True)])
+def test_a_scope_id_with_a_control_character_or_a_surrogate_is_refused(text: str) -> None:
+    gov = BudgetManager()
+    with pytest.raises(ValueError, match="scope id"):
+        gov.open_root(f"root {text}", money("1"))
+    assert gov.scopes() == ()
+
+
+@pytest.mark.parametrize("text", ["nul\x00byte", "lone \ud800 surrogate"])
+def test_a_memo_a_store_cannot_hold_is_refused(text: str) -> None:
+    gov = BudgetManager()
+    gov.open_root("root", money("1"))
+    with pytest.raises(ValueError, match="memo"):
+        gov.anchor("root", text)
 
 
 def test_control_events_are_escaped_too(audit_lines: io.StringIO) -> None:

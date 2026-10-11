@@ -71,12 +71,14 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
+import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from decimal import Decimal
 from typing import Any, Final, LiteralString
 
 from agentgov.core import (
+    _CHECKPOINT_MEMO,
     GENESIS_HASH,
     Authorization,
     BudgetNode,
@@ -86,6 +88,7 @@ from agentgov.core import (
     LedgerEntry,
     SettlementClaim,
     WriteBatch,
+    _amount_text,
     _iso,
     _parse_iso,
 )
@@ -95,7 +98,14 @@ from agentgov.exceptions import (
     ReadOnlyLedgerError,
     StorageError,
 )
-from agentgov.storage import PersistedAuthorization, PersistedNode, StoreDelta, StoreImage
+from agentgov.storage import (
+    AuditMark,
+    PersistedAuthorization,
+    PersistedNode,
+    Snapshot,
+    StoreDelta,
+    StoreImage,
+)
 
 try:
     import psycopg
@@ -110,10 +120,16 @@ __all__ = ["DEFAULT_SCHEMA", "PostgresStore"]
 DEFAULT_SCHEMA: Final = "agentgov"
 """The PostgreSQL schema a ledger lives in unless another is named."""
 
-_SCHEMA_VERSION: Final = "pg1"
-"""The PostgreSQL layout. The same logical tables as SQLite's version 2."""
+_SCHEMA_VERSION: Final = "pg2"
+"""The PostgreSQL layout. The same logical tables as SQLite's version 3:
+checkpoint snapshots, the auditor's marks, idempotency records, and indexes
+on history."""
 
-_SUPPORTED_VERSIONS: Final = frozenset({_SCHEMA_VERSION})
+_PG1: Final = "pg1"
+"""v0.3 and v0.4. Read as it is when opened read-only; upgraded in place,
+under the writer lock, the first time a writer opens it."""
+
+_SUPPORTED_VERSIONS: Final = frozenset({_PG1, _SCHEMA_VERSION})
 
 _SCHEMA_NAME: Final = re.compile(r"\A[a-z_][a-z0-9_]{0,62}\Z")
 
@@ -303,19 +319,22 @@ class PostgresStore:
         # make every governor that opens wait on, and stall, every writer.
         with self._reading():
             version = self._installed_version()
-        if version is not None:
+        if version == _SCHEMA_VERSION:
             return version
         if self._read_only:
-            raise StorageError(
-                f"schema {self._schema!r} holds no agentgov ledger; open it for writing "
-                f"once to create one"
-            )
-        # Not installed: install under the writer lock, re-checking under it,
-        # so governors starting together cannot race the DDL.
+            if version is None:
+                raise StorageError(
+                    f"schema {self._schema!r} holds no agentgov ledger; open it for writing "
+                    f"once to create one"
+                )
+            return version  # an older layout, read as it is: a reader never upgrades
+        # Not installed, or an older layout: install or upgrade under the
+        # writer lock, re-checking under it, so governors starting together
+        # cannot race the DDL.
         with self.writer():
             version = self._installed_version()
+            conn = self._conn
             if version is None:
-                conn = self._conn
                 with self._errors(f"create the ledger schema {self._schema!r}"):
                     for statement in self._sql.install:
                         conn.execute(statement)
@@ -325,7 +344,16 @@ class PostgresStore:
                     # a role that only carries joined writes.
                     conn.execute(self._sql.set_join_key, (secrets.token_bytes(32),))
                     conn.execute(self._sql.set_version, (_SCHEMA_VERSION,))
-                version = _SCHEMA_VERSION
+            elif version != _SCHEMA_VERSION:
+                with self._errors(
+                    f"upgrade ledger schema {self._schema!r} from {version} to "
+                    f"{_SCHEMA_VERSION} (an upgrade needs the schema's owner, or a role "
+                    f"that may create tables and indexes in it)"
+                ):
+                    for statement in self._sql.upgrade:
+                        conn.execute(statement)
+                    conn.execute(self._sql.set_version, (_SCHEMA_VERSION,))
+            version = _SCHEMA_VERSION
         return version
 
     def _installed_version(self) -> str | None:
@@ -708,25 +736,47 @@ class PostgresStore:
             return 0, GENESIS_HASH
         return int(row[0]), str(row[1])
 
-    def load(self) -> StoreImage:
-        """Read every table in one consistent read."""
+    def load(self, *, from_checkpoint: bool = False) -> StoreImage:
+        """Read every table in one consistent read.
+
+        :param from_checkpoint: Start from the snapshot the newest CHECKPOINT
+            entry names: the image then carries that snapshot and only the
+            entries after it, so the read costs the entries since the
+            checkpoint and the state, not the length of history.
+        """
         with self._reading(), self._errors("load the ledger"):
             version = self._installed_version() or _SCHEMA_VERSION
-            entries = self._select_entries(after=0)
+            snapshot = (
+                self._newest_snapshot() if from_checkpoint and version == _SCHEMA_VERSION else None
+            )
+            base = snapshot.sequence if snapshot is not None else 0
+            entries = self._select_entries(after=base)
             nodes = self._select_nodes()
-            rows = self._select_control_rows(after=0)
+            if base:
+                rows = self._select_control_rows(after=0, after_entry=base)
+            else:
+                rows = self._select_control_rows(after=0)
             authorizations = self._select_authorizations()
+            found = self._conn.execute(self._sql.control_high_water).fetchone()
         return StoreImage(
             schema_version=version,
             entries=entries,
             nodes=nodes,
             control_events=tuple(event for _, event in rows),
             authorizations=authorizations,
-            control_high_water=max((row_id for row_id, _ in rows), default=0),
+            control_high_water=int(found[0]) if found and found[0] is not None else 0,
+            snapshot=snapshot,
+            base=base,
         )
 
-    def snapshot(self, *, after_sequence: int, after_control_row: int) -> StoreDelta:
-        """Read what changed after ``after_sequence``, in one consistent read."""
+    def snapshot(
+        self, *, after_sequence: int, after_control_row: int, authorizations: bool = True
+    ) -> StoreDelta:
+        """Read what changed after ``after_sequence``, in one consistent read.
+
+        :param authorizations: Read every open authorization too. A reader
+            that follows holds from the entries themselves need not.
+        """
         with self._reading(), self._errors("read the ledger"):
             version = self._installed_version() or _SCHEMA_VERSION
             anchor: str | None = None
@@ -734,44 +784,211 @@ class PostgresStore:
                 row = self._conn.execute(self._sql.entry_hash_at, (after_sequence,)).fetchone()
                 anchor = None if row is None else str(row[0])
             entries = self._select_entries(after=after_sequence)
-            authorizations = self._select_authorizations()
+            auths = self._select_authorizations() if authorizations else ()
             rows = self._select_control_rows(after=after_control_row)
         return StoreDelta(
             schema_version=version,
             anchor_hash=anchor,
             entries=entries,
-            authorizations=authorizations,
+            authorizations=auths,
             legacy_control_events=tuple(event for _, event in rows if event.entry_id is None),
             control_high_water=max((row_id for row_id, _ in rows), default=after_control_row),
         )
+
+    # -- checkpoints ------------------------------------------------------
+
+    def _newest_snapshot(self) -> Snapshot | None:
+        """The snapshot the newest CHECKPOINT entry names, or ``None`` when no
+        entry is a checkpoint. A newest checkpoint whose snapshot is missing,
+        or whose memo does not parse, comes back empty for the caller to
+        refuse; it is never skipped for an older one. Inside a read."""
+        row = self._conn.execute(self._sql.newest_checkpoint).fetchone()
+        if row is None:
+            return None
+        found = _CHECKPOINT_MEMO.match(str(row[0]))
+        if found is None:
+            return Snapshot(sequence=0, digest="", body=b"")
+        sequence = int(found.group(1))
+        stored = self._conn.execute(self._sql.select_snapshot, (sequence,)).fetchone()
+        if stored is None:
+            return Snapshot(sequence=sequence, digest="", body=b"")
+        return Snapshot(
+            sequence=int(stored[0]),
+            digest=str(stored[1]),
+            body=bytes(stored[2]),
+            signature=stored[3],
+        )
+
+    def put_snapshot(self, snapshot: Snapshot) -> None:
+        """Store a snapshot, once, in a transaction of its own and without the
+        writer lock: the state as of a sequence never changes, so an identical
+        second snapshot is a no-op and a different one is refused.
+
+        :raises LedgerIntegrityError: If a different snapshot of the same
+            sequence is already stored: two derivations of one chain disagree.
+        """
+        self._require_writable("store a checkpoint snapshot")
+        if self._in_own_session():
+            raise StorageError("a snapshot is stored outside a writer session, never inside one")
+        conn = self._live()
+        with self._errors("store a checkpoint snapshot"):
+            conn.execute(
+                self._sql.insert_snapshot,
+                (snapshot.sequence, snapshot.digest, snapshot.body, snapshot.signature),
+            )
+            row = conn.execute(self._sql.select_snapshot, (snapshot.sequence,)).fetchone()
+        if row is None or str(row[1]) != snapshot.digest:
+            raise LedgerIntegrityError(
+                f"a different snapshot of sequence {snapshot.sequence} is already stored: two "
+                f"derivations of the same chain disagree"
+            )
+
+    def snapshot_at(self, sequence: int) -> Snapshot | None:
+        """The stored snapshot of ``sequence``, if any."""
+        with self._reading(), self._errors("read a checkpoint snapshot"):
+            row = self._conn.execute(self._sql.select_snapshot, (sequence,)).fetchone()
+        if row is None:
+            return None
+        return Snapshot(
+            sequence=int(row[0]), digest=str(row[1]), body=bytes(row[2]), signature=row[3]
+        )
+
+    def checkpoints(self) -> tuple[tuple[int, int, str], ...]:
+        """Every well-formed CHECKPOINT entry: its own sequence, the sequence
+        its snapshot is of, and the snapshot's digest, oldest first."""
+        with self._reading(), self._errors("read the ledger's checkpoints"):
+            rows = self._conn.execute(self._sql.checkpoint_memos).fetchall()
+        found = []
+        for sequence, memo in rows:
+            match = _CHECKPOINT_MEMO.match(str(memo))
+            if match is not None:
+                found.append((int(sequence), int(match.group(1)), match.group(2)))
+        return tuple(found)
+
+    # -- history ----------------------------------------------------------
+
+    def entry_at(self, sequence: int) -> LedgerEntry | None:
+        """The entry at ``sequence``, if there is one."""
+        with self._reading(), self._errors("read an entry"):
+            row = self._conn.execute(self._sql.select_entry_at, (sequence,)).fetchone()
+        return None if row is None else _entry(row)
+
+    def entry_by_id(self, entry_id: uuid.UUID) -> LedgerEntry | None:
+        """The entry with this ``entry_id``, if there is one."""
+        with self._reading(), self._errors("read an entry"):
+            row = self._conn.execute(self._sql.select_entry_by_id, (entry_id,)).fetchone()
+        return None if row is None else _entry(row)
+
+    def iter_entries(
+        self, *, after: int = 0, until: int | None = None, chunk: int = 10_000
+    ) -> Iterator[LedgerEntry]:
+        """Entries after ``after``, up to and including ``until``, oldest
+        first, read ``chunk`` at a time so memory stays bounded."""
+        position = after
+        while until is None or position < until:
+            with self._reading(), self._errors("read the ledger"):
+                batch = self._select_entries(after=position, until=until, limit=chunk)
+            if not batch:
+                return
+            yield from batch
+            position = batch[-1].sequence
+
+    def find_entries(
+        self,
+        *,
+        scope_id: str | None = None,
+        entry_type: EntryType | None = None,
+        memo: str | None = None,
+        transaction_id: uuid.UUID | None = None,
+        ref: uuid.UUID | None = None,
+        after: int = 0,
+        limit: int | None = None,
+    ) -> tuple[LedgerEntry, ...]:
+        """Entries matching every criterion given, oldest first, by index."""
+        criteria: dict[str, object] = {"after": after}
+        if scope_id is not None:
+            criteria["scope_id"] = scope_id
+        if entry_type is not None:
+            criteria["entry_type"] = entry_type.value
+        if memo is not None:
+            criteria["memo"] = memo
+        if transaction_id is not None:
+            criteria["transaction_id"] = transaction_id
+        if ref is not None:
+            criteria["ref"] = ref
+        if limit is not None:
+            criteria["limit"] = limit
+        with self._reading(), self._errors("search the ledger"):
+            rows = self._conn.execute(self._sql.find_entries(criteria), criteria).fetchall()
+        return tuple(_entry(row) for row in rows)
+
+    def released(self, hold_id: uuid.UUID) -> bool:
+        """Whether an entry released the hold ``hold_id`` by name."""
+        with self._reading(), self._errors("read the ledger"):
+            row = self._conn.execute(self._sql.released, (hold_id,)).fetchone()
+        return row is not None
+
+    def control_events(self) -> tuple[ControlEvent, ...]:
+        """Every circuit-breaker trip and reset recorded, oldest first."""
+        with self._reading(), self._errors("read the control events"):
+            return tuple(event for _, event in self._select_control_rows(after=0))
+
+    # -- the auditor's marks ----------------------------------------------
+
+    def record_audit(self, mark: AuditMark) -> None:
+        """Record how far an auditor verified the chain, and what it found.
+
+        In a transaction of its own and without the writer lock: a mark is
+        evidence about the chain, not part of it.
+        """
+        self._require_writable("record an audit mark")
+        with self._errors("record an audit mark"):
+            self._live().execute(
+                self._sql.insert_audit_mark,
+                (
+                    mark.sequence,
+                    mark.head,
+                    mark.state_digest,
+                    mark.status,
+                    mark.detail,
+                    mark.auditor,
+                    _iso(mark.recorded_at),
+                    mark.signature,
+                ),
+            )
+
+    def audit_marks(self) -> tuple[AuditMark, ...]:
+        """Every audit mark, oldest first."""
+        if self._version != _SCHEMA_VERSION:
+            return ()
+        with self._reading(), self._errors("read the audit marks"):
+            rows = self._conn.execute(self._sql.select_audit_marks).fetchall()
+        return tuple(_audit_mark(row) for row in rows)
+
+    def audit_failure(self) -> AuditMark | None:
+        """The first failure an auditor recorded, if any."""
+        if self._version != _SCHEMA_VERSION:
+            return None
+        with self._reading(), self._errors("read the audit marks"):
+            row = self._conn.execute(self._sql.select_audit_failure).fetchone()
+        return None if row is None else _audit_mark(row)
 
     def load_entries(self) -> tuple[LedgerEntry, ...]:
         """Return every persisted entry, oldest first."""
         with self._reading(), self._errors("load the ledger's entries"):
             return self._select_entries(after=0)
 
-    def _select_entries(self, *, after: int) -> tuple[LedgerEntry, ...]:
-        rows = self._conn.execute(self._sql.select_entries, (after,)).fetchall()
-        return tuple(
-            LedgerEntry(
-                sequence=int(row[0]),
-                entry_id=row[1],
-                transaction_id=row[2],
-                timestamp=_parse_iso(row[3]),
-                entry_type=EntryType(row[4]),
-                direction=Direction(row[5]),
-                scope_id=row[6],
-                counterparty_id=row[7],
-                amount=Decimal(row[8]),
-                balance_after=Decimal(row[9]),
-                prev_hash=row[10],
-                entry_hash=row[11],
-                memo=row[12],
-                version=row[13],
-                ref=row[14],
-            )
-            for row in rows
-        )
+    def _select_entries(
+        self, *, after: int, until: int | None = None, limit: int | None = None
+    ) -> tuple[LedgerEntry, ...]:
+        if until is None and limit is None:
+            rows = self._conn.execute(self._sql.select_entries, (after,)).fetchall()
+        else:
+            rows = self._conn.execute(
+                self._sql.select_entries_range,
+                (after, until if until is not None else 2**62, limit or 2**62),
+            ).fetchall()
+        return tuple(_entry(row) for row in rows)
 
     def _select_nodes(self) -> tuple[PersistedNode, ...]:
         rows = self._conn.execute(self._sql.select_nodes).fetchall()
@@ -786,8 +1003,15 @@ class PostgresStore:
             for row in rows
         )
 
-    def _select_control_rows(self, *, after: int) -> tuple[tuple[int, ControlEvent], ...]:
-        rows = self._conn.execute(self._sql.select_control, (after,)).fetchall()
+    def _select_control_rows(
+        self, *, after: int, after_entry: int | None = None
+    ) -> tuple[tuple[int, ControlEvent], ...]:
+        if after_entry is None:
+            rows = self._conn.execute(self._sql.select_control, (after,)).fetchall()
+        else:
+            rows = self._conn.execute(
+                self._sql.select_control_after_entry, (after_entry,)
+            ).fetchall()
         return tuple(
             (
                 int(row[0]),
@@ -826,6 +1050,39 @@ class PostgresStore:
             self._conn.close()
 
 
+def _entry(row: Any) -> LedgerEntry:
+    return LedgerEntry(
+        sequence=int(row[0]),
+        entry_id=row[1],
+        transaction_id=row[2],
+        timestamp=_parse_iso(row[3]),
+        entry_type=EntryType(row[4]),
+        direction=Direction(row[5]),
+        scope_id=row[6],
+        counterparty_id=row[7],
+        amount=Decimal(row[8]),
+        balance_after=Decimal(row[9]),
+        prev_hash=row[10],
+        entry_hash=row[11],
+        memo=row[12],
+        version=row[13],
+        ref=row[14],
+    )
+
+
+def _audit_mark(row: Any) -> AuditMark:
+    return AuditMark(
+        sequence=int(row[0]),
+        head=str(row[1]),
+        state_digest=str(row[2]),
+        status=str(row[3]),
+        detail=str(row[4]),
+        auditor=str(row[5]),
+        recorded_at=_parse_iso(str(row[6])),
+        signature=row[7],
+    )
+
+
 def _entry_row(entry: LedgerEntry) -> tuple[object, ...]:
     return (
         entry.sequence,
@@ -836,8 +1093,8 @@ def _entry_row(entry: LedgerEntry) -> tuple[object, ...]:
         entry.direction.value,
         entry.scope_id,
         entry.counterparty_id,
-        str(entry.amount),
-        str(entry.balance_after),
+        _amount_text(entry, entry.amount),
+        _amount_text(entry, entry.balance_after),
         entry.prev_hash,
         entry.entry_hash,
         entry.memo,
@@ -923,6 +1180,47 @@ class _Statements:
         self.select_entries = sql.SQL(
             "SELECT {} FROM {} WHERE sequence > %s ORDER BY sequence ASC"
         ).format(columns, entries)
+        self.select_entries_range = sql.SQL(
+            "SELECT {} FROM {} WHERE sequence > %s AND sequence <= %s "
+            "ORDER BY sequence ASC LIMIT %s"
+        ).format(columns, entries)
+        self.select_entry_at = sql.SQL("SELECT {} FROM {} WHERE sequence = %s").format(
+            columns, entries
+        )
+        self.select_entry_by_id = sql.SQL("SELECT {} FROM {} WHERE entry_id = %s").format(
+            columns, entries
+        )
+        self.newest_checkpoint = sql.SQL(
+            "SELECT memo FROM {} WHERE entry_type = 'checkpoint' ORDER BY sequence DESC LIMIT 1"
+        ).format(entries)
+        self.checkpoint_memos = sql.SQL(
+            "SELECT sequence, memo FROM {} WHERE entry_type = 'checkpoint' ORDER BY sequence ASC"
+        ).format(entries)
+        self.released = sql.SQL(
+            "SELECT 1 FROM {} WHERE entry_type = 'hold_void' AND ref = %s LIMIT 1"
+        ).format(entries)
+        snapshots, marks = table("snapshots"), table("audit_marks")
+        self.insert_snapshot = sql.SQL(
+            "INSERT INTO {} (sequence, digest, body, signature) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (sequence) DO NOTHING"
+        ).format(snapshots)
+        self.select_snapshot = sql.SQL(
+            "SELECT sequence, digest, body, signature FROM {} WHERE sequence = %s"
+        ).format(snapshots)
+        self.insert_audit_mark = sql.SQL(
+            "INSERT INTO {} (sequence, head, state_digest, status, detail, auditor, "
+            "recorded_at, signature) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+        ).format(marks)
+        self.select_audit_marks = sql.SQL(
+            "SELECT sequence, head, state_digest, status, detail, auditor, recorded_at, "
+            "signature FROM {} ORDER BY id ASC"
+        ).format(marks)
+        self.select_audit_failure = sql.SQL(
+            "SELECT sequence, head, state_digest, status, detail, auditor, recorded_at, "
+            "signature FROM {} WHERE status = 'failed' ORDER BY id ASC LIMIT 1"
+        ).format(marks)
+        self.control_high_water = sql.SQL("SELECT max(id) FROM {}").format(control)
+        self._entries_columns = columns
         self.upsert_node = sql.SQL(
             "INSERT INTO {} (scope_id, parent_id, depth, allocated, created_at) "
             "VALUES (%s, %s, %s, %s, %s) "
@@ -942,6 +1240,12 @@ class _Statements:
             "SELECT id, event_id, timestamp, event_type, scope_id, reason, ledger_head_hash, "
             "entry_id FROM {} WHERE id > %s ORDER BY id ASC"
         ).format(control)
+        self.select_control_after_entry = sql.SQL(
+            "SELECT c.id, c.event_id, c.timestamp, c.event_type, c.scope_id, c.reason, "
+            "c.ledger_head_hash, c.entry_id FROM {} AS c WHERE c.entry_id IS NULL OR "
+            "c.entry_id IN (SELECT e.entry_id FROM {} AS e WHERE e.sequence > %s) "
+            "ORDER BY c.id ASC"
+        ).format(control, entries)
         self.clear_chained_control = sql.SQL("DELETE FROM {} WHERE entry_id IS NOT NULL").format(
             control
         )
@@ -956,7 +1260,8 @@ class _Statements:
             "SELECT authorization_id, scope_id, amount, opened_at, entry_id FROM {}"
         ).format(auths)
         self.clear_authorizations = sql.SQL("DELETE FROM {}").format(auths)
-        self.install = _install_statements(schema)
+        self.install = (*_install_statements(schema), *_pg2_statements(schema))
+        self.upgrade = _pg2_statements(schema)
         self._insert_entries: dict[int, sql.Composed] = {}
 
         # Joined transactions. The lock is the same key as begin_locked's,
@@ -984,6 +1289,25 @@ class _Statements:
             sql.SQL(
                 "GRANT EXECUTE ON FUNCTION {}(bytea, uuid, uuid, text, text, text) TO {}"
             ).format(self._claim_fn, who),
+        )
+
+    def find_entries(self, criteria: dict[str, object]) -> sql.Composed:
+        """A SELECT of the entries matching ``criteria``, by index."""
+        clauses = [sql.SQL("sequence > %(after)s")]
+        if "scope_id" in criteria:
+            clauses.append(sql.SQL("scope_id = %(scope_id)s"))
+        if "entry_type" in criteria:
+            clauses.append(sql.SQL("entry_type = %(entry_type)s"))
+        if "memo" in criteria:
+            # Through the (entry_type, md5(memo)) index, then exactly.
+            clauses.append(sql.SQL("md5(memo) = md5(%(memo)s) AND memo = %(memo)s"))
+        if "transaction_id" in criteria:
+            clauses.append(sql.SQL("transaction_id = %(transaction_id)s"))
+        if "ref" in criteria:
+            clauses.append(sql.SQL("ref = %(ref)s"))
+        limit = sql.SQL(" LIMIT %(limit)s") if "limit" in criteria else sql.SQL("")
+        return sql.SQL("SELECT {} FROM {} WHERE {} ORDER BY sequence ASC{}").format(
+            self._entries_columns, self._entries_table, sql.SQL(" AND ").join(clauses), limit
         )
 
     def insert_entries(self, count: int) -> sql.Composed:
@@ -1125,6 +1449,108 @@ def _install_statements(schema: str) -> tuple[sql.Composed, ...]:
             "ENABLE ALWAYS TRIGGER append_only, ENABLE ALWAYS TRIGGER append_only_truncate"
         ).format(entries),
         *_join_statements(schema),
+    )
+
+
+def _pg2_statements(schema: str) -> tuple[sql.Composed, ...]:
+    """What layout pg2 adds to pg1. Each statement is idempotent, so the same
+    list both completes a fresh install and upgrades a pg1 schema in place,
+    under the writer lock. Building the indexes over a long ledger takes a
+    while, once."""
+
+    def table(name: str) -> sql.Identifier:
+        return sql.Identifier(schema, name)
+
+    entries, control = table("entries"), table("control_events")
+    snapshots, marks = table("snapshots"), table("audit_marks")
+    frozen = table("append_only_rows")
+    return (
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {} (
+                sequence   bigint PRIMARY KEY CHECK (sequence > 0),
+                digest     text NOT NULL,
+                body       bytea NOT NULL,
+                signature  text,
+                created_at timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        ).format(snapshots),
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {} (
+                id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                sequence     bigint NOT NULL,
+                head         text NOT NULL,
+                state_digest text NOT NULL,
+                status       text NOT NULL CHECK (status IN ('verified', 'failed')),
+                detail       text NOT NULL,
+                auditor      text NOT NULL,
+                recorded_at  text NOT NULL,
+                signature    text
+            )
+            """
+        ).format(marks),
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {} (
+                key        text PRIMARY KEY,
+                request    text NOT NULL,
+                outcome    text NOT NULL,
+                sequence   bigint NOT NULL,
+                created_at text NOT NULL
+            )
+            """
+        ).format(table("idempotency")),
+        sql.SQL("CREATE INDEX IF NOT EXISTS entries_by_scope ON {} (scope_id, sequence)").format(
+            entries
+        ),
+        # md5, not the memo itself: a btree entry is limited to about 2.7 kB.
+        sql.SQL(
+            "CREATE INDEX IF NOT EXISTS entries_by_type_memo ON {} (entry_type, md5(memo))"
+        ).format(entries),
+        sql.SQL("CREATE INDEX IF NOT EXISTS entries_by_transaction ON {} (transaction_id)").format(
+            entries
+        ),
+        sql.SQL("CREATE INDEX IF NOT EXISTS entries_by_ref ON {} (ref)").format(entries),
+        sql.SQL(
+            "CREATE INDEX IF NOT EXISTS entries_checkpoints ON {} (sequence) "
+            "WHERE entry_type = 'checkpoint'"
+        ).format(entries),
+        sql.SQL("CREATE INDEX IF NOT EXISTS control_events_by_entry ON {} (entry_id)").format(
+            control
+        ),
+        # Snapshots and audit marks are evidence: never edited, never deleted.
+        sql.SQL(
+            """
+            CREATE OR REPLACE FUNCTION {fn}() RETURNS trigger LANGUAGE plpgsql
+            SET search_path = pg_catalog, pg_temp AS $agentgov$
+            BEGIN
+                RAISE EXCEPTION 'agentgov: % refused: % is append-only', TG_OP, TG_TABLE_NAME
+                    USING ERRCODE = 'integrity_constraint_violation';
+            END
+            $agentgov$
+            """
+        ).format(fn=frozen),
+        *(
+            statement
+            for name, target in (("snapshots", snapshots), ("audit_marks", marks))
+            for statement in (
+                sql.SQL(
+                    "CREATE OR REPLACE TRIGGER {} BEFORE UPDATE OR DELETE ON {} "
+                    "FOR EACH ROW EXECUTE FUNCTION {}()"
+                ).format(sql.Identifier(f"{name}_append_only"), target, frozen),
+                sql.SQL(
+                    "CREATE OR REPLACE TRIGGER {} BEFORE TRUNCATE ON {} "
+                    "FOR EACH STATEMENT EXECUTE FUNCTION {}()"
+                ).format(sql.Identifier(f"{name}_append_only_truncate"), target, frozen),
+                sql.SQL("ALTER TABLE {} ENABLE ALWAYS TRIGGER {}, ENABLE ALWAYS TRIGGER {}").format(
+                    target,
+                    sql.Identifier(f"{name}_append_only"),
+                    sql.Identifier(f"{name}_append_only_truncate"),
+                ),
+            )
+        ),
     )
 
 

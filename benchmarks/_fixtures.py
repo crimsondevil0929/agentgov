@@ -63,6 +63,7 @@ _TABLES = {
         "event_id, timestamp, event_type, scope_id, reason, ledger_head_hash, entry_id"
     ),
     "open_authorizations": "authorization_id, scope_id, amount, opened_at, entry_id",
+    "snapshots": "sequence, digest, body, signature",
 }
 
 
@@ -79,7 +80,13 @@ def copy_to_postgres(sqlite_path: str | Path, dsn: str, *, schema: str = "agentg
     copied = 0
     try:
         with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+            present = {
+                row[0]
+                for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
             for table, columns in _TABLES.items():
+                if table not in present:
+                    continue
                 rows = source.execute(f"SELECT {columns} FROM {table}").fetchall()  # noqa: S608
                 if table == "entries":
                     rows.sort(key=lambda row: row[0])

@@ -24,6 +24,7 @@ from agentgov.core import (
     money,
 )
 from agentgov.exceptions import LedgerIntegrityError
+from tests.ledger_fixtures import memory_history
 
 ZERO = Decimal("0")
 
@@ -82,7 +83,7 @@ def test_resetting_a_healthy_scope_is_a_no_op(gov: BudgetManager) -> None:
 
 def test_a_renumbered_entry_is_caught(gov: BudgetManager) -> None:
     ledger = gov.ledger
-    ledger._entries[1] = dataclasses.replace(ledger._entries[1], sequence=99)
+    memory_history(ledger)[1] = dataclasses.replace(memory_history(ledger)[1], sequence=99)
     with pytest.raises(LedgerIntegrityError, match="sequence gap"):
         gov.verify_integrity()
 
@@ -95,7 +96,9 @@ def test_a_forged_head_hash_is_caught(gov: BudgetManager) -> None:
 
 def test_forged_boundary_totals_are_caught(gov: BudgetManager) -> None:
     gov.ledger._totals = dataclasses.replace(gov.ledger._totals, funded=money("99.00"))
-    with pytest.raises(LedgerIntegrityError, match="boundary totals disagree"):
+    with pytest.raises(
+        LedgerIntegrityError, match=r"boundary totals disagree|conservation violated"
+    ):
         gov.verify_integrity()
 
 
@@ -230,7 +233,7 @@ def test_manager_chain_check_catches_a_tampered_ledger(gov: BudgetManager) -> No
     gov.open_root("orchestrator", money("5.00"))
     gov.delegate("orchestrator", "researcher", money("1.00"))
     ledger = gov.ledger
-    ledger._entries[1] = dataclasses.replace(ledger._entries[1], memo="edited")
+    memory_history(ledger)[1] = dataclasses.replace(memory_history(ledger)[1], memo="edited")
 
     with pytest.raises(LedgerIntegrityError):
         gov.verify_chain()
