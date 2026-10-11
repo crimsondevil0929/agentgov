@@ -43,7 +43,7 @@ LOG_ID = "support-eu-1"
 OLD = Ed25519Signer(bytes(range(32)))
 NEW = Ed25519Signer(bytes(range(100, 132)))
 WITNESS = Ed25519Signer(bytes(range(32, 64)))
-EVERY_TWO = CheckpointPolicy(every_receipts=2, every_seconds=10**9)
+EVERY_TWO = CheckpointPolicy(every_receipts=2, every_seconds=10**9, background=False)
 
 
 def draft(n: int) -> ActionReceipt:

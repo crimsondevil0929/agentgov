@@ -1,0 +1,1 @@
+{"agentgov": "0.4.0", "bench": "receipts", "commit": "", "concurrent_per_s": 18.43, "cpus": 10, "implementation": "CPython", "in_flight": 16, "machine": "arm64", "platform": "macOS-15.6.1-arm64-arm-64bit", "python": "3.11.14", "serial_per_s": 18.63, "signer_latency_ms": 50.0, "speedup": 0.99}

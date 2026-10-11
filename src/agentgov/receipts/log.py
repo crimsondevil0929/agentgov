@@ -28,17 +28,20 @@ One process holds a log for writing at a time; a second is refused.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar
 
+from agentgov._aio import off_loop
 from agentgov.exceptions import (
+    AgentGovError,
     ConcurrentGovernorError,
     MalformedReceiptError,
     ReceiptLogError,
@@ -59,7 +62,7 @@ from agentgov.receipts.schema import (
     _check_text,
     document_from_json,
 )
-from agentgov.receipts.signing import Keyring, Signer, Verifier, verifier_of
+from agentgov.receipts.signing import Keyring, Signer, Verifier, as_async, verifier_of
 from agentgov.receipts.witness import Witness
 
 __all__ = ["CheckpointPolicy", "ReceiptLog"]
@@ -73,18 +76,83 @@ D = TypeVar("D", ActionReceipt, DeliveryReceipt)
 class CheckpointPolicy:
     """When the log publishes a checkpoint to its witnesses: after
     ``every_receipts`` new receipts, or when a receipt arrives
-    ``every_seconds`` after the last checkpoint, whichever comes first."""
+    ``every_seconds`` after the last checkpoint, whichever comes first.
+
+    With ``background`` (the default) a publisher thread signs the checkpoint
+    and collects the witnesses' cosignatures, and :meth:`ReceiptLog.issue`
+    returns as soon as the receipt is durable. Without it, the issue that
+    makes a checkpoint due publishes it before returning (outside the log's
+    lock, so other issues go on).
+    """
 
     every_receipts: int = 64
     every_seconds: float = 60.0
+    background: bool = True
 
     def __post_init__(self) -> None:
         if self.every_receipts < 1 or self.every_seconds <= 0:
             raise ValueError("a checkpoint policy needs a positive count and interval")
 
 
+class _Reservation:
+    """A position in the log, held while a receipt for it is signed."""
+
+    __slots__ = ("_done", "_wakeups", "error", "index", "receipt", "receipt_id")
+
+    def __init__(self, index: int, receipt_id: str) -> None:
+        self.index = index
+        self.receipt_id = receipt_id
+        self.receipt: LogDocument | None = None
+        """The receipt as appended; ``None`` if the position was taken back."""
+        self.error: BaseException | None = None
+        self._done = threading.Event()
+        self._wakeups: list[Callable[[], None]] = []
+
+    @property
+    def settled(self) -> bool:
+        return self._done.is_set()
+
+    def settle(
+        self, *, receipt: LogDocument | None = None, error: BaseException | None = None
+    ) -> None:
+        """Appended, failed, or taken back (neither). Log lock held."""
+        self.receipt, self.error = receipt, error
+        self._done.set()
+        for wake in self._wakeups:
+            wake()
+
+    def wait(self) -> None:
+        self._done.wait()
+
+    async def wait_async(self) -> None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+
+        def wake() -> None:
+            loop.call_soon_threadsafe(_resolve, future)
+
+        self._wakeups.append(wake)
+        if self._done.is_set():
+            return
+        await future
+
+
+def _resolve(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
+
+
 class ReceiptLog:
     """An append-only, witnessed log of signed receipts.
+
+    Issuing is pipelined: :meth:`issue` takes the next position under the
+    log's lock, signs outside it, and a sequencer appends signed receipts in
+    position order, as many at a time as are ready, with one write and one
+    fsync. So callers waiting on a slow key service sign concurrently, and
+    readers never wait on it. If the signature for a position fails, that
+    position and every later one held are taken back, and their callers sign
+    again for their new positions: every receipt signs its own position, and
+    the log has no gaps.
 
     :param log_id: The log's name, recorded in every receipt and checkpoint.
     :param signer: Signs the receipts :meth:`issue` places and every
@@ -126,13 +194,23 @@ class ReceiptLog:
         self._policy = policy if policy is not None else CheckpointPolicy()
         self._clock = clock if clock is not None else (lambda: datetime.now(UTC))
         self._fsync = fsync
+        # Lock order: _publish_lock, then _lock; never the reverse.
         self._lock = threading.RLock()
+        self._publish_lock = threading.Lock()
         self._tree = MerkleTree()
         self._receipts: list[LogDocument] = []
         self._index_of: dict[str, int] = {}
         self._checkpoints: list[Checkpoint] = []
+        self._next = 0  # the next position to hand out
+        self._held: dict[int, _Reservation] = {}  # positions handed out, not yet appended
+        self._held_ids: dict[str, int] = {}
+        self._signed: dict[int, tuple[_Reservation, LogDocument]] = {}  # waiting their turn
         self._pending = 0
         self._published_at = time.monotonic()
+        self._due = False
+        self._publisher: threading.Thread | None = None
+        self._wake = threading.Event()
+        self._stopping = False
         self._path = Path(path) if path is not None else None
         self._claim: _Claim | None = None
         if self._path is not None:
@@ -143,6 +221,7 @@ class ReceiptLog:
                 claim.release()
                 raise
             self._claim = claim
+        self._next = len(self._receipts)
 
     # -- reading ----------------------------------------------------------
 
@@ -205,53 +284,86 @@ class ReceiptLog:
     def issue(self, draft: D) -> D:
         """Place ``draft`` as the next leaf, sign it, and append it.
 
-        If the append makes a checkpoint due under the log's policy, the log
-        publishes one. A failure there (a witness refusing, or the checkpoint
-        not being written) is logged, not raised: the receipt is already
-        durable, so it is issued either way, and the next publish tries again.
+        The log's lock is held only to take a position and to append, never
+        while signing. If the append makes a checkpoint due, the log publishes
+        one, in the background or before returning (see
+        :class:`CheckpointPolicy`). A failure there (a witness refusing, the
+        checkpoint not being written or signed) is logged, not raised: the
+        receipt is already durable, so it is issued either way, and the next
+        publish tries again.
 
         :returns: The signed receipt, naming this log and its index.
         :raises ReceiptLogError: If a receipt with this id is already in the
-            log, the log is closed, or a delivery receipt names an action
-            receipt of this log that is not the one at the place it names.
+            log, or being issued, the log is closed, or a delivery receipt
+            names an action receipt of this log that is not the one at the
+            place it names.
+        :raises SignerUnavailableError: If the signer cannot sign it.
         """
-        with self._lock:
-            self._check_new(draft)
-            receipt = draft.with_log_anchor(self._log_id, len(self._receipts)).sign(self._signer)
-            self._check_binding(receipt)
-            self._append(receipt)
-            return receipt
+        while True:
+            reservation, unsigned, signer = self._reserve(draft)
+            try:
+                receipt = unsigned.sign(signer)
+            except BaseException:
+                self._abandon(reservation)
+                raise
+            self._deliver(reservation, receipt)
+            reservation.wait()
+            issued = self._outcome(reservation)
+            if issued is not None:
+                self._publish_if_due()
+                return issued  # type: ignore[return-value]
+
+    async def issue_async(self, draft: D) -> D:
+        """:meth:`issue` for a coroutine: the signer is awaited (an
+        :class:`~agentgov.receipts.signing.AsyncSigner`, or any signer on a
+        worker thread), and the log's lock and its writes run off the event
+        loop."""
+        while True:
+            reservation, unsigned, signer = await off_loop(self._reserve, draft)
+            try:
+                receipt = await unsigned.sign_async(as_async(signer))
+            except BaseException:
+                self._abandon(reservation)
+                raise
+            await off_loop(self._deliver, reservation, receipt)
+            await reservation.wait_async()
+            issued = self._outcome(reservation)
+            if issued is not None:
+                await off_loop(self._publish_if_due)
+                return issued  # type: ignore[return-value]
 
     def append(self, receipt: LogDocument) -> int:
         """Append a receipt someone else signed for this log's next index.
 
         :raises ReceiptLogError: If it is unsigned, names another log or
-            another index, or is already in the log.
+            another index, or is already in the log, or a receipt before it
+            fails to be issued (it signs its index, so it cannot move).
         """
         with self._lock:
-            self._check_position(receipt, len(self._receipts))
-            self._append(receipt)
-            return len(self._receipts) - 1
+            self._check_open()
+            self._check_position(receipt, self._next, staged={})
+            reservation = self._hold(receipt.receipt_id)
+        self._deliver(reservation, receipt)
+        reservation.wait()
+        if self._outcome(reservation) is None:
+            raise ReceiptLogError(
+                f"receipt {receipt.receipt_id} signs index {reservation.index}, and a receipt "
+                f"before it was not issued: sign it again for index {len(self)}"
+            )
+        self._publish_if_due()
+        return reservation.index
 
     def checkpoint(self) -> Checkpoint:
         """Sign and record a checkpoint of the log as it stands."""
-        with self._lock:
-            checkpoint = Checkpoint(
-                log_id=self._log_id,
-                tree_size=len(self._receipts),
-                root_hash=self._tree.root().hex(),
-                issued_at=self._clock(),
-            ).sign(self._signer)
-            if self._path is not None:
-                self._write(_checkpoint_path(self._path), canonical_bytes(checkpoint.to_json()))
-            self._checkpoints.append(checkpoint)
-            return checkpoint
+        with self._publish_lock:
+            return self._checkpoint()
 
     def publish(self) -> Checkpoint:
         """Checkpoint the log and have every witness cosign it.
 
         Every witness is asked, even after one refuses or cannot be reached,
-        so one witness never costs the log the others' cosignatures.
+        so one witness never costs the log the others' cosignatures. One
+        publication runs at a time; issuing goes on meanwhile.
 
         :raises WitnessError: If any witness refuses or fails, naming each.
             The checkpoint is still recorded: the log did sign it, and a
@@ -259,17 +371,18 @@ class ReceiptLog:
         :raises OSError: If the checkpoint itself cannot be written; nothing
             is recorded then, and the next publish tries again.
         """
-        with self._lock:
-            checkpoint = self.checkpoint()
-            self._pending = 0
-            self._published_at = time.monotonic()
+        with self._publish_lock:
+            checkpoint = self._checkpoint()
+            with self._lock:
+                self._pending = len(self._receipts) - checkpoint.tree_size
+                self._published_at = time.monotonic()
             refusals: list[str] = []
             for witness in self._witnesses:
                 try:
                     seen = witness.latest(self._log_id)
                     old_size = seen.tree_size if seen is not None else 0
                     proof = (
-                        self._tree.consistency_proof(old_size, checkpoint.tree_size)
+                        self.consistency_proof(old_size, checkpoint.tree_size)
                         if old_size <= checkpoint.tree_size
                         else []
                     )
@@ -282,6 +395,18 @@ class ReceiptLog:
                     f"{len(refusals)} of {len(self._witnesses)} witnesses; " + "; ".join(refusals)
                 )
             return checkpoint
+
+    def flush(self) -> None:
+        """Publish now any checkpoint the policy has made due, after one being
+        published in the background, if any, finishes.
+
+        :raises WitnessError: As :meth:`publish`.
+        """
+        with self._publish_lock:
+            with self._lock:
+                due, self._due = self._due, False
+        if due:
+            self.publish()
 
     def bundle(self, index: int, checkpoint: Checkpoint | None = None) -> ReceiptBundle:
         """The receipt at ``index`` with the proof that it is in the log.
@@ -301,8 +426,6 @@ class ReceiptLog:
                 checkpoint = next(
                     (c for c in reversed(self._checkpoints) if c.tree_size > index), None
                 )
-                if checkpoint is None:
-                    checkpoint = self.publish()
             elif (
                 checkpoint.log_id != self._log_id
                 or not index < checkpoint.tree_size <= len(self._receipts)
@@ -312,6 +435,9 @@ class ReceiptLog:
                     f"checkpoint {checkpoint.log_id}@{checkpoint.tree_size} is not a checkpoint "
                     f"of this log that covers receipt {index}"
                 )
+        if checkpoint is None:
+            checkpoint = self.publish()  # never under the log's lock: it signs
+        with self._lock:
             return ReceiptBundle(
                 receipt=self._receipts[index],
                 inclusion=self.inclusion_proof(index, checkpoint.tree_size),
@@ -319,7 +445,14 @@ class ReceiptLog:
             )
 
     def close(self) -> None:
-        """Release the claim on the log file. Idempotent."""
+        """Publish what is due, stop the publisher, and release the claim on
+        the log file. Idempotent."""
+        with self._lock:
+            self._stopping = True
+            publisher = self._publisher
+            self._wake.set()
+        if publisher is not None:
+            publisher.join()
         with self._lock:
             claim, self._claim = self._claim, None
         if claim is not None:
@@ -331,6 +464,171 @@ class ReceiptLog:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    # -- the sequencer ----------------------------------------------------
+
+    def _check_open(self) -> None:
+        if self._claim is None and self._path is not None:
+            raise ReceiptLogError(f"receipt log {self._path} is closed")
+
+    def _hold(self, receipt_id: str) -> _Reservation:
+        """Hand out the next position. Lock held."""
+        reservation = _Reservation(self._next, receipt_id)
+        self._next += 1
+        self._held[reservation.index] = reservation
+        self._held_ids[receipt_id] = reservation.index
+        return reservation
+
+    def _reserve(self, draft: D) -> tuple[_Reservation, D, Signer]:
+        with self._lock:
+            self._check_open()
+            self._check_new(draft)
+            # Placing it may refuse it (a delivery placed before its action):
+            # only a draft that takes the position holds it.
+            unsigned = draft.with_log_anchor(self._log_id, self._next)
+            return self._hold(draft.receipt_id), unsigned, self._signer
+
+    def _abandon(self, reservation: _Reservation) -> None:
+        """Signing failed: give the position back."""
+        with self._lock:
+            if not reservation.settled:
+                self._take_back(reservation)
+
+    def _deliver(self, reservation: _Reservation, receipt: LogDocument) -> None:
+        with self._lock:
+            if reservation.settled:  # taken back while it was being signed
+                return
+            self._signed[reservation.index] = (reservation, receipt)
+            self._drain()
+
+    @staticmethod
+    def _outcome(reservation: _Reservation) -> LogDocument | None:
+        """The appended receipt, ``None`` if its position was taken back, or
+        the error that kept it out."""
+        if reservation.error is not None:
+            raise reservation.error
+        return reservation.receipt
+
+    def _take_back(self, reservation: _Reservation, error: BaseException | None = None) -> None:
+        """Release ``reservation`` (with ``error``, for its caller) and take
+        back every later position, whose callers sign again. Lock held."""
+        for index in sorted(i for i in self._held if i >= reservation.index):
+            held = self._held.pop(index)
+            self._signed.pop(index, None)
+            self._held_ids.pop(held.receipt_id, None)
+            held.settle(error=error if held is reservation else None)
+        self._next = reservation.index
+
+    def _drain(self) -> None:
+        """Append every signed receipt whose turn has come, in order, with one
+        write. The first is always the caller's own. Lock held."""
+        start = len(self._receipts)
+        batch: list[tuple[_Reservation, LogDocument]] = []
+        staged: dict[int, LogDocument] = {}
+        refused: tuple[_Reservation, ReceiptLogError] | None = None
+        while start + len(batch) in self._signed:
+            reservation, receipt = self._signed[start + len(batch)]
+            try:
+                self._check_open()
+                self._check_binding(receipt, staged)
+            except ReceiptLogError as exc:
+                refused = (reservation, exc)
+                break
+            staged[reservation.index] = receipt
+            batch.append((reservation, receipt))
+        if batch:
+            try:
+                if self._path is not None:
+                    self._write_lines(self._path, [receipt.canonical() for _, receipt in batch])
+            except BaseException as exc:
+                # Nothing was written. The caller whose turn it was learns
+                # why; the others in the batch learn that it failed.
+                first = batch[0][0]
+                for reservation, _ in batch[1:]:
+                    self._held.pop(reservation.index, None)
+                    self._signed.pop(reservation.index, None)
+                    self._held_ids.pop(reservation.receipt_id, None)
+                    failed = ReceiptLogError(
+                        f"receipt {reservation.receipt_id} was not issued: the log could not "
+                        f"be written ({exc})"
+                    )
+                    failed.__cause__ = exc
+                    reservation.settle(error=failed)
+                self._take_back(first, exc)
+                return
+            for reservation, receipt in batch:
+                del self._signed[reservation.index]
+                del self._held[reservation.index]
+                self._held_ids.pop(reservation.receipt_id, None)
+                self._tree.append(receipt.leaf_hash())
+                self._index_of[receipt.receipt_id] = len(self._receipts)
+                self._receipts.append(receipt)
+                reservation.settle(receipt=receipt)
+            self._pending += len(batch)
+            self._note_due()
+        if refused is not None:
+            self._take_back(*refused)
+
+    # -- publishing -------------------------------------------------------
+
+    def _note_due(self) -> None:
+        """After an append: is a checkpoint due? Lock held."""
+        overdue = time.monotonic() - self._published_at >= self._policy.every_seconds
+        if not (self._pending >= self._policy.every_receipts or overdue):
+            return
+        self._due = True
+        if self._policy.background:
+            if self._publisher is None:
+                self._publisher = threading.Thread(
+                    target=self._run_publisher, name=f"receipt-log-{self._log_id}", daemon=True
+                )
+                self._publisher.start()
+            self._wake.set()
+
+    def _publish_if_due(self) -> None:
+        """Without a background publisher, the issue that made a checkpoint
+        due publishes it, outside the log's lock."""
+        if self._policy.background:
+            return
+        with self._lock:
+            due, self._due = self._due, False
+        if due:
+            self._publish_quietly()
+
+    def _run_publisher(self) -> None:
+        while True:
+            self._wake.wait()
+            with self._lock:
+                self._wake.clear()
+                stopping = self._stopping
+                due, self._due = self._due, False
+            if due:
+                self._publish_quietly()
+            if stopping:
+                return
+
+    def _publish_quietly(self) -> None:
+        try:
+            self.publish()
+        except (AgentGovError, OSError) as exc:
+            # The receipts are already durable; the next publish tries again.
+            logger.error("receipt log %r: automatic checkpoint failed: %s", self._log_id, exc)
+
+    def _checkpoint(self) -> Checkpoint:
+        """Sign and record a checkpoint at the current size. Publish lock held."""
+        with self._lock:
+            size = len(self._receipts)
+            root = self._tree.root(size).hex()
+            signer = self._signer
+            issued_at = self._clock()
+        checkpoint = Checkpoint(
+            log_id=self._log_id, tree_size=size, root_hash=root, issued_at=issued_at
+        ).sign(signer)
+        if self._path is not None:
+            self._write_lines(_checkpoint_path(self._path), [canonical_bytes(checkpoint.to_json())])
+        with self._lock:
+            self._checkpoints.append(checkpoint)
+        return checkpoint
+
     # -- internals --------------------------------------------------------
 
     def _check_new(self, receipt: LogDocument) -> None:
@@ -340,8 +638,16 @@ class ReceiptLog:
                 f"receipt {receipt.receipt_id} is already in log {self._log_id!r} at index "
                 f"{seen}; a receipt enters a log once"
             )
+        held = self._held_ids.get(receipt.receipt_id)
+        if held is not None:
+            raise ReceiptLogError(
+                f"receipt {receipt.receipt_id} is being issued in log {self._log_id!r} at index "
+                f"{held}; a receipt enters a log once"
+            )
 
-    def _check_position(self, receipt: LogDocument, index: int) -> None:
+    def _check_position(
+        self, receipt: LogDocument, index: int, staged: Mapping[int, LogDocument]
+    ) -> None:
         self._check_new(receipt)
         if receipt.signature is None:
             raise ReceiptLogError("an unsigned receipt cannot enter a log")
@@ -352,15 +658,18 @@ class ReceiptLog:
                 f"receipt {receipt.receipt_id} claims {claimed}; this is log "
                 f"{self._log_id!r} at index {index}"
             )
-        self._check_binding(receipt)
+        if index == len(self._receipts):
+            self._check_binding(receipt, staged)
 
-    def _check_binding(self, receipt: LogDocument) -> None:
+    def _check_binding(self, receipt: LogDocument, staged: Mapping[int, LogDocument]) -> None:
         """A delivery that names an action receipt of this log follows it,
         bound to its exact bytes."""
         if not isinstance(receipt, DeliveryReceipt) or receipt.action.log_id != self._log_id:
             return
         index = receipt.action.leaf_index
-        action = self._receipts[index] if index < len(self._receipts) else None
+        action = staged.get(index)
+        if action is None and index < len(self._receipts):
+            action = self._receipts[index]
         if not isinstance(action, ActionReceipt):
             raise ReceiptLogError(
                 f"delivery {receipt.receipt_id} follows from leaf {index} of log "
@@ -370,29 +679,11 @@ class ReceiptLog:
         if problem is not None:
             raise ReceiptLogError(f"delivery {receipt.receipt_id} does not bind: {problem}")
 
-    def _append(self, receipt: LogDocument) -> None:
-        if self._claim is None and self._path is not None:
-            raise ReceiptLogError(f"receipt log {self._path} is closed")
-        if self._path is not None:
-            self._write(self._path, receipt.canonical())
-        self._tree.append(receipt.leaf_hash())
-        self._index_of[receipt.receipt_id] = len(self._receipts)
-        self._receipts.append(receipt)
-        self._pending += 1
-        due = time.monotonic() - self._published_at >= self._policy.every_seconds
-        if self._pending >= self._policy.every_receipts or due:
-            try:
-                self.publish()
-            except (WitnessError, OSError) as exc:
-                # The receipt is already durable. Raising would tell the
-                # caller it was not issued. The next publish tries again.
-                logger.error("receipt log %r: automatic checkpoint failed: %s", self._log_id, exc)
-
-    def _write(self, path: Path, line: bytes) -> None:
+    def _write_lines(self, path: Path, lines: Sequence[bytes]) -> None:
         with path.open("ab") as handle:
             start = handle.tell()
             try:
-                handle.write(line + b"\n")
+                handle.write(b"".join(line + b"\n" for line in lines))
                 handle.flush()
                 if self._fsync:
                     os.fsync(handle.fileno())
@@ -408,7 +699,7 @@ class ReceiptLog:
                 receipt = document_from_json(loads_strict(line), f"{path}:{number}")
             except MalformedReceiptError as exc:
                 raise ReceiptLogError(f"{path} line {number} is not a receipt: {exc}") from exc
-            self._check_position(receipt, len(self._receipts))
+            self._check_position(receipt, len(self._receipts), staged={})
             self._tree.append(receipt.leaf_hash())
             self._index_of[receipt.receipt_id] = len(self._receipts)
             self._receipts.append(receipt)

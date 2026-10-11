@@ -225,7 +225,7 @@ def test_the_policy_publishes_after_every_n_receipts(tmp_path: Path) -> None:
         LOG_ID,
         LOG_KEY,
         witnesses=[witness],
-        policy=CheckpointPolicy(every_receipts=3, every_seconds=10**9),
+        policy=CheckpointPolicy(every_receipts=3, every_seconds=10**9, background=False),
         clock=Clock(),
     ) as receipt_log:
         for i in range(7):
@@ -240,7 +240,9 @@ def test_the_policy_publishes_when_a_receipt_arrives_late(
     now = [1000.0]
     monkeypatch.setattr("agentgov.receipts.log.time", SimpleNamespace(monotonic=lambda: now[0]))
     with ReceiptLog(
-        LOG_ID, LOG_KEY, policy=CheckpointPolicy(every_receipts=100, every_seconds=60)
+        LOG_ID,
+        LOG_KEY,
+        policy=CheckpointPolicy(every_receipts=100, every_seconds=60, background=False),
     ) as receipt_log:
         receipt_log.issue(draft(0))
         now[0] += 59
@@ -304,7 +306,7 @@ def test_bundle_refuses_a_checkpoint_that_is_not_this_logs(log: ReceiptLog) -> N
 
 def test_a_durable_log_resumes_exactly(tmp_path: Path) -> None:
     path = tmp_path / "receipts.jsonl"
-    policy = CheckpointPolicy(every_receipts=3, every_seconds=10**9)
+    policy = CheckpointPolicy(every_receipts=3, every_seconds=10**9, background=False)
     with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=policy, clock=Clock()) as first:
         issued = [first.issue(draft(i)) for i in range(4)]
         root, checkpoints = first.root(), first.checkpoints()
@@ -635,7 +637,7 @@ def test_a_failed_automatic_checkpoint_does_not_unissue_the_receipt(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = tmp_path / "receipts.jsonl"
-    every = CheckpointPolicy(every_receipts=1, every_seconds=10**9)
+    every = CheckpointPolicy(every_receipts=1, every_seconds=10**9, background=False)
     with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=every, clock=Clock()) as rlog:
         blocker = tmp_path / "receipts.jsonl.checkpoints"
         blocker.mkdir()  # the checkpoint cannot be written
@@ -659,7 +661,7 @@ def test_a_refused_automatic_publish_does_not_unissue_the_receipt(
         LOG_ID,
         LOG_KEY,
         witnesses=[stale],
-        policy=CheckpointPolicy(every_receipts=1, every_seconds=10**9),
+        policy=CheckpointPolicy(every_receipts=1, every_seconds=10**9, background=False),
     ) as rlog:
         with caplog.at_level(logging.ERROR, logger="agentgov.receipts"):
             receipt = rlog.issue(draft(0))

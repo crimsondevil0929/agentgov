@@ -37,7 +37,14 @@ from agentgov.receipts.canonical import (
     loads_strict,
 )
 from agentgov.receipts.merkle import leaf_hash
-from agentgov.receipts.signing import ALG_ED25519, ALG_HMAC_SHA256, Keyring, Signer, Verifier
+from agentgov.receipts.signing import (
+    ALG_ED25519,
+    ALG_HMAC_SHA256,
+    AsyncSigner,
+    Keyring,
+    Signer,
+    Verifier,
+)
 
 __all__ = [
     "ActionBinding",
@@ -836,6 +843,11 @@ class ActionReceipt:
 
     # -- signing ----------------------------------------------------------
 
+    async def sign_async(self, signer: AsyncSigner) -> ActionReceipt:
+        """:meth:`sign`, awaiting the signer."""
+        value = await signer.sign_async(self.signing_input(signer.alg, signer.key_id))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
+
     def sign(self, signer: Signer) -> ActionReceipt:
         """A copy signed by ``signer``."""
         value = signer.sign(self.signing_input(signer.alg, signer.key_id))
@@ -1268,6 +1280,11 @@ class DeliveryReceipt:
         return _signing_input(DELIVERY_DOMAIN, self.body(), alg, key_id)
 
     # -- signing ----------------------------------------------------------
+
+    async def sign_async(self, signer: AsyncSigner) -> DeliveryReceipt:
+        """:meth:`sign`, awaiting the signer."""
+        value = await signer.sign_async(self.signing_input(signer.alg, signer.key_id))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
 
     def sign(self, signer: Signer) -> DeliveryReceipt:
         value = signer.sign(self.signing_input(signer.alg, signer.key_id))

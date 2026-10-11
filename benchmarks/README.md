@@ -56,6 +56,21 @@ How to read it:
 - **File size.** 38% more per entry: the indexes that serve `find_entries()`
   and history by sequence without a scan, and AGOV3's fixed-point amounts.
 
+## Receipt issuance
+
+`bench_receipts.py` with a signer that takes 50 ms per signature, as a round
+trip to a KMS does, 128 receipts (`baseline/receipts-*.jsonl`):
+
+| | One caller | 16 callers |
+|---|---:|---:|
+| 0.4.0 | 18.6 /s | 18.4 /s |
+| 1.0 | 18.1 /s | 246.5 /s |
+
+0.4.0 signed while holding the log's lock, so callers queued behind one
+another. 1.0 takes a position under the lock, signs outside it, and appends
+in position order, so 16 callers overlap their signatures: 13.4 times
+0.4.0's rate, against the target of 10.
+
 ## Scale gates
 
 Measured the same way (`tests/test_scale.py` and the scripts above):
