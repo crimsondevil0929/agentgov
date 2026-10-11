@@ -43,6 +43,10 @@ sign = [
 # extra: the core package, and the SQLite store, keep zero runtime
 # dependencies.
 postgres = ["psycopg[binary]>=3.2"]
+# The AWS KMS signer (agentgov.receipts.kms_aws): an Ed25519 key that never
+# leaves the key service. botocore passes enum values through unchecked, so
+# any boto3 with KMS Sign serves; ED25519_SHA_512 itself is on AWS's side.
+kms-aws = ["boto3>=1.35"]
 
 [project.scripts]
 agentgov = "agentgov.cli:main"
@@ -112,6 +116,12 @@ strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 show_error_codes = true
+
+# boto3 is the kms-aws extra's, imported only when an AwsKmsSigner is built
+# without a client of its own.
+[[tool.mypy.overrides]]
+module = ["boto3", "boto3.*"]
+ignore_missing_imports = true
 
 # Explicitly tell the build system where the module is, 
 # overriding the PyPI package name auto-discovery.

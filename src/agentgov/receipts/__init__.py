@@ -31,6 +31,7 @@ against.
 from __future__ import annotations
 
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
+from agentgov.receipts.kms_aws import AwsKmsSigner
 from agentgov.receipts.log import CheckpointPolicy, ReceiptLog
 from agentgov.receipts.merkle import MerkleTree, verify_consistency, verify_inclusion
 from agentgov.receipts.rows import RowCommitment, commit_rows, verify_disclosure
@@ -92,6 +93,7 @@ __all__ = [
     "Attestation",
     "AttestedOutcome",
     "Authority",
+    "AwsKmsSigner",
     "Capability",
     "ChainAnchor",
     "Check",
