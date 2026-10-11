@@ -16,12 +16,18 @@ issue is refused, never logged twice.
 
 With a ``path``, the log is durable: receipts are appended one per line to a
 JSON-lines file and forced to stable storage before :meth:`issue` returns,
-and checkpoints go to ``<path>.checkpoints``. Reopening resumes the log,
-re-checking every receipt's position, every checkpoint's signature and root
-against the receipts, and the signature of every receipt the log signed since
-its last checkpoint; and it cuts off a final line torn by a crash mid-append.
-Every signature is checked under the log's keyring, never by the signer, so
-reopening a log whose key is held by a key service makes no calls to it.
+and checkpoints go to ``<path>.checkpoints``. An index of the file in SQLite,
+``<path>.index``, derived from it and rebuilt from it when needed, lets the
+log reopen in time that does not grow with it and hold none of its receipts
+in memory: reopening checks the newest checkpoint's signature, and its root
+against the index's tree; indexes, checks and verifies any receipts appended
+since the index last saw the file; re-verifies the receipts the log signed
+since its last checkpoint; and cuts off a final line torn by a crash
+mid-append. Each receipt read is checked against the leaf hash recorded for
+it. ``verify="full"`` rebuilds the index, re-checking every receipt and
+every checkpoint, as every reopen did before. Every signature is checked
+under the log's keyring, never by the signer, so reopening a log whose key is
+held by a key service makes no calls to it.
 
 A log outlives its key (ARC1 1.2). :meth:`ReceiptLog.rotate` has the outgoing
 key sign a :class:`~agentgov.receipts.schema.KeyTransition` to the incoming
@@ -35,7 +41,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -54,9 +59,18 @@ from agentgov.exceptions import (
     StorageError,
     WitnessError,
 )
+from agentgov.receipts._leaves import (
+    FileLeaves,
+    IndexWriteError,
+    MemoryLeaves,
+    complete_length,
+    count_lines,
+    last_line,
+    lines_from,
+    write_lines,
+)
 from agentgov.receipts._lines import read_complete_lines
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
-from agentgov.receipts.merkle import MerkleTree
 from agentgov.receipts.schema import (
     ActionReceipt,
     Checkpoint,
@@ -178,6 +192,10 @@ class ReceiptLog:
     :param signature_version: 2 signs digests (ARC1 1.2), so any receipt fits
         a key service's message limit; 1 signs as ARC1 1.0 and 1.1 do. The
         signer's own ``signature_version``, or 1, by default.
+    :param verify: What to check when a durable log reopens: ``"checkpoint"``
+        (the default) the newest checkpoint and what was appended since, in
+        time that does not grow with the log; ``"full"`` every receipt and
+        every checkpoint, rebuilding the index.
     :raises ReceiptLogError: If another process holds ``path``, the existing
         file does not check out, or the log's key in force (after its
         transitions) is not ``signer``'s.
@@ -195,11 +213,15 @@ class ReceiptLog:
         clock: Callable[[], datetime] | None = None,
         fsync: bool = True,
         signature_version: int | None = None,
+        verify: str = "checkpoint",
     ) -> None:
         try:
             self._log_id = _check_text(log_id, "log_id")
         except MalformedReceiptError as exc:
             raise ValueError(str(exc)) from exc
+        if verify not in ("checkpoint", "full"):
+            raise ValueError(f"verify must be 'checkpoint' or 'full', got {verify!r}")
+        self._verify = verify
         self._signer = signer
         self._signature_version = signature_version
         _signature_version(signer, signature_version)  # refuse a version that is no version
@@ -213,10 +235,10 @@ class ReceiptLog:
         self._lock = threading.RLock()
         self._turn = threading.Condition(self._lock)  # positions handed back, rotations ended
         self._publish_lock = threading.Lock()
-        self._tree = MerkleTree()
-        self._receipts: list[LogDocument] = []
-        self._index_of: dict[str, int] = {}
-        self._checkpoints: list[Checkpoint] = []
+        self._leaves: MemoryLeaves | FileLeaves = MemoryLeaves()
+        self._latest: Checkpoint | None = None  # the newest checkpoint, always known
+        self._checkpoint_list: list[Checkpoint] | None = []  # all of them, read when asked for
+        self._broken: BaseException | None = None
         self._transitions: list[KeyTransition] = []
         self._schedule: KeySchedule | None = None
         self._rotating = False
@@ -235,12 +257,16 @@ class ReceiptLog:
         if self._path is not None:
             claim = _Claim(self._path)
             try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._leaves = FileLeaves(self._path, fsync=fsync)
+                self._checkpoint_list = None
                 self._resume(self._path)
             except BaseException:
+                self._leaves.close()
                 claim.release()
                 raise
             self._claim = claim
-        self._next = len(self._receipts)
+        self._next = len(self._leaves)
         if (
             self._schedule is not None
             and verifier_of(signer).key_id != self._schedule.current.key_id
@@ -278,47 +304,65 @@ class ReceiptLog:
 
     def __len__(self) -> int:
         with self._lock:
-            return len(self._receipts)
+            return len(self._leaves)
 
     def receipt(self, index: int) -> LogDocument:
+        """The receipt at ``index`` (negative counts from the end).
+
+        :raises IndexError: If there is none.
+        """
         with self._lock:
-            return self._receipts[index]
+            self._check_readable()
+            if index < 0:
+                index += len(self._leaves)
+            if not 0 <= index < len(self._leaves):
+                raise IndexError(f"the log has no receipt {index}")
+            return self._leaves.get(index)
 
     def receipts(self) -> tuple[LogDocument, ...]:
         """Every leaf, in order: action receipts and delivery receipts."""
         with self._lock:
-            return tuple(self._receipts)
+            self._check_readable()
+            return self._leaves.all()
 
     def deliveries(self) -> tuple[DeliveryReceipt, ...]:
         """The delivery receipts alone, in order."""
         with self._lock:
-            return tuple(r for r in self._receipts if isinstance(r, DeliveryReceipt))
+            self._check_readable()
+            return tuple(r for r in self._leaves.all() if isinstance(r, DeliveryReceipt))
 
     def index_of(self, receipt_id: str) -> int | None:
         """The position of the receipt with this id, or ``None``."""
         with self._lock:
-            return self._index_of.get(receipt_id)
+            self._check_readable()
+            return self._leaves.index_of(receipt_id)
 
     def checkpoints(self) -> tuple[Checkpoint, ...]:
+        """Every checkpoint the log has signed, oldest first. A durable log
+        reads and checks them the first time they are asked for."""
         with self._lock:
-            return tuple(self._checkpoints)
+            self._check_readable()
+            return tuple(self._all_checkpoints())
 
     def root(self, size: int | None = None) -> str:
         """The hex root of the first ``size`` receipts (all by default)."""
         with self._lock:
-            return self._tree.root(size).hex()
+            self._check_readable()
+            return self._leaves.tree.root(size).hex()
 
     def inclusion_proof(self, index: int, size: int | None = None) -> InclusionProof:
         with self._lock:
-            n = len(self._receipts) if size is None else size
-            path = self._tree.inclusion_proof(index, n)
+            self._check_readable()
+            n = len(self._leaves) if size is None else size
+            path = self._leaves.tree.inclusion_proof(index, n)
             return InclusionProof(
                 leaf_index=index, tree_size=n, audit_path=tuple(p.hex() for p in path)
             )
 
     def consistency_proof(self, old_size: int, new_size: int | None = None) -> list[bytes]:
         with self._lock:
-            return self._tree.consistency_proof(old_size, new_size)
+            self._check_readable()
+            return self._leaves.tree.consistency_proof(old_size, new_size)
 
     # -- writing ----------------------------------------------------------
 
@@ -383,7 +427,9 @@ class ReceiptLog:
         """
         with self._lock:
             self._check_open()
-            self._check_position(receipt, self._next, staged={})
+            self._check_position(
+                receipt, self._next, staged={}, bind=self._next == len(self._leaves)
+            )
             reservation = self._hold(receipt.receipt_id)
         self._deliver(reservation, receipt)
         reservation.wait()
@@ -416,7 +462,7 @@ class ReceiptLog:
         with self._publish_lock:
             checkpoint = self._checkpoint()
             with self._lock:
-                self._pending = len(self._receipts) - checkpoint.tree_size
+                self._pending = len(self._leaves) - checkpoint.tree_size
                 self._published_at = time.monotonic()
             refusals: list[str] = []
             for witness in self._witnesses:
@@ -478,8 +524,8 @@ class ReceiptLog:
             try:
                 with self._lock:
                     outgoing = self._signer
-                    size = len(self._receipts)
-                    sealed = bool(self._checkpoints) and self._checkpoints[-1].tree_size == size
+                    size = len(self._leaves)
+                    sealed = self._latest is not None and self._latest.tree_size == size
                 if not sealed:
                     self._checkpoint()  # the outgoing key vouches for all it signed
                 transition = KeyTransition.of(self._log_id, size, incoming, self._clock()).sign(
@@ -512,16 +558,16 @@ class ReceiptLog:
             witness refused it.
         """
         with self._lock:
-            if not 0 <= index < len(self._receipts):
+            self._check_readable()
+            if not 0 <= index < len(self._leaves):
                 raise IndexError(f"the log has no receipt {index}")
             if checkpoint is None:
-                checkpoint = next(
-                    (c for c in reversed(self._checkpoints) if c.tree_size > index), None
-                )
+                latest = self._latest
+                checkpoint = latest if latest is not None and latest.tree_size > index else None
             elif (
                 checkpoint.log_id != self._log_id
-                or not index < checkpoint.tree_size <= len(self._receipts)
-                or checkpoint.root_hash != self._tree.root(checkpoint.tree_size).hex()
+                or not index < checkpoint.tree_size <= len(self._leaves)
+                or checkpoint.root_hash != self._leaves.tree.root(checkpoint.tree_size).hex()
             ):
                 raise ReceiptLogError(
                     f"checkpoint {checkpoint.log_id}@{checkpoint.tree_size} is not a checkpoint "
@@ -531,7 +577,7 @@ class ReceiptLog:
             checkpoint = self.publish()  # never under the log's lock: it signs
         with self._lock:
             return ReceiptBundle(
-                receipt=self._receipts[index],
+                receipt=self._leaves.get(index),
                 inclusion=self.inclusion_proof(index, checkpoint.tree_size),
                 checkpoint=checkpoint,
             )
@@ -547,6 +593,8 @@ class ReceiptLog:
             publisher.join()
         with self._lock:
             claim, self._claim = self._claim, None
+            if claim is not None:
+                self._leaves.close()
         if claim is not None:
             claim.release()
 
@@ -558,9 +606,20 @@ class ReceiptLog:
 
     # -- the sequencer ----------------------------------------------------
 
+    def _check_readable(self) -> None:
+        """A durable log reads its file, so a closed one refuses, as a closed
+        file does. Lock held."""
+        if self._claim is None and self._path is not None:
+            raise ReceiptLogError(f"receipt log {self._path} is closed")
+
     def _check_open(self) -> None:
         if self._claim is None and self._path is not None:
             raise ReceiptLogError(f"receipt log {self._path} is closed")
+        if self._broken is not None:
+            raise ReceiptLogError(
+                f"receipt log {self._path} could not index receipts it appended "
+                f"({self._broken}); reopen it, which indexes them from the file"
+            )
 
     def _hold(self, receipt_id: str) -> _Reservation:
         """Hand out the next position. Lock held."""
@@ -616,7 +675,7 @@ class ReceiptLog:
     def _drain(self) -> None:
         """Append every signed receipt whose turn has come, in order, with one
         write. The first is always the caller's own. Lock held."""
-        start = len(self._receipts)
+        start = len(self._leaves)
         batch: list[tuple[_Reservation, LogDocument]] = []
         staged: dict[int, LogDocument] = {}
         refused: tuple[_Reservation, ReceiptLogError] | None = None
@@ -632,8 +691,12 @@ class ReceiptLog:
             batch.append((reservation, receipt))
         if batch:
             try:
-                if self._path is not None:
-                    self._write_lines(self._path, [receipt.canonical() for _, receipt in batch])
+                self._leaves.extend([receipt for _, receipt in batch])
+            except IndexWriteError as exc:
+                # Durable in the file, which is the log: issued. The index
+                # lags, so nothing more is appended until a reopen catches up.
+                self._broken = exc
+                logger.error("receipt log %r: %s", self._log_id, exc)
             except BaseException as exc:
                 # Nothing was written. The caller whose turn it was learns
                 # why; the others in the batch learn that it failed.
@@ -654,9 +717,6 @@ class ReceiptLog:
                 del self._signed[reservation.index]
                 del self._held[reservation.index]
                 self._held_ids.pop(reservation.receipt_id, None)
-                self._tree.append(receipt.leaf_hash())
-                self._index_of[receipt.receipt_id] = len(self._receipts)
-                self._receipts.append(receipt)
                 reservation.settle(receipt=receipt)
             self._pending += len(batch)
             self._note_due()
@@ -712,18 +772,18 @@ class ReceiptLog:
     def _checkpoint(self) -> Checkpoint:
         """Sign and record a checkpoint at the current size. Publish lock held."""
         with self._lock:
-            size = len(self._receipts)
+            size = len(self._leaves)
             if self._schedule is not None and size <= self._schedule.boundary:
                 # Nothing new since the hand-over: the outgoing key's last
                 # checkpoint is the log's latest word at this size.
-                last = self._checkpoints[-1] if self._checkpoints else None
+                last = self._latest
                 if last is None or last.tree_size != size:
                     raise ReceiptLogError(
                         f"log {self._log_id!r} changed keys at size {self._schedule.boundary} "
                         f"and has no checkpoint there to stand on"
                     )
                 return last
-            root = self._tree.root(size).hex()
+            root = self._leaves.tree.root(size).hex()
             signer = self._signer
             issued_at = self._clock()
         checkpoint = Checkpoint(
@@ -732,7 +792,45 @@ class ReceiptLog:
         if self._path is not None:
             self._write_lines(_checkpoint_path(self._path), [canonical_bytes(checkpoint.to_json())])
         with self._lock:
-            self._checkpoints.append(checkpoint)
+            self._latest = checkpoint
+            if self._checkpoint_list is not None:
+                self._checkpoint_list.append(checkpoint)
+        return checkpoint
+
+    def _all_checkpoints(self) -> list[Checkpoint]:
+        """Every checkpoint, read and checked from the file the first time.
+        Lock held."""
+        if self._checkpoint_list is None:
+            assert self._path is not None
+            self._checkpoint_list = [
+                self._checked_checkpoint(line, number)
+                for number, line in enumerate(
+                    read_complete_lines(_checkpoint_path(self._path)), start=1
+                )
+            ]
+        return self._checkpoint_list
+
+    def _checked_checkpoint(self, line: bytes, number: int) -> Checkpoint:
+        """A checkpoint line, checked: signed by the key in force at its size,
+        this log's, and the root of the receipts up to it. Lock held."""
+        path = self._path
+        try:
+            checkpoint = Checkpoint.from_json(loads_strict(line), f"checkpoint {number}")
+            if self._schedule is not None:
+                checkpoint.verify(self._schedule.for_checkpoint(checkpoint.tree_size))
+            else:
+                checkpoint.verify(self._keyring)
+        except (MalformedReceiptError, ReceiptSignatureError) as exc:
+            raise ReceiptLogError(f"{path}.checkpoints line {number}: {exc}") from exc
+        if (
+            checkpoint.log_id != self._log_id
+            or checkpoint.tree_size > len(self._leaves)
+            or checkpoint.root_hash != self._leaves.tree.root(checkpoint.tree_size).hex()
+        ):
+            raise ReceiptLogError(
+                f"checkpoint {number} ({checkpoint.log_id}@{checkpoint.tree_size}) does not "
+                f"match the receipts in {path}: the log was edited"
+            )
         return checkpoint
 
     # -- internals --------------------------------------------------------
@@ -745,7 +843,7 @@ class ReceiptLog:
         return self._schedule.current if self._schedule is not None else verifier_of(self._signer)
 
     def _check_new(self, receipt: LogDocument) -> None:
-        seen = self._index_of.get(receipt.receipt_id)
+        seen = self._leaves.index_of(receipt.receipt_id)
         if seen is not None:
             raise ReceiptLogError(
                 f"receipt {receipt.receipt_id} is already in log {self._log_id!r} at index "
@@ -759,7 +857,12 @@ class ReceiptLog:
             )
 
     def _check_position(
-        self, receipt: LogDocument, index: int, staged: Mapping[int, LogDocument]
+        self,
+        receipt: LogDocument,
+        index: int,
+        staged: Mapping[int, LogDocument],
+        *,
+        bind: bool = True,
     ) -> None:
         self._check_new(receipt)
         if receipt.signature is None:
@@ -771,7 +874,7 @@ class ReceiptLog:
                 f"receipt {receipt.receipt_id} claims {claimed}; this is log "
                 f"{self._log_id!r} at index {index}"
             )
-        if index == len(self._receipts):
+        if bind:
             self._check_binding(receipt, staged)
 
     def _check_binding(self, receipt: LogDocument, staged: Mapping[int, LogDocument]) -> None:
@@ -781,8 +884,8 @@ class ReceiptLog:
             return
         index = receipt.action.leaf_index
         action = staged.get(index)
-        if action is None and index < len(self._receipts):
-            action = self._receipts[index]
+        if action is None and index < len(self._leaves):
+            action = self._leaves.get(index)
         if not isinstance(action, ActionReceipt):
             raise ReceiptLogError(
                 f"delivery {receipt.receipt_id} follows from leaf {index} of log "
@@ -793,20 +896,10 @@ class ReceiptLog:
             raise ReceiptLogError(f"delivery {receipt.receipt_id} does not bind: {problem}")
 
     def _write_lines(self, path: Path, lines: Sequence[bytes]) -> None:
-        with path.open("ab") as handle:
-            start = handle.tell()
-            try:
-                handle.write(b"".join(line + b"\n" for line in lines))
-                handle.flush()
-                if self._fsync:
-                    os.fsync(handle.fileno())
-            except BaseException:
-                # Never leave a torn line for the next append to follow.
-                handle.truncate(start)
-                raise
+        write_lines(path, lines, fsync=self._fsync)
 
     def _resume(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        """Pick up a durable log where it was left. Constructor only."""
         for number, line in enumerate(
             read_complete_lines(_transitions_path(path), repair=True), start=1
         ):
@@ -822,48 +915,39 @@ class ReceiptLog:
                 raise ReceiptLogError(f"{path}.transitions: {exc}") from exc
             for handed_to in self._schedule.keyring():
                 self._keyring.add(handed_to)
-        for number, line in enumerate(read_complete_lines(path, repair=True), start=1):
-            try:
-                receipt = document_from_json(loads_strict(line), f"{path}:{number}")
-            except MalformedReceiptError as exc:
-                raise ReceiptLogError(f"{path} line {number} is not a receipt: {exc}") from exc
-            self._check_position(receipt, len(self._receipts), staged={})
-            self._tree.append(receipt.leaf_hash())
-            self._index_of[receipt.receipt_id] = len(self._receipts)
-            self._receipts.append(receipt)
-        for number, line in enumerate(
-            read_complete_lines(_checkpoint_path(path), repair=True), start=1
-        ):
-            try:
-                checkpoint = Checkpoint.from_json(loads_strict(line), f"checkpoint {number}")
-                if self._schedule is not None:
-                    checkpoint.verify(self._schedule.for_checkpoint(checkpoint.tree_size))
-                else:
-                    checkpoint.verify(self._keyring)
-            except (MalformedReceiptError, ReceiptSignatureError) as exc:
-                raise ReceiptLogError(f"{path}.checkpoints line {number}: {exc}") from exc
-            if (
-                checkpoint.log_id != self._log_id
-                or checkpoint.tree_size > len(self._receipts)
-                or checkpoint.root_hash != self._tree.root(checkpoint.tree_size).hex()
-            ):
-                raise ReceiptLogError(
-                    f"checkpoint {number} ({checkpoint.log_id}@{checkpoint.tree_size}) does not "
-                    f"match the receipts in {path}: the log was edited"
-                )
-            self._checkpoints.append(checkpoint)
-        if self._schedule is not None and self._transitions[-1].tree_size > len(self._receipts):
+
+        leaves = self._leaves
+        assert isinstance(leaves, FileLeaves)
+        size = complete_length(path, repair=True)
+        if self._verify == "full" or not leaves.trustworthy(size):
+            leaves.reset()
+        self._index_appended(path, leaves, size)
+
+        checkpoints = _checkpoint_path(path)
+        if self._verify == "full":
+            complete_length(checkpoints, repair=True)
+            found = self._all_checkpoints()
+            self._latest = found[-1] if found else None
+        else:
+            end = complete_length(checkpoints, repair=True)
+            newest = last_line(checkpoints, end)
+            if newest is None:
+                self._checkpoint_list = []  # none yet: every later one is appended here
+            else:
+                self._latest = self._checked_checkpoint(newest, count_lines(checkpoints, end))
+        count = len(leaves)
+        if self._schedule is not None and self._transitions[-1].tree_size > count:
             raise ReceiptLogError(
                 f"{path}.transitions hands the log over at size "
-                f"{self._transitions[-1].tree_size}, beyond its {len(self._receipts)} receipts: "
+                f"{self._transitions[-1].tree_size}, beyond its {count} receipts: "
                 f"the log was edited"
             )
-        covered = self._checkpoints[-1].tree_size if self._checkpoints else 0
+        covered = self._latest.tree_size if self._latest is not None else 0
         # A signed root vouches for every receipt it covers. The ones after
         # it are vouched for only by their own signatures, so check the ones
         # this log signed before a checkpoint can sign over an edited one.
-        for index in range(covered, len(self._receipts)):
-            receipt = self._receipts[index]
+        for index in range(covered, count):
+            receipt = leaves.get(index)
             if receipt.signature is not None and receipt.signature.key_id in self._keyring:
                 key: Verifier | Keyring = (
                     self._schedule.for_leaf(index) if self._schedule is not None else self._keyring
@@ -874,7 +958,36 @@ class ReceiptLog:
                     raise ReceiptLogError(
                         f"{path} line {index + 1}: {exc}; the log was edited"
                     ) from exc
-        self._pending = len(self._receipts) - covered
+        self._pending = count - covered
+
+    def _index_appended(self, path: Path, leaves: FileLeaves, size: int) -> None:
+        """Check and index the receipts in the file after what the index
+        holds: all of them, when it was rebuilt. Constructor only."""
+        staged: dict[int, LogDocument] = {}
+        ids: dict[str, int] = {}
+        found: list[tuple[int, bytes, LogDocument]] = []
+        index = len(leaves)
+        for offset, line in lines_from(path, leaves.end, size):
+            number = index + 1
+            try:
+                receipt = document_from_json(loads_strict(line), f"{path}:{number}")
+            except MalformedReceiptError as exc:
+                raise ReceiptLogError(f"{path} line {number} is not a receipt: {exc}") from exc
+            seen = ids.get(receipt.receipt_id)
+            if seen is not None:
+                raise ReceiptLogError(
+                    f"receipt {receipt.receipt_id} is already in log {self._log_id!r} at index "
+                    f"{seen}; a receipt enters a log once"
+                )
+            self._check_position(receipt, index, staged=staged)
+            staged[index] = receipt
+            ids[receipt.receipt_id] = index
+            found.append((offset, line, receipt))
+            index += 1
+            if len(found) >= 4096:
+                leaves.adopt(found, last=False)
+                found, staged, ids = [], {}, {}
+        leaves.adopt(found, last=True)
 
 
 def _checkpoint_path(path: Path) -> Path:

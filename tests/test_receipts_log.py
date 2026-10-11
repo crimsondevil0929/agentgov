@@ -382,7 +382,7 @@ def test_a_failed_write_leaves_no_torn_line(
     def failing_fsync(fd: int) -> None:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr("agentgov.receipts.log.os.fsync", failing_fsync)
+    monkeypatch.setattr("agentgov.receipts._leaves.os.fsync", failing_fsync)
     with pytest.raises(OSError, match="No space"):
         receipt_log.issue(draft(1))
     assert path.read_bytes() == intact and len(receipt_log) == 1

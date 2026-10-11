@@ -233,7 +233,7 @@ def test_appended_receipts_share_one_write(tmp_path: Path, monkeypatch: pytest.M
         syncs.append(fd)
         real(fd)
 
-    monkeypatch.setattr("agentgov.receipts.log.os.fsync", counting)
+    monkeypatch.setattr("agentgov.receipts._leaves.os.fsync", counting)
     signer = GatedSigner()
     with ReceiptLog(LOG_ID, signer, path=tmp_path / "r.jsonl", policy=NEVER) as log:
         entered, release = signer.hold(draft(0).receipt_id)
@@ -263,7 +263,7 @@ def test_a_failed_write_fails_every_receipt_it_carried(
     def failing(fd: int) -> None:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr("agentgov.receipts.log.os.fsync", failing)
+    monkeypatch.setattr("agentgov.receipts._leaves.os.fsync", failing)
     release.set()
     own, carried = first.outcome(), second.outcome()
     assert isinstance(own, OSError) and "No space" in str(own)
@@ -344,9 +344,12 @@ def test_closing_a_log_publishes_what_is_due(tmp_path: Path) -> None:
     for n in range(4):
         log.issue(draft(n))
     log.close()
-    assert log.checkpoints()[-1].tree_size == 4
-    assert load_cosignatures(tmp_path / "w.jsonl")[-1].tree_size == 4
     log.close()  # idempotent
+    assert load_cosignatures(tmp_path / "w.jsonl")[-1].tree_size == 4
+    with pytest.raises(ReceiptLogError, match="is closed"):
+        log.checkpoints()  # a closed durable log reads nothing, as a closed file does
+    with ReceiptLog(LOG_ID, KEY, path=tmp_path / "r.jsonl", policy=every_two) as reopened:
+        assert reopened.checkpoints()[-1].tree_size == 4
 
 
 def test_flush_publishes_a_due_checkpoint_now() -> None:
