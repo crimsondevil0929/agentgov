@@ -143,7 +143,11 @@
     "tests/test_postgres_store.py",
     "tests/test_postgres_joined.py",
     "tests/test_fleet_concurrency.py",
-    "tests/test_model.py"
+    "tests/test_model.py",
+    "tests/test_checkpoints.py",
+    "tests/test_audit.py",
+    "tests/test_ledger_format.py",
+    "tests/test_upgrades.py"
   ],
   "env": {
     "AGENTGOV_MODEL_EXAMPLES": "120",

@@ -453,6 +453,7 @@ def main() -> None:
     parser.add_argument("spec", help="the JSON spec: targets, tests, env, equivalent")
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     parser.add_argument("--only", default="", help="run only mutants whose id contains this")
+    parser.add_argument("--ids", default="", help="run only the mutants listed in this file")
     parser.add_argument("--list", action="store_true", help="list the mutants and stop")
     parser.add_argument("--out", default="", help="write the JSON report here")
     args = parser.parse_args()
@@ -467,8 +468,13 @@ def main() -> None:
     for target in targets:
         path, _, qualname = target.partition("::")
         mutants.extend(generate(path, qualname))
+    # A justification is stale when no mutant has its id any more, whichever run.
+    stale = set(equivalent) - {m.mutant_id for m in mutants}
     if args.only:
         mutants = [m for m in mutants if args.only in m.mutant_id]
+    if args.ids:
+        wanted = set(Path(args.ids).read_text(encoding="utf-8").split("\n")) - {""}
+        mutants = [m for m in mutants if m.mutant_id in wanted]
     if args.list:
         for mutant in mutants:
             print(f"{mutant.path}:{mutant.line}  {mutant.mutant_id}")
@@ -483,13 +489,11 @@ def main() -> None:
         file=sys.stderr,
     )
     report = Report(spec=args.spec, targets=targets, tests=tests)
-    stale = set(equivalent)
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=args.jobs, initializer=_init_worker, initargs=(tests, env, timeout)
     ) as pool:
         for done, result in enumerate(pool.map(_run, mutants), start=1):
             if result.mutant_id in equivalent:
-                stale.discard(result.mutant_id)
                 if result.status == "survived":
                     result.status = "equivalent"
                     result.justification = equivalent[result.mutant_id]
@@ -520,7 +524,6 @@ def main() -> None:
                 if result.mutant_id in equivalent:
                     result.status = "equivalent"
                     result.justification = equivalent[result.mutant_id]
-                    stale.discard(result.mutant_id)
 
     counts = report.counts()
     print(json.dumps(counts, sort_keys=True), file=sys.stderr)
