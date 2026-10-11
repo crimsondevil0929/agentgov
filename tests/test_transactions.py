@@ -425,7 +425,7 @@ def test_callers_sharing_a_unit_of_work_share_a_key(
     fleet: Backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     gov = fleet.seeded()
-    with gov.ledger.lock:
+    with gov._lock:
         runs = [
             _Run(functools.partial(gov.authorize, "a", money("3"), idempotency_key="req-1"))
             for _ in range(3)

@@ -78,7 +78,7 @@ def _sessions(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 def _queued(gov: BudgetManager, calls: list[Callable[[], object]]) -> list[Run]:
     """Start ``calls`` while this thread holds the governor's lock, so they
     queue up, and let them go together: one unit of work runs them all."""
-    with gov.ledger.lock:
+    with gov._lock:
         runs = [Run(call) for call in calls]
         deadline = time.monotonic() + 10
         while len(gov._queue) < len(calls):
@@ -168,8 +168,11 @@ def test_a_commit_that_fails_fails_every_mutation_it_carried(
 
 def test_a_caller_holding_the_lock_runs_alone(gov: BudgetManager) -> None:
     """A check and the act it decides, under ``ledger.lock``: work queued by
-    other callers meanwhile runs after, never between them."""
-    with gov.ledger.lock:
+    other callers meanwhile runs after, never between them. Deprecated for
+    transaction(), which is atomic across a fleet too, and still served."""
+    with pytest.warns(DeprecationWarning, match="Ledger.lock is deprecated"):
+        lock = gov.ledger.lock
+    with lock:
         other = Run(lambda: gov.spend("a", money("5")))
         deadline = time.monotonic() + 10
         while not gov._queue:

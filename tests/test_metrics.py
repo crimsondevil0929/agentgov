@@ -71,7 +71,7 @@ def test_a_sqlite_governor_reports_its_work(tmp_path: Path) -> None:
         assert len(metrics.seen["agentgov.verify.duration"]) == 1
         # Callers that arrive together share a unit of work, and say how many.
         gov.delegate("root", "b", money("4"))
-        with gov.ledger.lock:
+        with gov._lock:
             runs = [
                 threading.Thread(target=functools.partial(gov.authorize, "b", money("0.1")))
                 for _ in range(3)

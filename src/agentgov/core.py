@@ -2863,10 +2863,19 @@ class Ledger:
     def lock(self) -> threading.RLock:
         """The mutex guarding all ledger state.
 
-        Exposed so a :class:`BudgetManager` can make a check-then-post
-        sequence atomic without introducing a second lock (and with it, a
-        lock-ordering hazard).
+        .. deprecated:: 1.0
+           Holding it around a check and the act it decides is atomic in this
+           process only, not across a fleet. Use
+           :meth:`BudgetManager.transaction` (current reads, one commit,
+           atomic everywhere) or :meth:`BudgetManager.try_authorize` (a hold
+           only if the scope can pay). It keeps working, warning, through 1.x.
         """
+        warnings.warn(
+            "Ledger.lock is deprecated: use BudgetManager.transaction(), or try_authorize(), "
+            "which are atomic across a fleet as well as within this process",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._lock
 
     @property
@@ -2998,38 +3007,6 @@ class Ledger:
             return tuple(self._state.holds.values())
 
     # -- writing ----------------------------------------------------------
-
-    def post(
-        self,
-        lines: Sequence[LedgerLine],
-        *,
-        transaction_id: uuid.UUID | None = None,
-    ) -> tuple[LedgerEntry, ...]:
-        """Atomically commit ``lines`` as one transaction.
-
-        .. deprecated:: 1.0
-           Write through :class:`BudgetManager`, whose operations check a
-           scope's funds and breaker before they write. This method checks
-           every rule a replay enforces, so it can no longer commit anything
-           a later open would refuse, but it bypasses the governor: it is
-           removed in 1.0.
-
-        :param lines: One or more legs to commit together.
-        :param transaction_id: Optional caller-supplied transaction id;
-            generated when omitted.
-        :returns: The committed entries, in the order given.
-        :raises ValueError: If ``lines`` is empty, an amount is non-positive
-            or out of range, or a ``(entry_type, direction)`` pair is illegal.
-        :raises LedgerIntegrityError: If the lines break any rule of the
-            ledger or of the delegation tree.
-        """
-        warnings.warn(
-            "Ledger.post() bypasses the governor and is removed in agentgov 1.0; "
-            "write through BudgetManager instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._post(lines, transaction_id=transaction_id)
 
     def _post(
         self,
@@ -3910,7 +3887,7 @@ class BudgetManager:
         # One mutex for the whole control plane. Sharing the ledger's lock
         # (rather than nesting a second one under it) removes any possibility
         # of a lock-ordering deadlock.
-        self._lock = self._ledger.lock
+        self._lock = self._ledger._lock
         self._store: PersistenceStore | None = store
         self._shared: SharedStore | None = shared
         # A single-writer store that can carry many commits in one

@@ -31,14 +31,12 @@ from decimal import Decimal
 __all__ = [
     "AgentGovError",
     "AgentThrashingError",
-    "AgentThrashingException",
     "BudgetError",
     "BudgetExceededError",
     "CircuitBreakerError",
     "CircuitOpenError",
     "ConcurrentGovernorError",
     "DenialOfWalletError",
-    "DenialOfWalletException",
     "DoubleSpendError",
     "DuplicateScopeError",
     "IdempotencyConflictError",
@@ -171,11 +169,6 @@ class DenialOfWalletError(BudgetExceededError):
             f"Denial-of-wallet backstop tripped for scope {scope_id!r} ({verb}): "
             f"requested {requested}, available {available}",
         )
-
-
-DenialOfWalletException = DenialOfWalletError
-"""Alias for :class:`DenialOfWalletError`, for callers who prefer the
-``Exception`` suffix. Both names refer to the same class."""
 
 
 class SubBudgetAllocationError(BudgetError):
@@ -415,11 +408,6 @@ class AgentThrashingError(CircuitOpenError):
         CircuitBreakerError.__init__(self, message)
 
 
-AgentThrashingException = AgentThrashingError
-"""Alias for :class:`AgentThrashingError`, for callers who prefer the
-``Exception`` suffix. Both names refer to the same class."""
-
-
 class RunawayLoopDetectedError(CircuitBreakerError):
     """Raised when the breaker detects a denial-of-wallet loop pattern.
 
@@ -610,3 +598,26 @@ class SignerUnavailableError(ReceiptError):
     Ed25519 signing uses the ``cryptography`` package: install it with
     ``pip install 'agentgov[sign]'``. Verification never needs it.
     """
+
+
+_ALIASES: dict[str, type[AgentGovError]] = {
+    "AgentThrashingException": AgentThrashingError,
+    "DenialOfWalletException": DenialOfWalletError,
+}
+
+
+def __getattr__(name: str) -> type[AgentGovError]:
+    """The ``*Exception`` aliases: the same classes as their ``*Error``
+    names, deprecated, and removed in 2.0."""
+    target = _ALIASES.get(name)
+    if target is None:
+        raise AttributeError(f"module 'agentgov.exceptions' has no attribute {name!r}")
+    import warnings
+
+    warnings.warn(
+        f"{name} is deprecated and is removed in 2.0: catch {target.__name__}, which it has "
+        f"always been",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return target

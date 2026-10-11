@@ -6,12 +6,12 @@ from decimal import Decimal
 
 import pytest
 
+import agentgov
 from agentgov.core import BudgetManager, Direction, EntryType, GovernancePolicy, money
 from agentgov.exceptions import (
     BudgetExceededError,
     CircuitOpenError,
     DenialOfWalletError,
-    DenialOfWalletException,
     DoubleSpendError,
     DuplicateScopeError,
     RunawayLoopDetectedError,
@@ -243,8 +243,12 @@ def test_overdrawing_raises_denial_of_wallet_and_moves_no_money(
     gov.verify_integrity()
 
 
-def test_denial_of_wallet_exception_alias_is_the_same_class() -> None:
+def test_denial_of_wallet_exception_alias_is_the_same_class_and_deprecated() -> None:
+    with pytest.warns(DeprecationWarning, match="removed in 2.0: catch DenialOfWalletError"):
+        from agentgov.exceptions import DenialOfWalletException
     assert DenialOfWalletException is DenialOfWalletError
+    with pytest.warns(DeprecationWarning, match="removed in 2.0"):
+        assert agentgov.DenialOfWalletException is DenialOfWalletError
     assert issubclass(DenialOfWalletError, BudgetExceededError)
 
 

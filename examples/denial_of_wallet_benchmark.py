@@ -54,7 +54,7 @@ from agentgov.dummy import DummyLLM
 from agentgov.exceptions import (
     AgentGovError,
     CircuitOpenError,
-    DenialOfWalletException,
+    DenialOfWalletError,
     SubBudgetAllocationError,
 )
 from agentgov.interceptor import ModelPricing, TokenUsage, pricing_for
@@ -576,6 +576,6 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except DenialOfWalletException as exc:  # pragma: no cover - safety net
+    except DenialOfWalletError as exc:  # pragma: no cover - safety net
         print(f"\nunexpected escape: {exc}", file=sys.stderr)
         sys.exit(1)

@@ -19,7 +19,7 @@ from agentgov.core import BudgetManager, EntryType, GovernancePolicy, money
 from agentgov.dummy import DummyLLM
 from agentgov.exceptions import (
     CircuitOpenError,
-    DenialOfWalletException,
+    DenialOfWalletError,
     DuplicateScopeError,
     RunawayLoopDetectedError,
     SubBudgetAllocationError,
@@ -67,7 +67,7 @@ def test_unbounded_recursive_spawning_is_latched_closed_by_denial_of_wallet() ->
         spawned.append(child)
         run(child, depth + 1)  # unbounded: only the budget can stop this
 
-    with pytest.raises(DenialOfWalletException) as excinfo:
+    with pytest.raises(DenialOfWalletError) as excinfo:
         run("agent.0", 0)
 
     failed_at = spawned[-1]

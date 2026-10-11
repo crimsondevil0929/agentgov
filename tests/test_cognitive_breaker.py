@@ -41,7 +41,6 @@ from agentgov.dummy import DummyLLM
 from agentgov.exceptions import (
     AgentGovError,
     AgentThrashingError,
-    AgentThrashingException,
     CircuitBreakerError,
     CircuitOpenError,
 )
@@ -294,7 +293,9 @@ def test_the_verdict_is_retrievable_after_a_trip(breaker: CognitiveBreaker) -> N
     assert 0.0 <= verdict.confidence <= 1.0
 
 
-def test_the_exception_alias_is_the_same_class() -> None:
+def test_the_exception_alias_is_the_same_class_and_deprecated() -> None:
+    with pytest.warns(DeprecationWarning, match="removed in 2.0: catch AgentThrashingError"):
+        from agentgov.exceptions import AgentThrashingException
     assert AgentThrashingException is AgentThrashingError
     assert issubclass(AgentThrashingError, CircuitBreakerError)
 
