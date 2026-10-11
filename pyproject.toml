@@ -47,6 +47,10 @@ postgres = ["psycopg[binary]>=3.2"]
 # leaves the key service. botocore passes enum values through unchecked, so
 # any boto3 with KMS Sign serves; ED25519_SHA_512 itself is on AWS's side.
 kms-aws = ["boto3>=1.35"]
+# Metrics through OpenTelemetry (agentgov.otel): the API only, whose
+# synchronous gauge arrived in 1.23; the SDK and exporters are the
+# application's.
+otel = ["opentelemetry-api>=1.27"]
 
 [project.scripts]
 agentgov = "agentgov.cli:main"
@@ -121,6 +125,11 @@ show_error_codes = true
 # without a client of its own.
 [[tool.mypy.overrides]]
 module = ["boto3", "boto3.*"]
+ignore_missing_imports = true
+
+# opentelemetry is the otel extra's, imported only when no meter is given.
+[[tool.mypy.overrides]]
+module = ["opentelemetry", "opentelemetry.*"]
 ignore_missing_imports = true
 
 # Explicitly tell the build system where the module is, 

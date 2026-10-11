@@ -110,6 +110,8 @@ from agentgov.exceptions import (
 )
 
 if TYPE_CHECKING:
+    from agentgov.metrics import Metrics
+
     # Storage imports core (LedgerEntry, ControlEvent, ...) for its Protocol
     # methods; guarding this import under TYPE_CHECKING avoids the cycle
     # while still giving mypy the real types for the `store=` parameters.
@@ -3845,6 +3847,9 @@ class BudgetManager:
         chain instead of refusing to open. Moves no money.
     :param signing: Sign the checkpoints this governor writes and check the
         one it opens from (see :class:`CheckpointSigning`).
+    :param metrics: Where to report how this governor is doing (lock waits,
+        units of work, catch-ups, trips, checkpoint lag): see
+        :mod:`agentgov.metrics`. Nothing is measured without it.
 
     **A shared ledger.** Over a :class:`~agentgov.storage.SharedStore` (see
     :meth:`open_postgres`) this manager is one of several governors writing
@@ -3853,9 +3858,10 @@ class BudgetManager:
     and verifies everything the other governors committed since its last
     look, and only then checks a balance or a breaker and writes. Reads
     (:meth:`available`, :meth:`is_halted`, ...) are served from the view as of
-    this governor's last write or :meth:`refresh`; call :meth:`refresh` first
-    for a current answer. The runaway-loop velocity window is counted per
-    governor, not across the fleet.
+    this governor's last write or :meth:`refresh`; pass ``fresh=True``, or
+    read inside :meth:`transaction`, for a current answer. The runaway-loop
+    velocity window is counted per governor unless
+    :attr:`GovernancePolicy.fleet_velocity` says otherwise.
     """
 
     def __init__(
@@ -3868,7 +3874,9 @@ class BudgetManager:
         verify: str = "checkpoint",
         auditor: bool | None = None,
         signing: CheckpointSigning | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
+        started = time.perf_counter()
         if verify not in _VERIFY_POLICIES:
             raise ValueError(f"verify must be one of {sorted(_VERIFY_POLICIES)}, got {verify!r}")
         shared = _shared_store(store) if store is not None and not store.read_only else None
@@ -3927,6 +3935,7 @@ class BudgetManager:
         # returned, and the keys already looked up in the store.
         self._unit_calls: dict[str, tuple[IdempotencyRecord, Any]] = {}
         self._key_cache: dict[str, IdempotencyRecord | None] = {}
+        self._metrics = metrics
         self._auditor: Any = None
         self._velocity: dict[str, _Velocity] = {}
         # Every scope's recent holds, by any governor (fleet_velocity), and the
@@ -3947,6 +3956,8 @@ class BudgetManager:
                 store, opened_from_checkpoint=image.snapshot is not None, want=auditor
             )
         self._remember_head()
+        if metrics is not None and store is not None:
+            metrics.record("agentgov.open.duration", time.perf_counter() - started)
 
     def _start_auditing(
         self, store: PersistenceStore, *, opened_from_checkpoint: bool, want: bool | None
@@ -3997,6 +4008,7 @@ class BudgetManager:
         verify: str = "checkpoint",
         auditor: bool | None = None,
         signing: CheckpointSigning | None = None,
+        metrics: Metrics | None = None,
     ) -> BudgetManager:
         """Open (or create) a durable, SQLite-backed governor in one call.
 
@@ -4059,6 +4071,7 @@ class BudgetManager:
                 verify=verify,
                 auditor=auditor,
                 signing=signing,
+                metrics=metrics,
             )
         except BaseException:
             # Never leak the advisory claim if restore-and-verify rejects the
@@ -4081,6 +4094,7 @@ class BudgetManager:
         verify: str = "checkpoint",
         auditor: bool | None = None,
         signing: CheckpointSigning | None = None,
+        metrics: Metrics | None = None,
     ) -> BudgetManager:
         """Open one governor of a ledger shared through PostgreSQL.
 
@@ -4134,6 +4148,7 @@ class BudgetManager:
                 verify=verify,
                 auditor=auditor,
                 signing=signing,
+                metrics=metrics,
             )
         except BaseException:
             store.close()
@@ -4556,6 +4571,8 @@ class BudgetManager:
                 if request.error is None:
                     request.value, request.error = None, exc
         finally:
+            if self._metrics is not None and batch:
+                self._metrics.record("agentgov.unit.size", len(batch))
             for request in batch:
                 request.settled = True
                 request.wake.release()
@@ -4605,17 +4622,28 @@ class BudgetManager:
                         self._catch_up_ahead(shared)
                     session: WriterSession | None = None
                     self._writing = True
+                    metrics = self._metrics
+                    asked = time.perf_counter()
+                    granted = asked
                     try:
                         with shared.writer(**self._reading_ahead(shared)) as session:
+                            granted = time.perf_counter()
                             self._unit_session = session
                             self._follow(shared)
                             yield
                     finally:
                         self._writing = False
                         self._unit_session = None
+                        if metrics is not None and session is not None:
+                            metrics.record("agentgov.lock.wait", granted - asked)
+                            metrics.record("agentgov.lock.hold", time.perf_counter() - granted)
                         if session is not None and session.wrote and not session.committed:
                             self._dirty = True
                             self._recover(shared)
+            except StorageError:
+                if self._metrics is not None and self._depth == 1:
+                    self._metrics.add("agentgov.store.errors")
+                raise
             finally:
                 self._depth -= 1
                 if not self._depth:
@@ -4664,6 +4692,11 @@ class BudgetManager:
         its session has ended: a checkpoint, when the chain has grown far
         enough past the last one. A failure there is logged, never raised:
         the mutation itself is durable, and the next one tries again."""
+        if self._metrics is not None:
+            with self._lock:
+                held, lag = len(self._open_auths), self._unlocked_checkpoint_lag()
+            self._metrics.set("agentgov.holds.open", held)
+            self._metrics.set("agentgov.checkpoint.lag", lag)
         every = self._policy.checkpoint_every
         store = self._store
         if every <= 0 or store is None or store.read_only or not hasattr(store, "put_snapshot"):
@@ -4704,9 +4737,12 @@ class BudgetManager:
         checkpoints succeed. Growing past that, they are failing (a signer
         that cannot be reached, say), and an open replays more."""
         with self._lock:
-            state = self._state
-            last = state.last_checkpoint[0] if state.last_checkpoint is not None else 0
-            return state.length - last
+            return self._unlocked_checkpoint_lag()
+
+    def _unlocked_checkpoint_lag(self) -> int:
+        state = self._state
+        last = state.last_checkpoint[0] if state.last_checkpoint is not None else 0
+        return state.length - last
 
     def checkpoint(self) -> int:
         """Checkpoint the chain state as of this governor's view.
@@ -5184,6 +5220,8 @@ class BudgetManager:
             ledger._follow_holds(view)
         self._control_high_water = delta.control_high_water
         self._remember(delta.entries)
+        if self._metrics is not None:
+            self._metrics.record("agentgov.catch_up.entries", len(delta.entries))
         return len(delta.entries)
 
     def _remember(self, entries: Sequence[LedgerEntry]) -> None:
@@ -6348,6 +6386,7 @@ class BudgetManager:
 
         :raises LedgerIntegrityError: On the first violation found.
         """
+        started = time.perf_counter()
         with self._lock:
             # The tree's own shape first: cheap, and its messages name the
             # exact defect, where a replay could only say the tree differs.
@@ -6358,6 +6397,8 @@ class BudgetManager:
         # copies the state, replays from the store and compares, while
         # writers carry on.
         self._ledger.verify_chain()
+        if self._metrics is not None:
+            self._metrics.record("agentgov.verify.duration", time.perf_counter() - started)
 
     def _verify_tree(self) -> None:
         """The delegation tree is a tree: parents registered, children listed,
@@ -6429,6 +6470,10 @@ class BudgetManager:
         controls = [e for e in pending.entries if e.entry_type in _CONTROL_TYPES]
         self._ledger._commit(pending)
         self._remember(pending.entries)
+        if self._metrics is not None and controls:
+            trips = sum(e.entry_type is EntryType.CIRCUIT_TRIPPED for e in controls)
+            if trips:
+                self._metrics.add("agentgov.trips", trips)
         if call is not None:
             call.record = record
         for entry in controls:
