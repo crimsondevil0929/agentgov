@@ -71,6 +71,20 @@ another. 1.0 takes a position under the lock, signs outside it, and appends
 in position order, so 16 callers overlap their signatures: 13.4 times
 0.4.0's rate, against the target of 10.
 
+A durable receipt log of 100,000 receipts (a 238 MB file, a checkpoint
+every 1,000), reopened:
+
+| | Reopen | Memory held open |
+|---|---:|---:|
+| 0.4.0 | 24,326 ms | 672 MB |
+| 1.0 | 1.3 ms | 27 KB |
+
+0.4.0 parsed every receipt into memory and checked every checkpoint. 1.0
+keeps an index of the file beside it, checks the newest checkpoint against
+the index's tree and re-verifies only what was signed since it; receipts are
+read from the file when asked for, each checked against the leaf hash
+recorded for it.
+
 ## Scale gates
 
 Measured the same way (`tests/test_scale.py` and the scripts above):
