@@ -536,7 +536,10 @@ class LedgerEntry:
 
 def _iso(moment: datetime) -> str:
     """Format a UTC datetime as a fixed-width ISO-8601 instant."""
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    moment = moment.astimezone(UTC)
+    if moment.year < 1000:  # strftime pads these per platform; keep its answer
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    return moment.replace(tzinfo=None).isoformat(timespec="microseconds") + "Z"
 
 
 def _parse_iso(text: str) -> datetime:
@@ -548,7 +551,14 @@ def _parse_iso(text: str) -> datetime:
     :meth:`LedgerEntry.recompute_hash` disagree with the stored hash even
     though nothing was tampered with.
     """
+    if _INSTANT.match(text):  # what _iso writes
+        return datetime.fromisoformat(text[:-1]).replace(tzinfo=UTC)
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+
+
+_INSTANT: Final = re.compile(
+    r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\Z"
+)
 
 
 def _fixed(amount: Decimal) -> str:
@@ -956,6 +966,7 @@ class _Overlay:
 
     __slots__ = (
         "_base",
+        "_children",
         "_closed",
         "_counts",
         "_events",
@@ -1020,6 +1031,7 @@ class _Overlay:
         self._opened: dict[uuid.UUID, LedgerEntry] = {}
         self._closed: set[uuid.UUID] = set()
         self._nodes: dict[str, BudgetNode] = {}
+        self._children: dict[str, list[str]] = {}  # scopes delegated to, by parent, here
         self._row_scopes: set[str] = set()
         self._roots: list[str] = []
         self._tripped: dict[str, tuple[datetime, str] | None] = {}
@@ -1238,7 +1250,8 @@ class _Overlay:
             else:
                 # In place, so a node a caller holds stays current.
                 current.allocated = node.allocated
-                current.child_ids[:] = node.child_ids
+        for scope_id, added in self._children.items():
+            base.nodes[scope_id].child_ids.extend(added)
         base.roots.extend(self._roots)
         for scope_id, trip in self._tripped.items():
             if trip is None:
@@ -1275,6 +1288,8 @@ class _Overlay:
         self._opened.update(child._opened)
         self.ambiguous |= child.ambiguous
         self._nodes.update(child._nodes)
+        for scope_id, added in child._children.items():
+            self._children.setdefault(scope_id, []).extend(added)
         self._row_scopes |= child._row_scopes
         self._roots.extend(child._roots)
         self._tripped.update(child._tripped)
@@ -1591,13 +1606,18 @@ class _Overlay:
             self._require(scope, entry)
 
     def _writable(self, scope_id: str) -> BudgetNode:
-        """This view's own copy of a node, to change without touching the base."""
+        """This view's own copy of a node, to change without touching the base.
+
+        The copy shares the base's list of children, which no view changes: a
+        view records the children it adds in ``_children`` and merge() appends
+        them, so staging a scope with many children costs nothing extra.
+        """
         staged = self._nodes.get(scope_id)
         if staged is None:
             current = self._base.node(scope_id)
             if current is None:  # callers check first; never trust that silently
                 raise LedgerIntegrityError(f"scope {scope_id!r} is not in the chain", scope_id)
-            staged = dataclasses.replace(current, child_ids=list(current.child_ids))
+            staged = dataclasses.replace(current)
             self._nodes[scope_id] = staged
         return staged
 
@@ -1627,7 +1647,7 @@ class _Overlay:
             created_at=entry.timestamp,
         )
         self._row_scopes.add(scope)
-        self._writable(parent.scope_id).child_ids.append(scope)
+        self._children.setdefault(parent.scope_id, []).append(scope)
 
     def _release_between(self, entry: LedgerEntry) -> None:
         scope, other = entry.scope_id, entry.counterparty_id or ""
@@ -5149,6 +5169,10 @@ class BudgetManager:
         """The delegation tree is a tree: parents registered, children listed,
         depths consistent, and no cycles. Lock held."""
         nodes = self._state.nodes
+        listed = {
+            scope_id: set(node.child_ids) for scope_id, node in nodes.items() if node.child_ids
+        }
+        rooted: set[str] = set()  # scopes already walked to a root
         for scope_id, node in nodes.items():
             if node.parent_id is None:
                 if scope_id not in self._state.roots:
@@ -5157,21 +5181,26 @@ class BudgetManager:
             parent = nodes.get(node.parent_id)
             if parent is None:
                 raise LedgerIntegrityError(f"parent {node.parent_id!r} is not registered", scope_id)
-            if scope_id not in parent.child_ids:
+            if scope_id not in listed.get(node.parent_id, ()):
                 raise LedgerIntegrityError(f"not listed as a child of {node.parent_id!r}", scope_id)
             if node.depth != parent.depth + 1:
                 raise LedgerIntegrityError(
                     f"depth {node.depth} is inconsistent with parent depth {parent.depth}",
                     scope_id,
                 )
-            # Walking to a root also proves the graph is acyclic.
-            seen = {scope_id}
+            # Walking to a root also proves the graph is acyclic. A walk ends
+            # where an earlier one did, so the whole tree is walked once.
+            path = {scope_id}
             cursor: str | None = node.parent_id
-            while cursor is not None:
-                if cursor in seen:
+            while cursor is not None and cursor not in rooted:
+                if cursor in path:
                     raise LedgerIntegrityError("delegation cycle detected", scope_id)
-                seen.add(cursor)
-                cursor = nodes[cursor].parent_id
+                path.add(cursor)
+                ancestor = nodes.get(cursor)
+                if ancestor is None:
+                    raise LedgerIntegrityError(f"ancestor {cursor!r} is not registered", scope_id)
+                cursor = ancestor.parent_id
+            rooted |= path
 
     def _verify_authorizations(self) -> None:
         """Every open hold has exactly one authorization, and nothing else does."""

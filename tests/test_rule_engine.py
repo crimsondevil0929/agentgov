@@ -283,6 +283,48 @@ def test_a_view_on_a_view_merges_into_it_or_is_dropped_without_a_trace() -> None
     assert batch.length == state.length + 1
 
 
+def _delegation(parent: str, child: str) -> list[LedgerLine]:
+    return [
+        LedgerLine(EntryType.ALLOCATION, Direction.DEBIT, parent, money("0.01"), child),
+        LedgerLine(EntryType.ALLOCATION, Direction.CREDIT, child, money("0.01"), parent),
+    ]
+
+
+def test_staging_a_scope_copies_none_of_its_children() -> None:
+    """A write to a scope with 100,000 children costs what one to a leaf does."""
+    gov = _tree()
+    state = gov.ledger._state
+    staged = _Overlay(state)._writable("root")
+    assert staged is not state.nodes["root"]
+    assert staged.child_ids is state.nodes["root"].child_ids
+
+
+def test_delegations_reach_the_parent_only_when_merged_in_order_through_views() -> None:
+    gov = _tree()
+    state = gov.ledger._state
+    batch = _Overlay(state)
+    first = gov.ledger._begin()
+    first._view = _Overlay(batch)
+    first.post(_delegation("root", "a"))
+    first.view.merge()
+    second = gov.ledger._begin()
+    second._view = _Overlay(batch)
+    second.post(_delegation("root", "b"))
+    second.post(_delegation("a", "c"))
+    second.view.merge()
+    dropped = gov.ledger._begin()
+    dropped._view = _Overlay(batch)
+    dropped.post(_delegation("root", "d"))
+    del dropped  # never merged
+    assert state.nodes["root"].child_ids == ["child"], "nothing reaches the state unmerged"
+    batch.merge()
+    assert state.nodes["root"].child_ids == ["child", "a", "b"]
+    assert state.nodes["a"].child_ids == ["c"]
+    assert state.nodes["c"].child_ids == []
+    assert "d" not in state.nodes
+    gov._verify_tree()  # the store never saw these entries; the tree is whole
+
+
 # -- exhaustion counts holds per scope --------------------------------------
 
 

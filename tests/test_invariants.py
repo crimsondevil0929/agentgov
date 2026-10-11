@@ -146,6 +146,45 @@ def test_an_inconsistent_depth_is_caught(gov: BudgetManager) -> None:
         gov.verify_integrity()
 
 
+def test_a_vanished_ancestor_is_caught_from_a_scope_listed_before_it(gov: BudgetManager) -> None:
+    """A walk to a root that meets an unregistered ancestor reports it, even
+    when the scope below is checked first (a snapshot lists scopes in any
+    order), rather than failing with a KeyError."""
+    gov.delegate("child", "grandchild", money("0.10"))
+    gov.node("child").parent_id = "vanished"
+    nodes = gov._nodes
+    reordered = {"grandchild": nodes["grandchild"]} | nodes
+    nodes.clear()
+    nodes.update(reordered)
+    with pytest.raises(LedgerIntegrityError, match="ancestor 'vanished' is not registered"):
+        gov.verify_integrity()
+
+
+def test_a_wide_tree_is_checked_in_time_proportional_to_its_size() -> None:
+    """Each child's listing is a set lookup, and walks to a root stop where
+    an earlier walk ended: no check scans a parent's children per child."""
+    gov = BudgetManager(policy=GovernancePolicy(max_calls_per_window=0))
+    gov.open_root("root", money("1000"))
+    for i in range(2_000):
+        gov.delegate("root", f"s-{i}", money("0.01"))
+
+    class Counting(list[str]):
+        scans = 0
+
+        def __contains__(self, item: object) -> bool:
+            Counting.scans += 1
+            return super().__contains__(item)
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            Counting.scans += 1
+            return super().__iter__()
+
+    root = gov.node("root")
+    root.child_ids = Counting(root.child_ids)
+    gov.verify_integrity()
+    assert Counting.scans <= 3, f"the root's children were scanned {Counting.scans} times"
+
+
 def test_a_delegation_cycle_is_caught(gov: BudgetManager) -> None:
     root, child = gov.node("root"), gov.node("child")
     root.parent_id = "child"

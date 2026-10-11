@@ -1,0 +1,107 @@
+name: Nightly
+
+# What is too slow for every change but must hold for every release: the
+# absolute scale gates (a 1,000,000-entry ledger opens in 500 ms, memory flat
+# with history), a deep run of the model-based tests, and the mutation pass.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scale:
+    name: scale gates (1M entries, 100k scopes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the project
+        run: uv sync --frozen --python 3.12
+
+      - name: Keep the large ledgers between runs
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/scale
+          key: scale-fixtures-${{ hashFiles('tests/test_scale.py', 'src/agentgov/core.py') }}
+
+      - name: Scale gates
+        env:
+          AGENTGOV_SCALE: "1"
+          AGENTGOV_SCALE_FIXTURES: ${{ runner.temp }}/scale
+        run: uv run pytest -v tests/test_scale.py
+
+  model:
+    name: model-based tests, deep
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the project
+        run: uv sync --frozen --python 3.12
+
+      - name: 5,000 random operation sequences against the reference model
+        env:
+          AGENTGOV_MODEL_EXAMPLES: "5000"
+        run: uv run pytest -v tests/test_model.py
+
+  mutation:
+    name: mutation pass
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentgov_admin
+          POSTGRES_PASSWORD: agentgov
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentgov_admin"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the project
+        run: uv sync --frozen --python 3.12
+
+      # Every spec under mutation/: each names the functions a phase added
+      # or rewrote, and justifies by name every mutant no test can tell
+      # apart from the original.
+      - name: Mutation pass
+        run: |
+          for spec in mutation/*.json; do
+            sed 's/localhost:55433/localhost:5432/' "$spec" > "$RUNNER_TEMP/$(basename "$spec")"
+            uv run python scripts/mutate.py "$RUNNER_TEMP/$(basename "$spec")" --jobs 4 \
+              --out "$RUNNER_TEMP/report-$(basename "$spec")"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-reports
+          path: ${{ runner.temp }}/report-*.json

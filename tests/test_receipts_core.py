@@ -12,9 +12,13 @@ import hashlib
 import os
 import subprocess
 import sys
+from enum import IntEnum
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from agentgov.exceptions import MalformedReceiptError, SignerUnavailableError
 from agentgov.receipts import (
@@ -22,6 +26,7 @@ from agentgov.receipts import (
     Ed25519Signer,
     HmacKey,
     MerkleTree,
+    canonical,
     canonical_bytes,
     loads_strict,
     parse_key,
@@ -57,13 +62,62 @@ def test_canonical_encoding_is_rfc8785(value: object, canonical: str) -> None:
 def test_object_keys_sort_by_utf16_code_units_not_code_points() -> None:
     """U+1F600 is above U+E000 as a code point but below it in UTF-16
     (0xD83D < 0xE000). RFC 8785 sorts by UTF-16, as JavaScript does."""
-    encoded = canonical_bytes({"": 1, "\U0001f600": 2, "a": 3}).decode()
-    assert encoded == '{"a":3,"\U0001f600":2,"":1}'
-    assert sorted(["", "\U0001f600"]) == ["", "\U0001f600"], "unlike Python's order"
+    encoded = canonical_bytes({"\ue000": 1, "\U0001f600": 2, "a": 3}).decode()
+    assert encoded == '{"a":3,"\U0001f600":2,"\ue000":1}'
+    assert sorted(["\ue000", "\U0001f600"]) == ["\ue000", "\U0001f600"], "unlike Python's order"
 
 
 def test_booleans_are_not_integers() -> None:
     assert canonical_bytes([True, 1, False, 0]) == b"[true,1,false,0]"
+
+
+def _reference(value: object) -> bytes:
+    """RFC 8785 as written: one value, one string at a time."""
+    out: list[str] = []
+    canonical._encode(value, out, "$")
+    return "".join(out).encode("utf-8")
+
+
+_PIECES = ["", "a", "Z", '"', "\\", "\n", "\x00", "\x1f", "\x7f", "\u2028", "é", "\ue000"]
+_PIECES += ["\uffff", "\U00010000", "\U0001f600"]
+_TEXT = st.lists(st.sampled_from(_PIECES), max_size=6).map("".join) | st.text(
+    alphabet=st.characters(exclude_categories=("Cs",)), max_size=8
+)
+_JSON = st.recursive(
+    st.none() | st.booleans() | st.integers(-(2**53 - 1), 2**53 - 1) | _TEXT,
+    lambda inner: (
+        st.lists(inner, max_size=4)
+        | st.tuples(inner, inner)
+        | st.dictionaries(_TEXT, inner, max_size=5)
+    ),
+    max_leaves=25,
+)
+
+
+@given(_JSON)
+def test_the_encoder_writes_what_rfc_8785_as_written_does(value: object) -> None:
+    """canonical_bytes orders keys itself and lets the C encoder write the
+    bytes; the result is the reference encoder's, key order included."""
+    assert canonical_bytes(value) == _reference(value)
+
+
+class _Seven(IntEnum):
+    SEVEN = 7
+
+
+class _Text(str):
+    __slots__ = ()
+
+
+def test_subclasses_and_other_mappings_encode_as_their_base_types() -> None:
+    value = {
+        "n": _Seven.SEVEN,
+        "s": _Text("x"),
+        "m": MappingProxyType({"b": 1, "a": 2}),
+        "t": (1, [2]),
+    }
+    assert canonical_bytes(value) == _reference(value)
+    assert canonical_bytes(value) == b'{"m":{"a":2,"b":1},"n":7,"s":"x","t":[1,[2]]}'
 
 
 @pytest.mark.parametrize(

@@ -14,7 +14,7 @@ import importlib.util
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -32,6 +32,7 @@ from agentgov.core import (
     _fixed,
     _frontier_root,
     _hash_entry,
+    _iso,
     _parse_iso,
     _replay,
     _snapshot_digest,
@@ -196,3 +197,48 @@ def test_an_amount_with_more_than_eight_decimals_has_no_agov3_rendering() -> Non
 
     with pytest.raises(Inexact):
         _fixed(Decimal("0.000000001"))
+
+
+# -- timestamps --------------------------------------------------------------------
+
+_STRFTIME = "%Y-%m-%dT%H:%M:%S.%f"
+
+
+@given(
+    st.datetimes(
+        min_value=datetime(1000, 1, 2),
+        max_value=datetime(9999, 12, 30),
+        timezones=st.sampled_from(
+            [UTC, timezone(timedelta(hours=5, minutes=30)), timezone(-timedelta(hours=8))]
+        ),
+    )
+)
+def test_a_timestamp_is_written_and_read_as_strftime_and_strptime_would(moment: datetime) -> None:
+    """Every hash covers _iso(timestamp): the fast paths may not change a byte."""
+    text = moment.astimezone(UTC).strftime(_STRFTIME) + "Z"
+    assert _iso(moment) == text
+    assert _parse_iso(text) == datetime.strptime(text, _STRFTIME + "Z").replace(tzinfo=UTC)
+    assert _parse_iso(text) == moment
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "2026-1-5T03:04:05.1Z",  # what strptime has always accepted
+        "2026-10-11T03:54:12.123456",  # no Z
+        "2026-13-01T00:00:00.000000Z",
+        "2026-10-11T03:54:12.123456+00:00",
+        "\u0662\u0660\u0662\u0666-10-11T03:54:12.123456Z",  # Arabic-Indic digits
+        "2026-10-11 03:54:12.123456Z",
+    ],
+)
+def test_a_timestamp_not_in_the_written_form_parses_as_strptime_would(text: str) -> None:
+    try:
+        expected: object = datetime.strptime(text, _STRFTIME + "Z").replace(tzinfo=UTC)
+    except ValueError:
+        expected = ValueError
+    try:
+        found: object = _parse_iso(text)
+    except ValueError:
+        found = ValueError
+    assert found == expected
