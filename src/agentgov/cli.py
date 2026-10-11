@@ -76,6 +76,7 @@ from agentgov.receipts import (
     Check,
     Failure,
     Keyring,
+    KeyTransition,
     RowDisclosure,
     VerificationReport,
     Verifier,
@@ -427,6 +428,7 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
     unreadable: dict[str, Check] = {}
     cosignatures = None
     rows = None
+    transitions: list[KeyTransition] | None = None
     ledger: BudgetManager | None = None
     try:
         if args.witness:
@@ -434,6 +436,14 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
                 cosignatures = load_cosignatures(args.witness)
             except MalformedReceiptError as exc:
                 unreadable["witnessed"] = Check("witnessed", "fail", str(exc), Failure.MALFORMED)
+        if args.transitions:
+            try:
+                lines = Path(args.transitions).read_bytes().splitlines()
+                transitions = [KeyTransition.loads(line) for line in lines if line.strip()] or None
+            except MalformedReceiptError as exc:
+                unreadable["key transitions"] = Check(
+                    "key transitions", "fail", f"{args.transitions}: {exc}", Failure.MALFORMED
+                )
         if args.rows:
             try:
                 rows = RowDisclosure.loads(Path(args.rows).read_bytes())
@@ -462,6 +472,7 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
             rows=rows,
             relay_keys=relay_keys,
             action=action,
+            transitions=transitions,
         )
     finally:
         if ledger is not None:
@@ -609,6 +620,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="the receipt log's checkpoint key (default: --pubkey); repeatable",
+    )
+    receipt.add_argument(
+        "--transitions",
+        default="",
+        help="the receipt log's key transitions (JSON lines: the log's .transitions file), "
+        "followed from --log-pubkey, or --pubkey, to the key that signed",
     )
     receipt.add_argument(
         "--witness", default="", help="a witness's published cosignatures (JSON lines)"

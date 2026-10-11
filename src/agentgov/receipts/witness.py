@@ -38,7 +38,7 @@ from agentgov.exceptions import (
 from agentgov.receipts._lines import read_complete_lines
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
 from agentgov.receipts.merkle import verify_consistency
-from agentgov.receipts.schema import Checkpoint, Cosignature
+from agentgov.receipts.schema import Checkpoint, Cosignature, _signature_version
 from agentgov.receipts.signing import Keyring, Signer, Verifier, verifier_of
 
 __all__ = ["FileWitness", "Witness", "find_cosignature", "load_cosignatures"]
@@ -83,10 +83,22 @@ class FileWitness:
         signed by a key not held for its log, is refused.
     :param clock: Source of ``witnessed_at``; the current UTC time by default.
     :param fsync: Force every cosignature to stable storage before returning.
+    :param signature_version: 2 signs digests (ARC1 1.2); the signer's own
+        ``signature_version``, or 1, by default.
     :raises WitnessError: If the existing file does not verify.
     """
 
-    __slots__ = ("_clock", "_fsync", "_latest", "_lock", "_logs", "_path", "_signer", "_witness_id")
+    __slots__ = (
+        "_clock",
+        "_fsync",
+        "_latest",
+        "_lock",
+        "_logs",
+        "_path",
+        "_signer",
+        "_version",
+        "_witness_id",
+    )
 
     def __init__(
         self,
@@ -97,9 +109,11 @@ class FileWitness:
         logs: Mapping[str, Verifier | Keyring],
         clock: Callable[[], datetime] | None = None,
         fsync: bool = True,
+        signature_version: int | None = None,
     ) -> None:
         self._path = Path(path)
         self._signer = signer
+        self._version = _signature_version(signer, signature_version)
         self._witness_id = witness_id
         self._logs = {log_id: Keyring.of(keys) for log_id, keys in logs.items()}
         self._clock = clock if clock is not None else (lambda: datetime.now(UTC))
@@ -190,7 +204,7 @@ class FileWitness:
                 tree_size=checkpoint.tree_size,
                 root_hash=checkpoint.root_hash,
                 witnessed_at=self._clock(),
-            ).sign(self._signer)
+            ).sign(self._signer, version=self._version)
             self._append(cosignature)
             self._latest[checkpoint.log_id] = cosignature
             return cosignature

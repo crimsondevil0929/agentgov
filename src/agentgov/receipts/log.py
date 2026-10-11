@@ -21,8 +21,13 @@ re-checking every receipt's position, every checkpoint's signature and root
 against the receipts, and the signature of every receipt the log signed since
 its last checkpoint; and it cuts off a final line torn by a crash mid-append.
 Every signature is checked under the log's keyring, never by the signer, so
-reopening a log whose key is held by a key service makes no calls to it, and
-a log whose key was rotated reopens with the old key in its keyring.
+reopening a log whose key is held by a key service makes no calls to it.
+
+A log outlives its key (ARC1 1.2). :meth:`ReceiptLog.rotate` has the outgoing
+key sign a :class:`~agentgov.receipts.schema.KeyTransition` to the incoming
+one, kept in ``<path>.transitions``; from then on the log holds each leaf and
+checkpoint to the key in force for its position, and a verifier who trusts
+only the first key follows the transitions to the current one.
 One process holds a log for writing at a time; a second is refused.
 """
 
@@ -57,9 +62,12 @@ from agentgov.receipts.schema import (
     Checkpoint,
     DeliveryReceipt,
     InclusionProof,
+    KeySchedule,
+    KeyTransition,
     LogDocument,
     ReceiptBundle,
     _check_text,
+    _signature_version,
     document_from_json,
 )
 from agentgov.receipts.signing import Keyring, Signer, Verifier, as_async, verifier_of
@@ -167,8 +175,12 @@ class ReceiptLog:
     :param policy: When to publish; see :class:`CheckpointPolicy`.
     :param clock: Source of ``issued_at``; the current UTC time by default.
     :param fsync: Force each receipt and checkpoint to stable storage.
-    :raises ReceiptLogError: If another process holds ``path``, or the
-        existing file does not check out.
+    :param signature_version: 2 signs digests (ARC1 1.2), so any receipt fits
+        a key service's message limit; 1 signs as ARC1 1.0 and 1.1 do. The
+        signer's own ``signature_version``, or 1, by default.
+    :raises ReceiptLogError: If another process holds ``path``, the existing
+        file does not check out, or the log's key in force (after its
+        transitions) is not ``signer``'s.
     """
 
     def __init__(
@@ -182,12 +194,15 @@ class ReceiptLog:
         policy: CheckpointPolicy | None = None,
         clock: Callable[[], datetime] | None = None,
         fsync: bool = True,
+        signature_version: int | None = None,
     ) -> None:
         try:
             self._log_id = _check_text(log_id, "log_id")
         except MalformedReceiptError as exc:
             raise ValueError(str(exc)) from exc
         self._signer = signer
+        self._signature_version = signature_version
+        _signature_version(signer, signature_version)  # refuse a version that is no version
         trusted = list(Keyring.of(keyring)) if keyring is not None else []
         self._keyring = Keyring([*trusted, verifier_of(signer)])
         self._witnesses = tuple(witnesses)
@@ -196,11 +211,15 @@ class ReceiptLog:
         self._fsync = fsync
         # Lock order: _publish_lock, then _lock; never the reverse.
         self._lock = threading.RLock()
+        self._turn = threading.Condition(self._lock)  # positions handed back, rotations ended
         self._publish_lock = threading.Lock()
         self._tree = MerkleTree()
         self._receipts: list[LogDocument] = []
         self._index_of: dict[str, int] = {}
         self._checkpoints: list[Checkpoint] = []
+        self._transitions: list[KeyTransition] = []
+        self._schedule: KeySchedule | None = None
+        self._rotating = False
         self._next = 0  # the next position to hand out
         self._held: dict[int, _Reservation] = {}  # positions handed out, not yet appended
         self._held_ids: dict[str, int] = {}
@@ -222,6 +241,16 @@ class ReceiptLog:
                 raise
             self._claim = claim
         self._next = len(self._receipts)
+        if (
+            self._schedule is not None
+            and verifier_of(signer).key_id != self._schedule.current.key_id
+        ):
+            self.close()
+            raise ReceiptLogError(
+                f"log {self._log_id!r} has been signed by key {self._schedule.current.key_id} "
+                f"since size {self._schedule.boundary}, and this signer holds key "
+                f"{signer.key_id}: open it with the key in force, and hand it over with rotate()"
+            )
 
     # -- reading ----------------------------------------------------------
 
@@ -232,8 +261,20 @@ class ReceiptLog:
     @property
     def keyring(self) -> Keyring:
         """The keys this log's signatures are checked under: the signer's,
-        and any it was given for signatures made before a rotation."""
+        any it was given, and each key its transitions handed it to."""
         return self._keyring
+
+    def transitions(self) -> tuple[KeyTransition, ...]:
+        """The log's key transitions, in order (ARC1 1.2)."""
+        with self._lock:
+            return tuple(self._transitions)
+
+    @property
+    def schedule(self) -> KeySchedule | None:
+        """Which key signs which part of the log, once a transition has
+        handed it from one key to another; ``None`` before."""
+        with self._lock:
+            return self._schedule
 
     def __len__(self) -> int:
         with self._lock:
@@ -302,7 +343,7 @@ class ReceiptLog:
         while True:
             reservation, unsigned, signer = self._reserve(draft)
             try:
-                receipt = unsigned.sign(signer)
+                receipt = unsigned.sign(signer, version=self._version_for(signer))
             except BaseException:
                 self._abandon(reservation)
                 raise
@@ -321,7 +362,8 @@ class ReceiptLog:
         while True:
             reservation, unsigned, signer = await off_loop(self._reserve, draft)
             try:
-                receipt = await unsigned.sign_async(as_async(signer))
+                version = self._version_for(signer)
+                receipt = await unsigned.sign_async(as_async(signer), version=version)
             except BaseException:
                 self._abandon(reservation)
                 raise
@@ -408,6 +450,56 @@ class ReceiptLog:
         if due:
             self.publish()
 
+    def rotate(self, signer: Signer) -> KeyTransition:
+        """Hand the log to ``signer``'s key.
+
+        Issues in flight finish first, and new ones wait. The outgoing key
+        signs a checkpoint at the current size, if the last one is not there
+        already, and a transition naming the incoming key at that size; from
+        then on the incoming key signs every leaf and every larger checkpoint.
+        Witnesses need the incoming key in their keyring for this log.
+
+        :returns: The signed transition, also kept in ``<path>.transitions``.
+        :raises ValueError: If ``signer`` holds the key the log is signed by.
+        :raises SignerUnavailableError: If the outgoing key cannot sign; the
+            log is unchanged and still signed by it.
+        """
+        incoming = verifier_of(signer)
+        with self._publish_lock:
+            with self._lock:
+                self._check_open()
+                if incoming.key_id == self._key_in_force().key_id:
+                    raise ValueError(
+                        f"log {self._log_id!r} is already signed by key {incoming.key_id}"
+                    )
+                self._rotating = True
+                while self._held:
+                    self._turn.wait()
+            try:
+                with self._lock:
+                    outgoing = self._signer
+                    size = len(self._receipts)
+                    sealed = bool(self._checkpoints) and self._checkpoints[-1].tree_size == size
+                if not sealed:
+                    self._checkpoint()  # the outgoing key vouches for all it signed
+                transition = KeyTransition.of(self._log_id, size, incoming, self._clock()).sign(
+                    outgoing, version=self._version_for(outgoing)
+                )
+                if self._path is not None:
+                    self._write_lines(
+                        _transitions_path(self._path), [canonical_bytes(transition.to_json())]
+                    )
+                with self._lock:
+                    self._transitions.append(transition)
+                    self._keyring.add(incoming)
+                    self._schedule = KeySchedule(self._log_id, self._keyring, self._transitions)
+                    self._signer = signer
+                return transition
+            finally:
+                with self._lock:
+                    self._rotating = False
+                    self._turn.notify_all()
+
     def bundle(self, index: int, checkpoint: Checkpoint | None = None) -> ReceiptBundle:
         """The receipt at ``index`` with the proof that it is in the log.
 
@@ -480,6 +572,8 @@ class ReceiptLog:
 
     def _reserve(self, draft: D) -> tuple[_Reservation, D, Signer]:
         with self._lock:
+            while self._rotating:
+                self._turn.wait()
             self._check_open()
             self._check_new(draft)
             # Placing it may refuse it (a delivery placed before its action):
@@ -517,6 +611,7 @@ class ReceiptLog:
             self._held_ids.pop(held.receipt_id, None)
             held.settle(error=error if held is reservation else None)
         self._next = reservation.index
+        self._turn.notify_all()
 
     def _drain(self) -> None:
         """Append every signed receipt whose turn has come, in order, with one
@@ -565,6 +660,7 @@ class ReceiptLog:
                 reservation.settle(receipt=receipt)
             self._pending += len(batch)
             self._note_due()
+            self._turn.notify_all()
         if refused is not None:
             self._take_back(*refused)
 
@@ -617,12 +713,22 @@ class ReceiptLog:
         """Sign and record a checkpoint at the current size. Publish lock held."""
         with self._lock:
             size = len(self._receipts)
+            if self._schedule is not None and size <= self._schedule.boundary:
+                # Nothing new since the hand-over: the outgoing key's last
+                # checkpoint is the log's latest word at this size.
+                last = self._checkpoints[-1] if self._checkpoints else None
+                if last is None or last.tree_size != size:
+                    raise ReceiptLogError(
+                        f"log {self._log_id!r} changed keys at size {self._schedule.boundary} "
+                        f"and has no checkpoint there to stand on"
+                    )
+                return last
             root = self._tree.root(size).hex()
             signer = self._signer
             issued_at = self._clock()
         checkpoint = Checkpoint(
             log_id=self._log_id, tree_size=size, root_hash=root, issued_at=issued_at
-        ).sign(signer)
+        ).sign(signer, version=self._version_for(signer))
         if self._path is not None:
             self._write_lines(_checkpoint_path(self._path), [canonical_bytes(checkpoint.to_json())])
         with self._lock:
@@ -630,6 +736,13 @@ class ReceiptLog:
         return checkpoint
 
     # -- internals --------------------------------------------------------
+
+    def _version_for(self, signer: Signer) -> int:
+        return _signature_version(signer, self._signature_version)
+
+    def _key_in_force(self) -> Verifier:
+        """The key that signs the next leaf. Lock held."""
+        return self._schedule.current if self._schedule is not None else verifier_of(self._signer)
 
     def _check_new(self, receipt: LogDocument) -> None:
         seen = self._index_of.get(receipt.receipt_id)
@@ -694,6 +807,21 @@ class ReceiptLog:
 
     def _resume(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        for number, line in enumerate(
+            read_complete_lines(_transitions_path(path), repair=True), start=1
+        ):
+            try:
+                transition = KeyTransition.from_json(loads_strict(line), f"transition {number}")
+            except MalformedReceiptError as exc:
+                raise ReceiptLogError(f"{path}.transitions line {number}: {exc}") from exc
+            self._transitions.append(transition)
+        if self._transitions:
+            try:
+                self._schedule = KeySchedule(self._log_id, self._keyring, self._transitions)
+            except (MalformedReceiptError, ReceiptSignatureError) as exc:
+                raise ReceiptLogError(f"{path}.transitions: {exc}") from exc
+            for handed_to in self._schedule.keyring():
+                self._keyring.add(handed_to)
         for number, line in enumerate(read_complete_lines(path, repair=True), start=1):
             try:
                 receipt = document_from_json(loads_strict(line), f"{path}:{number}")
@@ -708,7 +836,10 @@ class ReceiptLog:
         ):
             try:
                 checkpoint = Checkpoint.from_json(loads_strict(line), f"checkpoint {number}")
-                checkpoint.verify(self._keyring)
+                if self._schedule is not None:
+                    checkpoint.verify(self._schedule.for_checkpoint(checkpoint.tree_size))
+                else:
+                    checkpoint.verify(self._keyring)
             except (MalformedReceiptError, ReceiptSignatureError) as exc:
                 raise ReceiptLogError(f"{path}.checkpoints line {number}: {exc}") from exc
             if (
@@ -721,6 +852,12 @@ class ReceiptLog:
                     f"match the receipts in {path}: the log was edited"
                 )
             self._checkpoints.append(checkpoint)
+        if self._schedule is not None and self._transitions[-1].tree_size > len(self._receipts):
+            raise ReceiptLogError(
+                f"{path}.transitions hands the log over at size "
+                f"{self._transitions[-1].tree_size}, beyond its {len(self._receipts)} receipts: "
+                f"the log was edited"
+            )
         covered = self._checkpoints[-1].tree_size if self._checkpoints else 0
         # A signed root vouches for every receipt it covers. The ones after
         # it are vouched for only by their own signatures, so check the ones
@@ -728,8 +865,11 @@ class ReceiptLog:
         for index in range(covered, len(self._receipts)):
             receipt = self._receipts[index]
             if receipt.signature is not None and receipt.signature.key_id in self._keyring:
+                key: Verifier | Keyring = (
+                    self._schedule.for_leaf(index) if self._schedule is not None else self._keyring
+                )
                 try:
-                    receipt.verify(self._keyring)
+                    receipt.verify(key)
                 except ReceiptSignatureError as exc:
                     raise ReceiptLogError(
                         f"{path} line {index + 1}: {exc}; the log was edited"
@@ -739,6 +879,10 @@ class ReceiptLog:
 
 def _checkpoint_path(path: Path) -> Path:
     return path.with_name(path.name + ".checkpoints")
+
+
+def _transitions_path(path: Path) -> Path:
+    return path.with_name(path.name + ".transitions")
 
 
 class _Claim:
