@@ -75,6 +75,7 @@ from agentgov.opening import open_url
 from agentgov.receipts import (
     Check,
     Failure,
+    Keyring,
     RowDisclosure,
     VerificationReport,
     Verifier,
@@ -390,12 +391,24 @@ def _read_key(value: str) -> Verifier:
     return parse_key(text)
 
 
+def _read_keys(values: Sequence[str]) -> Verifier | Keyring:
+    """One key as itself; several, given by repeating the option, as a keyring
+    (a key and its successor, after a rotation)."""
+    keys = [_read_key(value) for value in values]
+    if len(keys) == 1:
+        return keys[0]
+    try:
+        return Keyring(keys)
+    except ValueError as exc:
+        raise MalformedReceiptError(str(exc)) from exc
+
+
 def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
     """Verify an ARC1 receipt bundle; exit with the first failure's code."""
     try:
-        issuer = _read_key(args.pubkey)
-        log_key = _read_key(args.log_pubkey) if args.log_pubkey else None
-        witness_key = _read_key(args.witness_pubkey) if args.witness_pubkey else None
+        issuer = _read_keys(args.pubkey)
+        log_key = _read_keys(args.log_pubkey) if args.log_pubkey else None
+        witness_key = _read_keys(args.witness_pubkey) if args.witness_pubkey else None
         relay_keys = [_read_key(key) for key in args.relay_key] if args.relay_key else None
         action = Path(args.action).read_bytes() if args.action else None
         bundle = Path(args.bundle).read_bytes()
@@ -587,16 +600,24 @@ def build_parser() -> argparse.ArgumentParser:
     receipt.add_argument(
         "--pubkey",
         required=True,
-        help="the issuer's key: 'ed25519:<hex>', 'hmac-sha256:<hex>', or a file holding one",
+        action="append",
+        help="the issuer's key: 'ed25519:<hex>', 'hmac-sha256:<hex>', or a file holding one; "
+        "repeat it for each key the issuer has signed with (after a rotation)",
     )
     receipt.add_argument(
-        "--log-pubkey", default="", help="the receipt log's checkpoint key (default: --pubkey)"
+        "--log-pubkey",
+        action="append",
+        default=[],
+        help="the receipt log's checkpoint key (default: --pubkey); repeatable",
     )
     receipt.add_argument(
         "--witness", default="", help="a witness's published cosignatures (JSON lines)"
     )
     receipt.add_argument(
-        "--witness-pubkey", default="", help="the witness's key; required with --witness"
+        "--witness-pubkey",
+        action="append",
+        default=[],
+        help="the witness's key; required with --witness; repeatable",
     )
     receipt.add_argument(
         "--ledger",

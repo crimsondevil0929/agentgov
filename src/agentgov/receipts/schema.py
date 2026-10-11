@@ -37,7 +37,7 @@ from agentgov.receipts.canonical import (
     loads_strict,
 )
 from agentgov.receipts.merkle import leaf_hash
-from agentgov.receipts.signing import ALG_ED25519, ALG_HMAC_SHA256, Signer, Verifier
+from agentgov.receipts.signing import ALG_ED25519, ALG_HMAC_SHA256, Keyring, Signer, Verifier
 
 __all__ = [
     "ActionBinding",
@@ -311,11 +311,20 @@ def _signing_input(domain: bytes, body: Mapping[str, Any], alg: str, key_id: str
 def _check_signature(
     what: str,
     signature: Signature | None,
-    verifier: Verifier,
+    verifier: Verifier | Keyring,
     payload: Callable[[str, str], bytes],
 ) -> None:
     if signature is None:
         raise ReceiptSignatureError(f"the {what} is not signed")
+    if isinstance(verifier, Keyring):
+        key = verifier.get(signature.key_id)
+        if key is None:
+            held = ", ".join(sorted(k.key_id for k in verifier)) or "none"
+            raise ReceiptSignatureError(
+                f"the {what} was signed by key {signature.key_id}, which is not among the "
+                f"keys given ({held})"
+            )
+        verifier = key
     if signature.alg != verifier.alg:
         raise ReceiptSignatureError(
             f"the {what} claims an {signature.alg} signature but the key given is "
@@ -832,8 +841,9 @@ class ActionReceipt:
         value = signer.sign(self.signing_input(signer.alg, signer.key_id))
         return replace(self, signature=Signature(signer.alg, signer.key_id, value))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this."""
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("receipt", self.signature, verifier, self.signing_input)
 
     def with_log_anchor(self, log_id: str, leaf_index: int) -> ActionReceipt:
@@ -1032,8 +1042,9 @@ class Attestation:
         value = signer.sign(self.signing_input(signer.alg, signer.key_id))
         return replace(self, signature=Signature(signer.alg, signer.key_id, value))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this."""
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("attestation", self.signature, verifier, self.signing_input)
 
     @classmethod
@@ -1262,8 +1273,9 @@ class DeliveryReceipt:
         value = signer.sign(self.signing_input(signer.alg, signer.key_id))
         return replace(self, signature=Signature(signer.alg, signer.key_id, value))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this."""
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("delivery receipt", self.signature, verifier, self.signing_input)
 
     def with_log_anchor(self, log_id: str, leaf_index: int) -> DeliveryReceipt:
@@ -1364,8 +1376,9 @@ class Checkpoint:
         value = signer.sign(self.signing_input(signer.alg, signer.key_id))
         return replace(self, signature=Signature(signer.alg, signer.key_id, value))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless the log's key signed this."""
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless the log's key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("checkpoint", self.signature, verifier, self.signing_input)
 
     @classmethod
@@ -1414,8 +1427,9 @@ class Cosignature:
         value = signer.sign(self.signing_input(signer.alg, signer.key_id))
         return replace(self, signature=Signature(signer.alg, signer.key_id, value))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless the witness's key signed this."""
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless the witness's key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("cosignature", self.signature, verifier, self.signing_input)
 
     @classmethod

@@ -20,6 +20,9 @@ and checkpoints go to ``<path>.checkpoints``. Reopening resumes the log,
 re-checking every receipt's position, every checkpoint's signature and root
 against the receipts, and the signature of every receipt the log signed since
 its last checkpoint; and it cuts off a final line torn by a crash mid-append.
+Every signature is checked under the log's keyring, never by the signer, so
+reopening a log whose key is held by a key service makes no calls to it, and
+a log whose key was rotated reopens with the old key in its keyring.
 One process holds a log for writing at a time; a second is refused.
 """
 
@@ -29,7 +32,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,7 +59,7 @@ from agentgov.receipts.schema import (
     _check_text,
     document_from_json,
 )
-from agentgov.receipts.signing import Signer
+from agentgov.receipts.signing import Keyring, Signer, Verifier, verifier_of
 from agentgov.receipts.witness import Witness
 
 __all__ = ["CheckpointPolicy", "ReceiptLog"]
@@ -86,6 +89,10 @@ class ReceiptLog:
     :param log_id: The log's name, recorded in every receipt and checkpoint.
     :param signer: Signs the receipts :meth:`issue` places and every
         checkpoint.
+    :param keyring: The keys, besides ``signer``'s own, that the log's
+        existing checkpoints and receipts may be signed with: the keys it was
+        signed with before a rotation. Reopening checks each signature under
+        the key it names, and never calls the signer.
     :param path: A JSON-lines file to persist to. ``None`` keeps the log in
         memory.
     :param witnesses: Cosign each published checkpoint.
@@ -101,6 +108,7 @@ class ReceiptLog:
         log_id: str,
         signer: Signer,
         *,
+        keyring: Keyring | Verifier | Iterable[Verifier | str] | None = None,
         path: str | Path | None = None,
         witnesses: Sequence[Witness] = (),
         policy: CheckpointPolicy | None = None,
@@ -112,6 +120,8 @@ class ReceiptLog:
         except MalformedReceiptError as exc:
             raise ValueError(str(exc)) from exc
         self._signer = signer
+        trusted = list(Keyring.of(keyring)) if keyring is not None else []
+        self._keyring = Keyring([*trusted, verifier_of(signer)])
         self._witnesses = tuple(witnesses)
         self._policy = policy if policy is not None else CheckpointPolicy()
         self._clock = clock if clock is not None else (lambda: datetime.now(UTC))
@@ -139,6 +149,12 @@ class ReceiptLog:
     @property
     def log_id(self) -> str:
         return self._log_id
+
+    @property
+    def keyring(self) -> Keyring:
+        """The keys this log's signatures are checked under: the signer's,
+        and any it was given for signatures made before a rotation."""
+        return self._keyring
 
     def __len__(self) -> int:
         with self._lock:
@@ -401,7 +417,7 @@ class ReceiptLog:
         ):
             try:
                 checkpoint = Checkpoint.from_json(loads_strict(line), f"checkpoint {number}")
-                checkpoint.verify(self._signer)
+                checkpoint.verify(self._keyring)
             except (MalformedReceiptError, ReceiptSignatureError) as exc:
                 raise ReceiptLogError(f"{path}.checkpoints line {number}: {exc}") from exc
             if (
@@ -420,9 +436,9 @@ class ReceiptLog:
         # this log signed before a checkpoint can sign over an edited one.
         for index in range(covered, len(self._receipts)):
             receipt = self._receipts[index]
-            if receipt.signature is not None and receipt.signature.key_id == self._signer.key_id:
+            if receipt.signature is not None and receipt.signature.key_id in self._keyring:
                 try:
-                    receipt.verify(self._signer)
+                    receipt.verify(self._keyring)
                 except ReceiptSignatureError as exc:
                     raise ReceiptLogError(
                         f"{path} line {index + 1}: {exc}; the log was edited"

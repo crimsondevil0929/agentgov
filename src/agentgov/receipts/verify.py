@@ -55,7 +55,7 @@ from agentgov.receipts.schema import (
     instant,
     money_text,
 )
-from agentgov.receipts.signing import Verifier
+from agentgov.receipts.signing import Keyring, Verifier
 from agentgov.receipts.witness import find_cosignature
 
 if TYPE_CHECKING:
@@ -130,10 +130,10 @@ class VerificationReport:
 def verify_bundle(
     bundle: ReceiptBundle | str | bytes,
     *,
-    issuer_key: Verifier,
-    log_key: Verifier | None = None,
+    issuer_key: Verifier | Keyring,
+    log_key: Verifier | Keyring | None = None,
     cosignatures: Sequence[Cosignature] | None = None,
-    witness_key: Verifier | None = None,
+    witness_key: Verifier | Keyring | None = None,
     ledger: BudgetManager | None = None,
     rows: RowDisclosure | None = None,
     relay_keys: Iterable[Verifier] | None = None,
@@ -142,12 +142,14 @@ def verify_bundle(
     """Verify a receipt bundle against the keys and records the caller trusts.
 
     :param bundle: A decoded bundle, or its JSON text.
-    :param issuer_key: The key that must have signed the receipt.
-    :param log_key: The key that must have signed the log checkpoint;
-        ``issuer_key`` by default.
+    :param issuer_key: The key that must have signed the receipt, or a
+        keyring of the keys that may have (a key and its successor).
+    :param log_key: The key, or keyring, that must have signed the log
+        checkpoint; ``issuer_key`` by default.
     :param cosignatures: A witness's published cosignatures. With
         ``witness_key``, the bundle's checkpoint must be among them.
-    :param witness_key: The witness's key; required with ``cosignatures``.
+    :param witness_key: The witness's key, or keyring; required with
+        ``cosignatures``.
     :param ledger: An AgentGov ledger the receipt's agentgov anchor and cost
         must agree with.
     :param rows: Disclosed rows that must be in the receipt's row commitment.
@@ -188,10 +190,10 @@ def verify_bundle(
 def _verify_delivery(
     bundle: ReceiptBundle,
     receipt: DeliveryReceipt,
-    issuer_key: Verifier,
-    log_key: Verifier | None,
+    issuer_key: Verifier | Keyring,
+    log_key: Verifier | Keyring | None,
     cosignatures: Sequence[Cosignature] | None,
-    witness_key: Verifier | None,
+    witness_key: Verifier | Keyring | None,
     relay_keys: Iterable[Verifier] | None,
     action: ReceiptBundle | str | bytes | None,
 ) -> VerificationReport:
@@ -244,8 +246,8 @@ def _check_binding(
     bundle: ReceiptBundle,
     receipt: DeliveryReceipt,
     action: ReceiptBundle | str | bytes | None,
-    issuer_key: Verifier,
-    log_key: Verifier | None,
+    issuer_key: Verifier | Keyring,
+    log_key: Verifier | Keyring | None,
 ) -> Check:
     name = "action binding"
     if action is None:
@@ -290,15 +292,27 @@ def _check_binding(
     )
 
 
-def _check_signature(receipt: LogDocument, key: Verifier) -> Check:
+def _used(keys: Verifier | Keyring, key_id: str) -> Verifier:
+    """The key that verified a signature naming ``key_id``."""
+    if isinstance(keys, Keyring):
+        found = keys.get(key_id)
+        if found is None:  # pragma: no cover - only called once it verified
+            raise AssertionError(key_id)
+        return found
+    return keys
+
+
+def _check_signature(receipt: LogDocument, key: Verifier | Keyring) -> Check:
     try:
         receipt.verify(key)
     except ReceiptSignatureError as exc:
         return Check("receipt signature", "fail", str(exc), Failure.SIGNATURE)
-    return Check("receipt signature", "pass", f"{key.alg}, key {key.key_id}")
+    assert receipt.signature is not None  # it verified
+    used = _used(key, receipt.signature.key_id)
+    return Check("receipt signature", "pass", f"{used.alg}, key {used.key_id}")
 
 
-def _check_inclusion(bundle: ReceiptBundle, log_key: Verifier) -> Check:
+def _check_inclusion(bundle: ReceiptBundle, log_key: Verifier | Keyring) -> Check:
     name = "log inclusion"
     checkpoint, proof = bundle.checkpoint, bundle.inclusion
     if checkpoint is None or proof is None:
@@ -350,7 +364,9 @@ def _check_inclusion(bundle: ReceiptBundle, log_key: Verifier) -> Check:
 
 
 def _check_witness(
-    bundle: ReceiptBundle, cosignatures: Sequence[Cosignature] | None, key: Verifier | None
+    bundle: ReceiptBundle,
+    cosignatures: Sequence[Cosignature] | None,
+    key: Verifier | Keyring | None,
 ) -> Check:
     name = "witnessed"
     if cosignatures is None:
@@ -365,10 +381,13 @@ def _check_witness(
         cosignature = find_cosignature(bundle.checkpoint, cosignatures, key)
     except WitnessError as exc:
         return Check(name, "fail", str(exc), Failure.WITNESS)
+    assert cosignature.signature is not None  # it verified
+    used = _used(key, cosignature.signature.key_id)
     return Check(
         name,
         "pass",
-        f"by {cosignature.witness_id!r} (key {key.key_id}) at {cosignature.body()['witnessed_at']}",
+        f"by {cosignature.witness_id!r} (key {used.key_id}) at "
+        f"{cosignature.body()['witnessed_at']}",
     )
 
 
