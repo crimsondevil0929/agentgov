@@ -39,6 +39,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agentgov.core import (
+    CheckpointSigning,
     _ChainState,
     _decode_snapshot,
     _encode_snapshot,
@@ -97,6 +98,8 @@ class Auditor:
         governor takes no more than its share of the interpreter.
     :param record: Record marks in the store. Off for a one-off check that
         should leave the database exactly as it found it.
+    :param signing: Check each snapshot's signed statement too (see
+        :class:`~agentgov.core.CheckpointSigning`).
     """
 
     def __init__(
@@ -107,6 +110,7 @@ class Auditor:
         chunk: int = 10_000,
         duty: float = 1.0,
         record: bool = True,
+        signing: CheckpointSigning | None = None,
     ) -> None:
         if not 0 < duty <= 1:
             raise ValueError(f"duty must be in (0, 1], got {duty}")
@@ -117,6 +121,8 @@ class Auditor:
         self._chunk = chunk
         self._duty = duty
         self._record = record
+        self._signing = signing
+        self._first: str | None = None
         self._stop: threading.Event | None = None
 
     # -- one run ------------------------------------------------------------
@@ -215,6 +221,11 @@ class Auditor:
                 f"the snapshot stored for sequence {state.length} is not the state the chain "
                 f"implies there"
             )
+        if self._signing is not None:
+            if self._first is None:
+                first = self._store.entry_at(1)
+                self._first = first.entry_hash if first is not None else ""
+            self._signing.check(stored, state, self._first)
 
     def _mark(
         self, state: _ChainState, status: str, detail: str, *, sequence: int | None = None
@@ -277,10 +288,11 @@ class AuditorThread:
         interval: float = 5.0,
         duty: float = 0.25,
         on_failure: Callable[[str], None] | None = None,
+        signing: CheckpointSigning | None = None,
     ) -> None:
         self._store = store
         self._stop = threading.Event()
-        self._auditor = Auditor(store, duty=duty)
+        self._auditor = Auditor(store, duty=duty, signing=signing)
         self._interval = interval
         self._on_failure = on_failure
         self._thread = threading.Thread(target=self._run, name="agentgov-auditor", daemon=True)

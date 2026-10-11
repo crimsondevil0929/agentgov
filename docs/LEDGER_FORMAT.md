@@ -307,6 +307,36 @@ it with the frontier's last node once for each trailing one bit of `n`. The
 tree's root folds the frontier from the right; the root of no entries is
 SHA-256 of the empty string. `chain.json` gives the root of its chain.
 
+### 4.4 The signed statement
+
+A snapshot is trusted for every entry before it. To make rewriting that
+history take a key as well as write access to the database, a governor with a
+checkpoint signer stores with each snapshot, in its `signature` column, a
+**checkpoint statement** the key signed:
+
+| Field | Content |
+|---|---|
+| `v` | `"agentgov-checkpoint"` |
+| `first` | the `entry_hash` of entry 1: which ledger |
+| `sequence` | `s` |
+| `head` | the `entry_hash` of entry `s` |
+| `root` | the Merkle root (§4.3) of entries 1 to `s` |
+| `snapshot` | the snapshot's digest (§4.1) |
+| `issued_at` | when it was signed, as `YYYY-MM-DDTHH:MM:SS.ffffffZ` |
+| `sig` | the signature, as an ARC1 `sig` object |
+
+It is signed exactly as an ARC1 document is (`docs/RECEIPTS.md` §4): over
+`agentgov/checkpoint/v1\n` followed by the canonical encoding of the statement
+with `sig` reduced to `{"alg", "key_id"}`, or, at signature version 2, over
+`agentgov/checkpoint/v2\n` followed by the SHA-512 of the encoding with
+`"sv": 2` in the header. The column holds the statement's canonical encoding.
+
+A reader that trusts some keys accepts a snapshot only if its statement
+verifies under one of them and its `first`, `sequence`, `head`, `root` and
+`snapshot` are the ledger's and the snapshot's own. A statement signed by any
+other key is tampering, whether or not signatures are required. Entries after
+the newest checkpoint are held by the hash chain alone.
+
 ## 5. Storage layouts
 
 The SQLite layout is schema `3`; the PostgreSQL layout is `pg2`. Both hold
@@ -340,8 +370,10 @@ PostgreSQL `pg1` (v0.3, v0.4) upgrade to the current layouts.
 
 A **full verification** replays every entry from genesis under §3 and checks,
 at every checkpoint's `s`, that the snapshot stored for `s` is the canonical
-encoding of the replayed state and has the digest the checkpoint entry names.
-It then compares the caches with the state. `agentgov verify` does this.
+encoding of the replayed state and has the digest the checkpoint entry names,
+and, given the keys trusted to sign checkpoints, that its statement (§4.4)
+checks out. It then compares the caches with the state. `agentgov verify`
+does this (`--checkpoint-key`, `--require-signed`).
 
 An **open from a checkpoint** (what a governor does by default) finds the
 newest checkpoint entry, reads the snapshot it names, checks the digest,

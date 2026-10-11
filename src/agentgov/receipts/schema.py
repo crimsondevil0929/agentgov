@@ -369,7 +369,17 @@ def _signing_input(
     if version != 2:
         raise ValueError(f"signature version {version!r} is not 1 or 2")
     header = {"alg": alg, "key_id": key_id, "sv": 2}
-    return _DOMAIN_V2[domain] + hashlib.sha512(canonical_bytes({**body, "sig": header})).digest()
+    return _domain_v2(domain) + hashlib.sha512(canonical_bytes({**body, "sig": header})).digest()
+
+
+def _domain_v2(domain: bytes) -> bytes:
+    """A document type's version 2 domain: its version 1 domain, ``v2`` for ``v1``."""
+    found = _DOMAIN_V2.get(domain)
+    if found is not None:
+        return found
+    if not domain.endswith(b"/v1\n"):
+        raise ValueError(f"{domain!r} is not a version 1 domain")
+    return domain[: -len(b"v1\n")] + b"v2\n"
 
 
 def _signature_version(signer: object, version: int | None) -> int:

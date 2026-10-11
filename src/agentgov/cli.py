@@ -64,7 +64,13 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from agentgov.audit import Auditor
-from agentgov.core import BudgetManager, BudgetNode, EntryType, format_audit_line
+from agentgov.core import (
+    BudgetManager,
+    BudgetNode,
+    CheckpointSigning,
+    EntryType,
+    format_audit_line,
+)
 from agentgov.exceptions import (
     AgentGovError,
     LedgerError,
@@ -216,6 +222,18 @@ def _command_inspect(args: argparse.Namespace, out: TextIO) -> int:
 
 def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
     """Re-derive every invariant and report PASS/FAIL for a pipeline."""
+    signing = None
+    if args.checkpoint_key or args.require_signed:
+        if not args.checkpoint_key:
+            out.write("error: --require-signed needs --checkpoint-key, the key that signs\n")
+            return 2
+        try:
+            signing = CheckpointSigning(
+                keys=_read_keys(args.checkpoint_key), required=args.require_signed
+            )
+        except (OSError, MalformedReceiptError) as exc:
+            out.write(f"error: {exc}\n")
+            return 2
     try:
         manager = _open(args.path)
     except AgentGovError as exc:
@@ -228,7 +246,11 @@ def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
             ("hash chain, balances + hold pairing", manager.ledger.verify_chain),
             ("conservation identity", manager.ledger.verify_conservation),
             ("topology + breakers, derived from the chain", manager.verify_integrity),
-            ("checkpoint snapshots, each the state the chain implies", _snapshots(manager)),
+            (
+                "checkpoint snapshots, each the state the chain implies"
+                + (", each signed by a trusted key" if signing is not None else ""),
+                _snapshots(manager, signing),
+            ),
         ):
             try:
                 check()
@@ -237,7 +259,7 @@ def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
                 checks.append((label, str(exc)))
 
         failures = [(label, detail) for label, detail in checks if detail is not None]
-        entries = len(manager.audit_trail())
+        entries = len(manager.ledger)
         for label, detail in checks:
             mark = "ok  " if detail is None else "FAIL"
             out.write(f"  {mark}  {label}\n")
@@ -256,15 +278,18 @@ def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
         manager.close()
 
 
-def _snapshots(manager: BudgetManager) -> Callable[[], None]:
+def _snapshots(
+    manager: BudgetManager, signing: CheckpointSigning | None = None
+) -> Callable[[], None]:
     """A check that every checkpoint's snapshot is the state the chain implies
-    at its sequence, recording nothing."""
+    at its sequence (and, with ``signing``, carries a trusted key's signed
+    statement of it), recording nothing."""
 
     def check() -> None:
         store = manager.store
         if store is None or not hasattr(store, "checkpoints"):
             return
-        report = Auditor(store, record=False).run(from_genesis=True)
+        report = Auditor(store, record=False, signing=signing).run(from_genesis=True)
         if report.failure is not None:
             raise LedgerIntegrityError(report.failure)
 
@@ -528,6 +553,18 @@ def build_parser() -> argparse.ArgumentParser:
         "verify", help="re-derive every invariant; exit 0 on PASS, 1 on FAIL"
     )
     verify.add_argument("path", help=_TARGET)
+    verify.add_argument(
+        "--checkpoint-key",
+        action="append",
+        default=[],
+        help="a key trusted to sign the ledger's checkpoints ('ed25519:<hex>' or a file); "
+        "repeatable. Every signed checkpoint must then check out under one",
+    )
+    verify.add_argument(
+        "--require-signed",
+        action="store_true",
+        help="fail on a checkpoint no --checkpoint-key signed",
+    )
     verify.set_defaults(handler=_command_verify)
 
     reconcile_cmd = subcommands.add_parser(

@@ -1870,6 +1870,188 @@ def _snapshot_digest(body: bytes) -> str:
     return hashlib.sha256(_SNAPSHOT_DOMAIN + body).hexdigest()
 
 
+_STATEMENT_VERSION: Final = "agentgov-checkpoint"
+_STATEMENT_DOMAIN: Final = b"agentgov/checkpoint/v1\n"
+_STATEMENT_FIELDS: Final = (
+    "v",
+    "first",
+    "sequence",
+    "head",
+    "root",
+    "snapshot",
+    "issued_at",
+    "sig",
+)
+
+
+@dataclass(frozen=True)
+class _CheckpointStatement:
+    """A key's signed word for one checkpoint of a ledger, kept with its
+    snapshot: which ledger (the hash of its first entry), which sequence, the
+    head and the RFC 9162 root of every entry up to it, and the digest of the
+    snapshot of the state there. Signed as ARC1 documents are (canonical JSON,
+    ``sig`` reduced to its header, domain ``agentgov/checkpoint/v1``, or
+    ``v2`` at signature version 2). See docs/LEDGER_FORMAT.md."""
+
+    first: str
+    sequence: int
+    head: str
+    root: str
+    snapshot: str
+    issued_at: datetime
+    signature: Any = None
+
+    def facts(self) -> tuple[str, int, str, str, str]:
+        return (self.first, self.sequence, self.head, self.root, self.snapshot)
+
+    def body(self) -> dict[str, object]:
+        return {
+            "v": _STATEMENT_VERSION,
+            "first": self.first,
+            "sequence": self.sequence,
+            "head": self.head,
+            "root": self.root,
+            "snapshot": self.snapshot,
+            "issued_at": _iso(self.issued_at),
+        }
+
+    def signing_input(self, alg: str, key_id: str, version: int = 1) -> bytes:
+        from agentgov.receipts.schema import _signing_input
+
+        return _signing_input(_STATEMENT_DOMAIN, self.body(), alg, key_id, version)
+
+    def sign(self, signer: Any) -> _CheckpointStatement:
+        from agentgov.receipts.schema import Signature, _signature_version
+
+        version = _signature_version(signer, None)
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id, version))
+        return dataclasses.replace(
+            self, signature=Signature(signer.alg, signer.key_id, value, version)
+        )
+
+    def verify(self, keys: Any) -> None:
+        """:raises ReceiptSignatureError: Unless a key of ``keys`` signed this."""
+        from agentgov.receipts.schema import _check_signature
+
+        _check_signature("checkpoint statement", self.signature, keys, self.signing_input)
+
+    def text(self) -> str:
+        from agentgov.receipts.canonical import canonical_bytes
+
+        sig = self.signature.to_json() if self.signature is not None else None
+        return canonical_bytes({**self.body(), "sig": sig}).decode("utf-8")
+
+    @classmethod
+    def loads(cls, text: str) -> _CheckpointStatement:
+        """:raises MalformedReceiptError: If ``text`` is not a statement."""
+        from agentgov.receipts.canonical import loads_strict
+        from agentgov.receipts.schema import Signature, _Fields, _sig_fields
+
+        f = _Fields(loads_strict(text), "checkpoint statement", _STATEMENT_FIELDS)
+        f.version(_STATEMENT_VERSION)
+        sig = f.optional_child("sig", _sig_fields(f.raw("sig")))
+        return cls(
+            first=f.hex64("first"),
+            sequence=f.integer("sequence", minimum=1),
+            head=f.hex64("head"),
+            root=f.hex64("root"),
+            snapshot=f.hex64("snapshot"),
+            issued_at=f.instant("issued_at"),
+            signature=Signature.from_json(sig) if sig else None,
+        )
+
+
+@dataclass(frozen=True)
+class CheckpointSigning:
+    """Signed ledger checkpoints: who signs them, whose signatures count, and
+    whether a governor may open from one no trusted key signed.
+
+    A checkpoint snapshot is trusted for everything before it, so without a
+    signature anyone who can write the database can rewrite that history
+    consistently. With one, rewriting it takes the key too: a governor opening
+    from a checkpoint checks that a trusted key signed the statement kept
+    with its snapshot, which names the ledger, the checkpoint's sequence, the
+    head and the Merkle root of every entry up to it, and the snapshot's
+    digest. Entries after the newest checkpoint are hash-chained, not signed.
+
+    :ivar signer: Signs every checkpoint this governor writes, automatic or
+        not; ``None`` writes them unsigned. A key service's
+        :class:`~agentgov.receipts.signing.RemoteSigner` serves.
+    :ivar keys: The keys trusted to have signed the ledger's checkpoints, as
+        a keyring, one key, or several (a key and its successor); the
+        signer's own is always trusted. A signature by any other key is
+        refused, as tampering.
+    :ivar required: Refuse to open from a checkpoint no trusted key signed.
+        Optional in the API, and required in production.
+    :raises ValueError: If signatures are required but no key could check one.
+    """
+
+    signer: Any = None
+    keys: Any = None
+    required: bool = False
+
+    def __post_init__(self) -> None:
+        if self.required and self.signer is None and self.keys is None:
+            raise ValueError("signed checkpoints are required, but no key is trusted to sign them")
+
+    def keyring(self) -> Any:
+        """Every key trusted to have signed a checkpoint."""
+        from agentgov.receipts.signing import Keyring, verifier_of
+
+        trusted = list(Keyring.of(self.keys)) if self.keys is not None else []
+        if self.signer is not None:
+            trusted.append(verifier_of(self.signer))
+        return Keyring(trusted)
+
+    def statement(
+        self, first: str, state: _ChainState, digest: str, issued_at: datetime
+    ) -> str | None:
+        """The signed statement for a checkpoint of ``state``, or ``None``
+        without a signer."""
+        if self.signer is None:
+            return None
+        unsigned = _CheckpointStatement(
+            first=first,
+            sequence=state.length,
+            head=state.head,
+            root=_frontier_root(state.frontier).hex(),
+            snapshot=digest,
+            issued_at=issued_at,
+        )
+        return unsigned.sign(self.signer).text()
+
+    def check(self, snapshot: Any, state: _ChainState, first: str) -> None:
+        """A snapshot's statement, against the state it decodes to.
+
+        :raises LedgerIntegrityError: If it is unsigned when signatures are
+            required, signed by no trusted key, or describes another state.
+        """
+        sequence = snapshot.sequence
+        if not snapshot.signature:
+            if self.required:
+                raise LedgerIntegrityError(
+                    f"the checkpoint of sequence {sequence} is not signed, and this governor "
+                    f"requires signed checkpoints"
+                )
+            return
+        from agentgov.exceptions import MalformedReceiptError, ReceiptSignatureError
+
+        try:
+            statement = _CheckpointStatement.loads(snapshot.signature)
+            statement.verify(self.keyring())
+        except (MalformedReceiptError, ReceiptSignatureError) as exc:
+            raise LedgerIntegrityError(
+                f"the checkpoint of sequence {sequence} carries a signed statement that does not "
+                f"check out: {exc}"
+            ) from exc
+        expected = (first, state.length, state.head, _frontier_root(state.frontier).hex())
+        if statement.facts() != (*expected, snapshot.digest):
+            raise LedgerIntegrityError(
+                f"the signed statement of the checkpoint of sequence {sequence} does not "
+                f"describe its snapshot: it was made for another state"
+            )
+
+
 class _Reader:
     """Typed, path-reporting reads out of a decoded snapshot document."""
 
@@ -2421,18 +2603,26 @@ class Ledger:
         return ledger
 
     @classmethod
-    def _from_image(cls, store: PersistenceStore, image: StoreImage, *, finish: bool) -> Ledger:
+    def _from_image(
+        cls,
+        store: PersistenceStore,
+        image: StoreImage,
+        *,
+        finish: bool,
+        signing: CheckpointSigning | None = None,
+    ) -> Ledger:
         """A ledger over ``store`` from one consistent read of it: replayed in
-        full, or from the checkpoint snapshot the image carries."""
+        full, or from the checkpoint snapshot the image carries, checked
+        against ``signing``."""
         if image.snapshot is None:
             return cls._from_entries(store, image.entries, _legacy_events(image), finish=finish)
         ledger = cls()
         ledger._store = store
         ledger._entries = None if _keeps_history(store) else []
-        ledger._adopt_snapshot(image)
+        ledger._adopt_snapshot(image, signing)
         return ledger
 
-    def _adopt_snapshot(self, image: StoreImage) -> None:
+    def _adopt_snapshot(self, image: StoreImage, signing: CheckpointSigning | None = None) -> None:
         """Serve the state a checkpoint snapshot holds, and the entries after it.
 
         The snapshot must be the one the newest CHECKPOINT entry commits to,
@@ -2467,6 +2657,10 @@ class Ledger:
             raise LedgerIntegrityError(
                 f"the snapshot stored as sequence {snapshot.sequence} is of sequence {state.length}"
             )
+        if signing is not None:
+            assert self._store is not None
+            first = self._store.entry_at(1)  # type: ignore[attr-defined]
+            signing.check(snapshot, state, first.entry_hash if first is not None else "")
         if image.entries[0].sequence != state.length + 1:
             raise LedgerIntegrityError("the entries after the checkpoint do not follow it")
         legacy = _legacy_events(image)
@@ -3284,6 +3478,8 @@ class BudgetManager:
     :param repair: When the store's cache tables (topology, control events,
         open authorizations) disagree with the chain, rebuild them from the
         chain instead of refusing to open. Moves no money.
+    :param signing: Sign the checkpoints this governor writes and check the
+        one it opens from (see :class:`CheckpointSigning`).
 
     **A shared ledger.** Over a :class:`~agentgov.storage.SharedStore` (see
     :meth:`open_postgres`) this manager is one of several governors writing
@@ -3306,6 +3502,7 @@ class BudgetManager:
         repair: bool = False,
         verify: str = "checkpoint",
         auditor: bool | None = None,
+        signing: CheckpointSigning | None = None,
     ) -> None:
         if verify not in _VERIFY_POLICIES:
             raise ValueError(f"verify must be one of {sorted(_VERIFY_POLICIES)}, got {verify!r}")
@@ -3328,7 +3525,7 @@ class BudgetManager:
                 image = store.load()  # a store written before checkpoints existed
             legacy = _legacy_events(image)
             if ledger is None:
-                ledger = Ledger._from_image(store, image, finish=store.read_only)
+                ledger = Ledger._from_image(store, image, finish=store.read_only, signing=signing)
             elif shared is not None and (len(ledger), ledger.head_hash) != _image_head(image):
                 # A ledger read from a shared store before this snapshot may
                 # be behind it; serve the snapshot, which the caches match.
@@ -3348,6 +3545,7 @@ class BudgetManager:
         self._depth = 0
         self._checkpointing = False
         self._verify = verify
+        self._signing = signing
         self._auditor: Any = None
         self._velocity: dict[str, _Velocity] = {}
         self._repairs: tuple[str, ...] = ()
@@ -3389,7 +3587,9 @@ class BudgetManager:
             return
         from agentgov.audit import AuditorThread
 
-        self._auditor = AuditorThread(holder.fork(), on_failure=self._audit_failed)
+        self._auditor = AuditorThread(
+            holder.fork(), on_failure=self._audit_failed, signing=self._signing
+        )
 
     def _audit_failed(self, detail: str) -> None:
         """The auditor found the chain does not verify: write nothing more."""
@@ -3407,6 +3607,7 @@ class BudgetManager:
         repair: bool = False,
         verify: str = "checkpoint",
         auditor: bool | None = None,
+        signing: CheckpointSigning | None = None,
     ) -> BudgetManager:
         """Open (or create) a durable, SQLite-backed governor in one call.
 
@@ -3447,6 +3648,8 @@ class BudgetManager:
             this governor's, to replay the history an open from a checkpoint
             did not. On by default exactly when this open started from a
             checkpoint; pass ``False`` where a sidecar audits instead.
+        :param signing: Sign every checkpoint this governor writes, and check
+            the one it opens from: see :class:`CheckpointSigning`.
         :returns: A restored or freshly created :class:`BudgetManager`.
         :raises agentgov.exceptions.ConcurrentGovernorError: If another
             process already holds this database for writing. Two governors
@@ -3460,7 +3663,14 @@ class BudgetManager:
 
         store = SqliteStore(path, synchronous=synchronous, read_only=read_only)
         try:
-            return cls(policy=policy, store=store, repair=repair, verify=verify, auditor=auditor)
+            return cls(
+                policy=policy,
+                store=store,
+                repair=repair,
+                verify=verify,
+                auditor=auditor,
+                signing=signing,
+            )
         except BaseException:
             # Never leak the advisory claim if restore-and-verify rejects the
             # file: the next process to try must not be told it is contended.
@@ -3480,6 +3690,7 @@ class BudgetManager:
         idle_timeout: float = 60.0,
         verify: str = "checkpoint",
         auditor: bool | None = None,
+        signing: CheckpointSigning | None = None,
     ) -> BudgetManager:
         """Open one governor of a ledger shared through PostgreSQL.
 
@@ -3506,6 +3717,7 @@ class BudgetManager:
             an open transaction, holding the lock, before ending its session.
         :param verify: What to verify at open; see :meth:`open_sqlite`.
         :param auditor: Run an auditor thread; see :meth:`open_sqlite`.
+        :param signing: Sign checkpoints, and check them; see :meth:`open_sqlite`.
         :raises agentgov.exceptions.StorageError: If the database cannot be
             reached.
         :raises agentgov.exceptions.LedgerIntegrityError: If the shared chain,
@@ -3521,7 +3733,14 @@ class BudgetManager:
             idle_timeout=idle_timeout,
         )
         try:
-            return cls(policy=policy, store=store, repair=repair, verify=verify, auditor=auditor)
+            return cls(
+                policy=policy,
+                store=store,
+                repair=repair,
+                verify=verify,
+                auditor=auditor,
+                signing=signing,
+            )
         except BaseException:
             store.close()
             raise
@@ -3966,8 +4185,17 @@ class BudgetManager:
                 return last[0]  # nothing since but the checkpoint entry itself
             sequence = state.length
             body = _encode_snapshot(state)
+            signed = state.copy() if self._signing is not None else None
         digest = _snapshot_digest(body)
-        store.put_snapshot(Snapshot(sequence=sequence, digest=digest, body=body))
+        statement = None
+        if signed is not None and self._signing is not None:
+            # Signed outside every lock: a key service may take its time.
+            first = self._ledger.entry(1)
+            assert first is not None
+            statement = self._signing.statement(first.entry_hash, signed, digest, datetime.now(UTC))
+        store.put_snapshot(
+            Snapshot(sequence=sequence, digest=digest, body=body, signature=statement)
+        )
         with self._mutating():
             last = self._state.last_checkpoint
             if last is not None and last[0] >= sequence:
@@ -3986,6 +4214,65 @@ class BudgetManager:
             )
             self._commit(pending)
         return sequence
+
+    def publish_checkpoint(self, witnesses: Sequence[Any]) -> Any:
+        """Have witnesses cosign the ledger's newest checkpoint.
+
+        The checkpoint is published as an ARC1 checkpoint of the Merkle tree
+        of the ledger's entries (§4.3 of the ledger format) up to it, signed by
+        the checkpoint signer, under the log id
+        ``agentgov-ledger:<hash of entry 1>``; each witness checks it extends
+        what it cosigned before, so a rewritten history cannot be witnessed.
+        Witnesses need the signer's key for that log id. The consistency
+        proofs are computed from every entry hash up to the checkpoint, so
+        this costs time in proportion to the ledger: run it from a periodic
+        job, not on the write path.
+
+        :returns: The ARC1 checkpoint the witnesses were asked to cosign.
+        :raises ValueError: Without a checkpoint signer, or a checkpoint.
+        :raises WitnessError: If a witness refuses or fails, naming each; the
+            others are still asked.
+        """
+        from agentgov.exceptions import WitnessError
+        from agentgov.receipts.merkle import MerkleTree, leaf_hash
+        from agentgov.receipts.schema import Checkpoint
+
+        signing = self._signing
+        if signing is None or signing.signer is None:
+            raise ValueError(
+                "publishing a checkpoint needs a checkpoint signer (CheckpointSigning)"
+            )
+        last = self._state.last_checkpoint
+        if last is None:
+            raise ValueError("the ledger has no checkpoint to publish")
+        sequence = last[0]
+        first = self._ledger.entry(1)
+        assert first is not None
+        tree = MerkleTree(
+            leaf_hash(bytes.fromhex(entry.entry_hash))
+            for entry in self._ledger.iter_entries(until=sequence)
+        )
+        checkpoint = Checkpoint(
+            log_id=f"agentgov-ledger:{first.entry_hash}",
+            tree_size=sequence,
+            root_hash=tree.root().hex(),
+            issued_at=datetime.now(UTC),
+        ).sign(signing.signer)
+        refusals: list[str] = []
+        for witness in witnesses:
+            try:
+                seen = witness.latest(checkpoint.log_id)
+                old = seen.tree_size if seen is not None else 0
+                proof = tree.consistency_proof(old, sequence) if old <= sequence else []
+                witness.cosign(checkpoint, proof)
+            except (WitnessError, OSError) as exc:
+                refusals.append(f"witness {witness.witness_id!r}: {exc}")
+        if refusals:
+            raise WitnessError(
+                f"ledger checkpoint {sequence} was not cosigned by {len(refusals)} of "
+                f"{len(witnesses)} witnesses; " + "; ".join(refusals)
+            )
+        return checkpoint
 
     @contextmanager
     def joined(self, connection: object) -> Iterator[JoinedTransaction]:
@@ -4260,7 +4547,13 @@ class BudgetManager:
         would, and adopted whole only once it checks out. A writer keeps its
         velocity windows: they are this process's own count, not the ledger's.
         """
-        fresh = BudgetManager(policy=self._policy, store=store, verify=self._verify, auditor=False)
+        fresh = BudgetManager(
+            policy=self._policy,
+            store=store,
+            verify=self._verify,
+            auditor=False,
+            signing=self._signing,
+        )
         self._ledger._publish(fresh._ledger._entries, fresh._ledger._state)
         self._ledger._open_auths = fresh._ledger._open_auths
         self._ledger._legacy_auth_ids = fresh._ledger._legacy_auth_ids
