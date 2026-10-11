@@ -541,7 +541,7 @@ def test_verify_passes_on_an_intact_ledger(ledger_path: str) -> None:
     code, output = run_cli("verify", ledger_path)
     assert code == 0
     assert "PASS" in output
-    assert output.count("ok  ") == 3
+    assert output.count("ok  ") == 4  # chain, conservation, topology, checkpoint snapshots
 
 
 def test_verify_fails_with_a_nonzero_exit_on_a_tampered_ledger(ledger_path: str) -> None:

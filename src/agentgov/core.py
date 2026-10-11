@@ -3285,6 +3285,7 @@ class BudgetManager:
         store: PersistenceStore | None = None,
         repair: bool = False,
         verify: str = "checkpoint",
+        auditor: bool | None = None,
     ) -> None:
         if verify not in _VERIFY_POLICIES:
             raise ValueError(f"verify must be one of {sorted(_VERIFY_POLICIES)}, got {verify!r}")
@@ -3327,6 +3328,7 @@ class BudgetManager:
         self._depth = 0
         self._checkpointing = False
         self._verify = verify
+        self._auditor: Any = None
         self._velocity: dict[str, _Velocity] = {}
         self._repairs: tuple[str, ...] = ()
         self._schema_version = ""
@@ -3335,6 +3337,44 @@ class BudgetManager:
 
         if store is not None and image is not None:
             self._restore_from_store(store, image, repair=repair)
+            self._start_auditing(
+                store, opened_from_checkpoint=image.snapshot is not None, want=auditor
+            )
+
+    def _start_auditing(
+        self, store: PersistenceStore, *, opened_from_checkpoint: bool, want: bool | None
+    ) -> None:
+        """Refuse to write a ledger an auditor found does not verify, and audit
+        what this open did not replay.
+
+        A governor that opened from a checkpoint trusted the snapshot for
+        everything before it; unless told otherwise it runs an auditor in a
+        thread of its own, which replays that history (once per ledger: it
+        resumes from the newest mark any auditor verified) and stops this
+        governor writing if the chain does not verify.
+        """
+        holder: Any = store
+        failure = holder.audit_failure() if hasattr(holder, "audit_failure") else None
+        if failure is not None:
+            message = (
+                f"an auditor found this ledger does not verify ({failure.detail}); investigate "
+                f"with `agentgov verify`. A later audit that verifies the chain clears this"
+            )
+            if not store.read_only:
+                raise LedgerIntegrityError(message)
+            logger.warning(message)
+            return
+        start = want if want is not None else opened_from_checkpoint
+        if store.read_only or not start or not hasattr(holder, "fork"):
+            return
+        from agentgov.audit import AuditorThread
+
+        self._auditor = AuditorThread(holder.fork(), on_failure=self._audit_failed)
+
+    def _audit_failed(self, detail: str) -> None:
+        """The auditor found the chain does not verify: write nothing more."""
+        with self._lock:
+            self._unusable = f"the auditor found the chain does not verify: {detail}"
 
     @classmethod
     def open_sqlite(
@@ -3346,6 +3386,7 @@ class BudgetManager:
         read_only: bool = False,
         repair: bool = False,
         verify: str = "checkpoint",
+        auditor: bool | None = None,
     ) -> BudgetManager:
         """Open (or create) a durable, SQLite-backed governor in one call.
 
@@ -3382,6 +3423,10 @@ class BudgetManager:
             it, in time bounded by the entries since that checkpoint;
             ``"full"`` replays the whole chain from genesis, as
             ``agentgov verify`` does.
+        :param auditor: Run an auditor (:mod:`agentgov.audit`) in a thread of
+            this governor's, to replay the history an open from a checkpoint
+            did not. On by default exactly when this open started from a
+            checkpoint; pass ``False`` where a sidecar audits instead.
         :returns: A restored or freshly created :class:`BudgetManager`.
         :raises agentgov.exceptions.ConcurrentGovernorError: If another
             process already holds this database for writing. Two governors
@@ -3395,7 +3440,7 @@ class BudgetManager:
 
         store = SqliteStore(path, synchronous=synchronous, read_only=read_only)
         try:
-            return cls(policy=policy, store=store, repair=repair, verify=verify)
+            return cls(policy=policy, store=store, repair=repair, verify=verify, auditor=auditor)
         except BaseException:
             # Never leak the advisory claim if restore-and-verify rejects the
             # file: the next process to try must not be told it is contended.
@@ -3414,6 +3459,7 @@ class BudgetManager:
         lock_timeout: float = 30.0,
         idle_timeout: float = 60.0,
         verify: str = "checkpoint",
+        auditor: bool | None = None,
     ) -> BudgetManager:
         """Open one governor of a ledger shared through PostgreSQL.
 
@@ -3439,6 +3485,7 @@ class BudgetManager:
         :param idle_timeout: Seconds the server lets this governor idle inside
             an open transaction, holding the lock, before ending its session.
         :param verify: What to verify at open; see :meth:`open_sqlite`.
+        :param auditor: Run an auditor thread; see :meth:`open_sqlite`.
         :raises agentgov.exceptions.StorageError: If the database cannot be
             reached.
         :raises agentgov.exceptions.LedgerIntegrityError: If the shared chain,
@@ -3454,7 +3501,7 @@ class BudgetManager:
             idle_timeout=idle_timeout,
         )
         try:
-            return cls(policy=policy, store=store, repair=repair, verify=verify)
+            return cls(policy=policy, store=store, repair=repair, verify=verify, auditor=auditor)
         except BaseException:
             store.close()
             raise
@@ -3466,10 +3513,14 @@ class BudgetManager:
         self.close()
 
     def close(self) -> None:
-        """Close the underlying durable store, if this manager has one.
+        """Close the underlying durable store, if this manager has one, and
+        stop its auditor.
 
         A no-op for a manager with no store. Safe to call more than once.
         """
+        auditor, self._auditor = self._auditor, None
+        if auditor is not None:
+            auditor.stop()
         self._ledger.close()
 
     # -- the chain state, as this manager serves it -----------------------
@@ -3812,6 +3863,8 @@ class BudgetManager:
             try:
                 shared = self._shared
                 if shared is None or self._writing:
+                    if self._store is not None and not self._store.read_only:
+                        self._require_following()
                     yield
                 else:
                     self._require_following()
@@ -4187,7 +4240,7 @@ class BudgetManager:
         would, and adopted whole only once it checks out. A writer keeps its
         velocity windows: they are this process's own count, not the ledger's.
         """
-        fresh = BudgetManager(policy=self._policy, store=store, verify=self._verify)
+        fresh = BudgetManager(policy=self._policy, store=store, verify=self._verify, auditor=False)
         self._ledger._publish(fresh._ledger._entries, fresh._ledger._state)
         self._ledger._open_auths = fresh._ledger._open_auths
         self._ledger._legacy_auth_ids = fresh._ledger._legacy_auth_ids

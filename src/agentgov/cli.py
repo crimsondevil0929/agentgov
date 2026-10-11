@@ -23,16 +23,31 @@ Two commands, aimed at two different readers:
     rebuilds those tables from the chain and says what it changed. Moves no
     money and never edits the chain.
 
+``agentgov audit <ledger> [--follow]``
+    For an operator or a sidecar: replays the chain from genesis, checks every
+    checkpoint snapshot against it, and records how far it verified in the
+    ledger itself (see :mod:`agentgov.audit`). A governor opens from its
+    newest checkpoint; this is what verifies the history before it.
+
+``agentgov checkpoint <ledger>``
+    Writes a checkpoint now, rather than waiting for the next automatic one.
+
+``agentgov export <ledger> --from-seq N``
+    Streams entries from sequence ``N`` as JSON lines, for an archive.
+
 ``agentgov verify-receipt <bundle> --pubkey <key>``
     For an auditor: verifies an ARC1 receipt offline — its signature, its
     inclusion in the receipt log, a witness's cosignature of that log, its
     agreement with the ledger, and any disclosed rows — and exits with a code
     naming the first thing that failed (see :mod:`agentgov.receipts.verify`).
 
-The ledger commands other than ``repair`` open the database **read-only**, so
-they are safe to run against a governor that is live and holding the write
-claim. ``repair`` needs the write claim, and is refused while a governor holds
-it.
+Every ledger command takes a path to a SQLite ledger or a URL
+(``sqlite:///path``, ``postgresql://...?schema=...``; see
+:mod:`agentgov.opening`). The ledger commands other than ``repair`` and
+``checkpoint`` open the ledger **read-only**, so they are safe to run against
+a governor that is live and holding the write claim, and they replay the chain
+in full from genesis rather than trusting a checkpoint. ``repair`` needs the
+write claim, and is refused while a governor holds it.
 
 Standard library only — argparse and nothing else, so the CLI costs the
 package no dependencies.
@@ -43,13 +58,20 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
+from agentgov.audit import Auditor
 from agentgov.core import BudgetManager, BudgetNode, EntryType, format_audit_line
-from agentgov.exceptions import AgentGovError, LedgerError, MalformedReceiptError
+from agentgov.exceptions import (
+    AgentGovError,
+    LedgerError,
+    LedgerIntegrityError,
+    MalformedReceiptError,
+)
+from agentgov.opening import open_url
 from agentgov.receipts import (
     Check,
     Failure,
@@ -72,11 +94,13 @@ from agentgov.reconciliation import (
 __all__ = ["main"]
 
 _DIRECTION_SIGN = {"DR": "-", "CR": "+", "--": " "}
+_TARGET = "a SQLite ledger's path, or a ledger URL (sqlite:///..., postgresql://...)"
 
 
 def _open(path: str) -> BudgetManager:
-    """Open a ledger for audit, never claiming it away from a live governor."""
-    return BudgetManager.open_sqlite(path, read_only=True)
+    """Open a ledger for audit, never claiming it away from a live governor,
+    and replaying it in full rather than trusting a checkpoint."""
+    return open_url(path, read_only=True, verify="full", auditor=False)
 
 
 def _money(amount: Decimal) -> str:
@@ -202,6 +226,7 @@ def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
             ("hash chain, balances + hold pairing", manager.ledger.verify_chain),
             ("conservation identity", manager.ledger.verify_conservation),
             ("topology + breakers, derived from the chain", manager.verify_integrity),
+            ("checkpoint snapshots, each the state the chain implies", _snapshots(manager)),
         ):
             try:
                 check()
@@ -224,6 +249,76 @@ def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
             f"\nPASS  {args.path}  "
             f"({entries:,} entries verified; head {manager.ledger.head_hash[:16]})\n"
         )
+        return 0
+    finally:
+        manager.close()
+
+
+def _snapshots(manager: BudgetManager) -> Callable[[], None]:
+    """A check that every checkpoint's snapshot is the state the chain implies
+    at its sequence, recording nothing."""
+
+    def check() -> None:
+        store = manager.store
+        if store is None or not hasattr(store, "checkpoints"):
+            return
+        report = Auditor(store, record=False).run(from_genesis=True)
+        if report.failure is not None:
+            raise LedgerIntegrityError(report.failure)
+
+    return check
+
+
+def _command_audit(args: argparse.Namespace, out: TextIO) -> int:
+    """Replay the chain from genesis, check every snapshot, record the marks."""
+    from agentgov.opening import parse_url
+
+    kind, target, options = parse_url(args.path)
+    store: Any
+    if kind == "postgres":
+        from agentgov.postgres import PostgresStore
+
+        store = PostgresStore(target, schema=options.get("schema", "agentgov"))
+    elif kind == "sqlite":
+        from agentgov.storage import SqliteStore
+
+        store = SqliteStore(target, read_only=True)
+    else:
+        out.write("error: a memory: ledger has nothing to audit\n")
+        return 2
+    try:
+        auditor = Auditor(store, name=args.name or None)
+        if args.follow:
+            report = auditor.follow(interval=args.interval)
+        else:
+            report = auditor.run(from_genesis=args.from_genesis)
+        if report.failure is not None:
+            out.write(f"FAIL  {args.path}\n  {report.failure}\n")
+            return 1
+        out.write(
+            f"PASS  {args.path}  (verified to {report.verified_to:,} from "
+            f"{report.resumed_from:,}: {report.entries:,} entries replayed, "
+            f"{report.checkpoints} checkpoint snapshot(s) checked; head {report.head[:16]})\n"
+        )
+        return 0
+    finally:
+        store.close()
+
+
+def _command_checkpoint(args: argparse.Namespace, out: TextIO) -> int:
+    """Write a checkpoint of the ledger now."""
+    with open_url(args.path, auditor=False) as manager:
+        sequence = manager.checkpoint()
+    out.write(f"checkpointed {args.path} at sequence {sequence:,}\n")
+    return 0
+
+
+def _command_export(args: argparse.Namespace, out: TextIO) -> int:
+    """Stream entries from a sequence on, as JSON lines."""
+    manager = open_url(args.path, read_only=True, auditor=False)
+    try:
+        for entry in manager.ledger.iter_entries(after=max(0, args.from_seq - 1)):
+            out.write(json.dumps(entry.to_audit_record(), sort_keys=True) + "\n")
         return 0
     finally:
         manager.close()
@@ -393,7 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = subcommands.add_parser(
         "inspect", help="print the ledger, balance tree, and breaker status"
     )
-    inspect.add_argument("path", help="path to the SQLite ledger")
+    inspect.add_argument("path", help=_TARGET)
     inspect.add_argument(
         "--limit", type=int, default=20, help="entries to show, 0 for all (default: 20)"
     )
@@ -408,14 +503,14 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subcommands.add_parser(
         "verify", help="re-derive every invariant; exit 0 on PASS, 1 on FAIL"
     )
-    verify.add_argument("path", help="path to the SQLite ledger")
+    verify.add_argument("path", help=_TARGET)
     verify.set_defaults(handler=_command_verify)
 
     reconcile_cmd = subcommands.add_parser(
         "reconcile",
         help="match a provider invoice against the ledger; exit 1 on unmetered spend",
     )
-    reconcile_cmd.add_argument("path", help="path to the SQLite ledger")
+    reconcile_cmd.add_argument("path", help=_TARGET)
     reconcile_cmd.add_argument("export", help="provider usage export (JSON or CSV)")
     reconcile_cmd.add_argument(
         "--journal",
@@ -454,6 +549,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     repair.add_argument("path", help="path to the SQLite ledger")
     repair.set_defaults(handler=_command_repair)
+
+    audit = subcommands.add_parser(
+        "audit",
+        help="replay the chain from genesis and check every checkpoint; exit 1 on FAIL",
+    )
+    audit.add_argument("path", help=_TARGET)
+    audit.add_argument("--follow", action="store_true", help="keep auditing what is written")
+    audit.add_argument(
+        "--interval", type=float, default=5.0, help="seconds between runs with --follow"
+    )
+    audit.add_argument(
+        "--from-genesis", action="store_true", help="ignore earlier audit marks and replay all"
+    )
+    audit.add_argument("--name", default="", help="who is auditing, recorded in each mark")
+    audit.set_defaults(handler=_command_audit)
+
+    checkpoint = subcommands.add_parser("checkpoint", help="write a checkpoint of the ledger now")
+    checkpoint.add_argument("path", help=_TARGET)
+    checkpoint.set_defaults(handler=_command_checkpoint)
+
+    export = subcommands.add_parser("export", help="stream entries as JSON lines")
+    export.add_argument("path", help=_TARGET)
+    export.add_argument(
+        "--from-seq", type=int, default=1, help="the first sequence to export (default: 1)"
+    )
+    export.set_defaults(handler=_command_export)
 
     receipt = subcommands.add_parser(
         "verify-receipt",

@@ -1184,6 +1184,12 @@ class SqliteStore:
 
         self._write_unclaimed("record an audit mark", work)
 
+    def fork(self) -> SqliteStore:
+        """Another store over the same database, on a connection of its own
+        and without its claim: read-only, for an auditor beside the governor
+        (it records its marks through :meth:`record_audit`)."""
+        return SqliteStore(self._path, read_only=True)
+
     def audit_marks(self) -> tuple[AuditMark, ...]:
         """Every audit mark, oldest first."""
         with self._read_transaction():
@@ -1196,15 +1202,17 @@ class SqliteStore:
         return tuple(_audit_mark(row) for row in rows)
 
     def audit_failure(self) -> AuditMark | None:
-        """The first failure an auditor recorded, if any."""
+        """The newest audit mark, if it is a failure. A later mark that
+        verified the chain supersedes an earlier failure."""
         with self._read_transaction():
             if not self._has_table("audit_marks"):
                 return None
             row = self._conn.execute(
                 "SELECT sequence, head, state_digest, status, detail, auditor, recorded_at, "
-                "signature FROM audit_marks WHERE status = 'failed' ORDER BY id ASC LIMIT 1"
+                "signature FROM audit_marks ORDER BY id DESC LIMIT 1"
             ).fetchone()
-        return None if row is None else _audit_mark(row)
+        mark = None if row is None else _audit_mark(row)
+        return mark if mark is not None and mark.status == "failed" else None
 
     def load_entries(self) -> tuple[LedgerEntry, ...]:
         """Return every persisted entry, oldest first."""

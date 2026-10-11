@@ -966,12 +966,25 @@ class PostgresStore:
         return tuple(_audit_mark(row) for row in rows)
 
     def audit_failure(self) -> AuditMark | None:
-        """The first failure an auditor recorded, if any."""
+        """The newest audit mark, if it is a failure. A later mark that
+        verified the chain supersedes an earlier failure."""
         if self._version != _SCHEMA_VERSION:
             return None
         with self._reading(), self._errors("read the audit marks"):
-            row = self._conn.execute(self._sql.select_audit_failure).fetchone()
-        return None if row is None else _audit_mark(row)
+            row = self._conn.execute(self._sql.select_newest_audit_mark).fetchone()
+        mark = None if row is None else _audit_mark(row)
+        return mark if mark is not None and mark.status == "failed" else None
+
+    def fork(self) -> PostgresStore:
+        """Another store over the same ledger, on a connection of its own (for
+        an auditor beside this governor). Writable, so it can record audit
+        marks; it never takes the writer lock."""
+        return PostgresStore(
+            self._conninfo,
+            schema=self._schema,
+            lock_timeout=self._lock_timeout_ms / 1000,
+            idle_timeout=self._idle_timeout_ms / 1000,
+        )
 
     def load_entries(self) -> tuple[LedgerEntry, ...]:
         """Return every persisted entry, oldest first."""
@@ -1215,9 +1228,9 @@ class _Statements:
             "SELECT sequence, head, state_digest, status, detail, auditor, recorded_at, "
             "signature FROM {} ORDER BY id ASC"
         ).format(marks)
-        self.select_audit_failure = sql.SQL(
+        self.select_newest_audit_mark = sql.SQL(
             "SELECT sequence, head, state_digest, status, detail, auditor, recorded_at, "
-            "signature FROM {} WHERE status = 'failed' ORDER BY id ASC LIMIT 1"
+            "signature FROM {} ORDER BY id DESC LIMIT 1"
         ).format(marks)
         self.control_high_water = sql.SQL("SELECT max(id) FROM {}").format(control)
         self._entries_columns = columns

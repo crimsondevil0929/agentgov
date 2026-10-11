@@ -1,0 +1,269 @@
+{
+  "cases": [
+    {
+      "entry": {
+        "amount": "1000.00000000",
+        "balance_after": "1000.00000000",
+        "counterparty_id": "",
+        "direction": "CR",
+        "entry_hash": "ec480de88a998354f0943ee2a610b704d8bd9a6939807a0dbd2a3ffd3cee43eb",
+        "entry_id": "1aa09920-df17-55a8-9061-03ddbcf33251",
+        "entry_type": "funding",
+        "memo": "root envelope issued",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "",
+        "scope_id": "root",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"1000.00000000\",\"balance_after\":\"1000.00000000\",\"counterparty_id\":null,\"direction\":\"CR\",\"entry_id\":\"1aa09920-df17-55a8-9061-03ddbcf33251\",\"entry_type\":\"funding\",\"format\":\"AGOV3\",\"memo\":\"root envelope issued\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":null,\"scope_id\":\"root\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "funding",
+      "sha256": "ec480de88a998354f0943ee2a610b704d8bd9a6939807a0dbd2a3ffd3cee43eb"
+    },
+    {
+      "entry": {
+        "amount": "0.00000001",
+        "balance_after": "0.99999999",
+        "counterparty_id": "",
+        "direction": "DR",
+        "entry_hash": "420c7c2710c62498631d6a7f88d777742086d05110abc6645f859ddd141692d4",
+        "entry_id": "cb189945-2b30-59f0-8795-a027e9615075",
+        "entry_type": "spend",
+        "memo": "",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "",
+        "scope_id": "agent",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"0.00000001\",\"balance_after\":\"0.99999999\",\"counterparty_id\":null,\"direction\":\"DR\",\"entry_id\":\"cb189945-2b30-59f0-8795-a027e9615075\",\"entry_type\":\"spend\",\"format\":\"AGOV3\",\"memo\":\"\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":null,\"scope_id\":\"agent\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "smallest-amount",
+      "sha256": "420c7c2710c62498631d6a7f88d777742086d05110abc6645f859ddd141692d4"
+    },
+    {
+      "entry": {
+        "amount": "1000000000000.00000000",
+        "balance_after": "1000000000000.00000000",
+        "counterparty_id": "",
+        "direction": "CR",
+        "entry_hash": "488e34119164e3032cb5c55a66e5b4a4cda875b5eff2fec9ea98a0ea97a86ddf",
+        "entry_id": "1a896ea0-16ad-5be7-a8b4-cad803255121",
+        "entry_type": "funding",
+        "memo": "",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "",
+        "scope_id": "treasury",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"1000000000000.00000000\",\"balance_after\":\"1000000000000.00000000\",\"counterparty_id\":null,\"direction\":\"CR\",\"entry_id\":\"1a896ea0-16ad-5be7-a8b4-cad803255121\",\"entry_type\":\"funding\",\"format\":\"AGOV3\",\"memo\":\"\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":null,\"scope_id\":\"treasury\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "largest-amount",
+      "sha256": "488e34119164e3032cb5c55a66e5b4a4cda875b5eff2fec9ea98a0ea97a86ddf"
+    },
+    {
+      "entry": {
+        "amount": "0.50000000",
+        "balance_after": "-0.25000000",
+        "counterparty_id": "",
+        "direction": "DR",
+        "entry_hash": "4d420d03d9613fe4055e08bfae156d56830697352e7e8869ab87441d69152de0",
+        "entry_id": "3ceca113-e5ca-5da8-8da3-4577e77ba118",
+        "entry_type": "spend",
+        "memo": "",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "dfa62419-7d2c-5829-a3d4-64869f494504",
+        "scope_id": "agent",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"0.50000000\",\"balance_after\":\"-0.25000000\",\"counterparty_id\":null,\"direction\":\"DR\",\"entry_id\":\"3ceca113-e5ca-5da8-8da3-4577e77ba118\",\"entry_type\":\"spend\",\"format\":\"AGOV3\",\"memo\":\"\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":\"dfa62419-7d2c-5829-a3d4-64869f494504\",\"scope_id\":\"agent\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "negative-balance",
+      "sha256": "4d420d03d9613fe4055e08bfae156d56830697352e7e8869ab87441d69152de0"
+    },
+    {
+      "entry": {
+        "amount": "0.25000000",
+        "balance_after": "0.25000000",
+        "counterparty_id": "orchestrator",
+        "direction": "CR",
+        "entry_hash": "b6d6faf20cc81ecccd55b979669123bd27cf3bdf8054345ba72c81bbef103233",
+        "entry_id": "d499e201-ffb3-57bb-9d43-c6f77cbf4295",
+        "entry_type": "allocation",
+        "memo": "sub-budget delegated to researcher",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "",
+        "scope_id": "researcher",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"0.25000000\",\"balance_after\":\"0.25000000\",\"counterparty_id\":\"orchestrator\",\"direction\":\"CR\",\"entry_id\":\"d499e201-ffb3-57bb-9d43-c6f77cbf4295\",\"entry_type\":\"allocation\",\"format\":\"AGOV3\",\"memo\":\"sub-budget delegated to researcher\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":null,\"scope_id\":\"researcher\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "allocation-credit",
+      "sha256": "b6d6faf20cc81ecccd55b979669123bd27cf3bdf8054345ba72c81bbef103233"
+    },
+    {
+      "entry": {
+        "amount": "0.02000000",
+        "balance_after": "1.00000000",
+        "counterparty_id": "",
+        "direction": "CR",
+        "entry_hash": "6468b508792ab7679258154a15e5b110698b095351076c00780b894d88329739",
+        "entry_id": "64c9a568-da40-520d-8982-c8da42813457",
+        "entry_type": "hold_void",
+        "memo": "",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "dfa62419-7d2c-5829-a3d4-64869f494504",
+        "scope_id": "agent",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"0.02000000\",\"balance_after\":\"1.00000000\",\"counterparty_id\":null,\"direction\":\"CR\",\"entry_id\":\"64c9a568-da40-520d-8982-c8da42813457\",\"entry_type\":\"hold_void\",\"format\":\"AGOV3\",\"memo\":\"\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":\"dfa62419-7d2c-5829-a3d4-64869f494504\",\"scope_id\":\"agent\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "hold-release",
+      "sha256": "6468b508792ab7679258154a15e5b110698b095351076c00780b894d88329739"
+    },
+    {
+      "entry": {
+        "amount": "0.01000000",
+        "balance_after": "0.99000000",
+        "counterparty_id": "",
+        "direction": "CR",
+        "entry_hash": "2c1e2b555167bbf8dd4215bb8a427ad7ba5cdee6393930115e2dc00af8770bb7",
+        "entry_id": "5584c715-3fa1-561e-a3e7-fa007b03550c",
+        "entry_type": "reversal",
+        "memo": "",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "7366413a-ef9c-54f2-9e5f-380073227f07",
+        "scope_id": "agent",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"0.01000000\",\"balance_after\":\"0.99000000\",\"counterparty_id\":null,\"direction\":\"CR\",\"entry_id\":\"5584c715-3fa1-561e-a3e7-fa007b03550c\",\"entry_type\":\"reversal\",\"format\":\"AGOV3\",\"memo\":\"\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":\"7366413a-ef9c-54f2-9e5f-380073227f07\",\"scope_id\":\"agent\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "named-refund",
+      "sha256": "2c1e2b555167bbf8dd4215bb8a427ad7ba5cdee6393930115e2dc00af8770bb7"
+    },
+    {
+      "entry": {
+        "amount": "0.00000000",
+        "balance_after": "0.50000000",
+        "counterparty_id": "",
+        "direction": "--",
+        "entry_hash": "5630d4a1668cba700bed747fee74216b141523cd8cbaecbb7b0c2f4f1fabe8ad",
+        "entry_id": "bbaee90a-9bb8-5f4c-b0bc-bd04fb1391c8",
+        "entry_type": "circuit_tripped",
+        "memo": "overdraft attempt: requested 0.60000000, available 0.50000000",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "",
+        "scope_id": "agent",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"0.00000000\",\"balance_after\":\"0.50000000\",\"counterparty_id\":null,\"direction\":\"--\",\"entry_id\":\"bbaee90a-9bb8-5f4c-b0bc-bd04fb1391c8\",\"entry_type\":\"circuit_tripped\",\"format\":\"AGOV3\",\"memo\":\"overdraft attempt: requested 0.60000000, available 0.50000000\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":null,\"scope_id\":\"agent\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "trip",
+      "sha256": "5630d4a1668cba700bed747fee74216b141523cd8cbaecbb7b0c2f4f1fabe8ad"
+    },
+    {
+      "entry": {
+        "amount": "0.00000000",
+        "balance_after": "0.00000000",
+        "counterparty_id": "",
+        "direction": "--",
+        "entry_hash": "69f08951b202f3184705a3f0480f3667d7fa184e26bf15501568c20b89047960",
+        "entry_id": "ce071c7d-edc1-5800-b6a4-1edab8418408",
+        "entry_type": "checkpoint",
+        "memo": "agentgov-checkpoint v1 seq=10000 sha256=abababababababababababababababababababababababababababababababab",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "",
+        "scope_id": "",
+        "sequence": "10001",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"0.00000000\",\"balance_after\":\"0.00000000\",\"counterparty_id\":null,\"direction\":\"--\",\"entry_id\":\"ce071c7d-edc1-5800-b6a4-1edab8418408\",\"entry_type\":\"checkpoint\",\"format\":\"AGOV3\",\"memo\":\"agentgov-checkpoint v1 seq=10000 sha256=abababababababababababababababababababababababababababababababab\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":null,\"scope_id\":\"\",\"sequence\":10001,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "checkpoint",
+      "sha256": "69f08951b202f3184705a3f0480f3667d7fa184e26bf15501568c20b89047960"
+    },
+    {
+      "entry": {
+        "amount": "0.00000000",
+        "balance_after": "0.00000000",
+        "counterparty_id": "",
+        "direction": "--",
+        "entry_hash": "30f39cc1e645f42f88347a31bdb9a8bd20cf697c214701a65c1a95b1b0e4de16",
+        "entry_id": "30d247db-ca3f-5859-8694-1c4a759730be",
+        "entry_type": "anchor",
+        "memo": "quote \" backslash \\ tab \t newline \n bell \u0007 del  sep   end",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "",
+        "scope_id": "téam/中文 💸",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV3"
+      },
+      "hashed": "{\"amount\":\"0.00000000\",\"balance_after\":\"0.00000000\",\"counterparty_id\":null,\"direction\":\"--\",\"entry_id\":\"30d247db-ca3f-5859-8694-1c4a759730be\",\"entry_type\":\"anchor\",\"format\":\"AGOV3\",\"memo\":\"quote \\\" backslash \\\\ tab \\t newline \\n bell \\u0007 del  sep   end\",\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"ref\":null,\"scope_id\":\"téam/中文 💸\",\"sequence\":1,\"timestamp\":\"2026-10-11T00:00:00.000000Z\",\"transaction_id\":\"55d94b43-53b8-5855-a153-9aff427298e3\"}",
+      "name": "text-needing-escapes",
+      "sha256": "30f39cc1e645f42f88347a31bdb9a8bd20cf697c214701a65c1a95b1b0e4de16"
+    },
+    {
+      "entry": {
+        "amount": "1E-8",
+        "balance_after": "0.99999999",
+        "counterparty_id": "",
+        "direction": "DR",
+        "entry_hash": "a03c3220471cfd4428589d3b08fb71b45be3bb2d3f7e09209c547e34f9bc62c8",
+        "entry_id": "c659afb8-de61-59f8-9d44-b413bcf0573a",
+        "entry_type": "spend",
+        "memo": "",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "dfa62419-7d2c-5829-a3d4-64869f494504",
+        "scope_id": "agent",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV2"
+      },
+      "hashed": "[\"AGOV2\",\"0000000000000000000000000000000000000000000000000000000000000000\",1,\"c659afb8-de61-59f8-9d44-b413bcf0573a\",\"55d94b43-53b8-5855-a153-9aff427298e3\",\"2026-10-11T00:00:00.000000Z\",\"spend\",\"DR\",\"agent\",null,\"1E-8\",\"0.99999999\",\"\",\"dfa62419-7d2c-5829-a3d4-64869f494504\"]",
+      "name": "agov2-spend",
+      "sha256": "a03c3220471cfd4428589d3b08fb71b45be3bb2d3f7e09209c547e34f9bc62c8"
+    },
+    {
+      "entry": {
+        "amount": "1.00000000",
+        "balance_after": "1.00000000",
+        "counterparty_id": "",
+        "direction": "CR",
+        "entry_hash": "c95b7b02aa946eafb5600126196d2fb5c3853e680e974ea766360f1cdafb514a",
+        "entry_id": "4874235e-0e9a-58cc-bb5b-e11d69a3b77b",
+        "entry_type": "funding",
+        "memo": "",
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ref": "",
+        "scope_id": "root",
+        "sequence": "1",
+        "timestamp": "2026-10-11T00:00:00.000000Z",
+        "transaction_id": "55d94b43-53b8-5855-a153-9aff427298e3",
+        "version": "AGOV1"
+      },
+      "hashed": "[\"AGOV1\",\"0000000000000000000000000000000000000000000000000000000000000000\",1,\"4874235e-0e9a-58cc-bb5b-e11d69a3b77b\",\"55d94b43-53b8-5855-a153-9aff427298e3\",\"2026-10-11T00:00:00.000000Z\",\"funding\",\"CR\",\"root\",null,\"1.00000000\",\"1.00000000\",\"\"]",
+      "name": "agov1-funding",
+      "sha256": "c95b7b02aa946eafb5600126196d2fb5c3853e680e974ea766360f1cdafb514a"
+    }
+  ],
+  "description": "Single entries: the text each one's SHA-256 covers, and the hash."
+}

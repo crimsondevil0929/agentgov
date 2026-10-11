@@ -448,6 +448,9 @@ def test_a_role_with_only_dml_grants_can_run_a_governor(pg_admin_dsn: str, pg_ds
             "GRANT SELECT, INSERT, UPDATE, DELETE ON agentgov.nodes TO {r}",
             "GRANT SELECT, INSERT ON agentgov.control_events TO {r}",
             "GRANT SELECT, INSERT, DELETE ON agentgov.open_authorizations TO {r}",
+            "GRANT SELECT, INSERT ON agentgov.snapshots TO {r}",
+            "GRANT SELECT, INSERT ON agentgov.audit_marks TO {r}",
+            "GRANT SELECT, INSERT ON agentgov.idempotency TO {r}",
         )
         with admin(pg_dsn) as conn:
             for grant in grants:
