@@ -76,6 +76,48 @@ def test_a_read_only_view_and_a_store_open_while_the_lock_is_held(
         holder.close()
 
 
+def test_an_open_in_progress_makes_no_writer_wait(
+    pg_dsn: str, seeded: BudgetManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half, without timing: a governor paused in the middle of its
+    open's read holds nothing a writer waits on. A writer allowed two seconds
+    for the lock commits while the open is paused, and the governor that
+    opened catches up with what it wrote before its own first write."""
+    reading, resume = threading.Event(), threading.Event()
+    select_nodes = PostgresStore._select_nodes
+    opener_threads: set[int] = set()
+
+    def paused(self: PostgresStore) -> Any:
+        if threading.get_ident() in opener_threads:
+            reading.set()
+            assert resume.wait(30)
+        return select_nodes(self)
+
+    monkeypatch.setattr(PostgresStore, "_select_nodes", paused)
+    opened: list[BudgetManager] = []
+
+    def open_one() -> None:
+        opener_threads.add(threading.get_ident())
+        opened.append(BudgetManager.open_postgres(pg_dsn, verify="full", auditor=False))
+
+    opener = threading.Thread(target=open_one)
+    opener.start()
+    try:
+        assert reading.wait(30), "the open never reached its read"
+        with BudgetManager.open_postgres(pg_dsn, lock_timeout=2, auditor=False) as writer:
+            writer.spend("agent", money("1"))
+    finally:
+        resume.set()
+        opener.join(30)
+    (gov,) = opened
+    try:
+        assert gov.available("agent") == money("10"), "opened from the paused read"
+        gov.spend("agent", money("1"))
+        assert gov.available("agent") == money("8")
+    finally:
+        gov.close()
+
+
 def test_the_first_mutation_after_a_lock_free_open_catches_up(
     pg_dsn: str, seeded: BudgetManager
 ) -> None:

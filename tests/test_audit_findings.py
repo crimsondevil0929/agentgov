@@ -220,6 +220,11 @@ def test_f1_a_governor_opening_does_not_stall_other_governors(pg_dsn: str, tmp_p
     closed_at = opened_at + open_seconds
     during = [lat for start, lat in samples if start <= closed_at and start + lat >= opened_at]
     assert open_seconds > 0.25, "the ledger is too small for this test to mean anything"
-    assert max(during, default=0.0) < 0.25, (
+    assert during, "no write overlapped the open"
+    # 0.4.0 held the writer lock for the whole open, so a write that began as
+    # it did waited for nearly all of it. A loaded machine stalls a write now
+    # and then too, and half the open tells the two apart: that no lock is
+    # held at all is shown without timing in tests/test_lock_free_open.py.
+    assert max(during) < max(0.25, open_seconds / 2), (
         f"a write waited {max(during):.3f}s while another governor took {open_seconds:.3f}s to open"
     )
