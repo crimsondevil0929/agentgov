@@ -1997,6 +1997,8 @@ def _pg2_statements(schema: str) -> tuple[sql.Composed, ...]:
             )
             """
         ).format(table("idempotency")),
+        # History is looked up by scope and by type, never by transaction_id
+        # or ref (random values: an index would cost every commit a page).
         sql.SQL("CREATE INDEX IF NOT EXISTS entries_by_scope ON {} (scope_id, sequence)").format(
             entries
         ),
@@ -2004,10 +2006,6 @@ def _pg2_statements(schema: str) -> tuple[sql.Composed, ...]:
         sql.SQL(
             "CREATE INDEX IF NOT EXISTS entries_by_type_memo ON {} (entry_type, md5(memo))"
         ).format(entries),
-        sql.SQL("CREATE INDEX IF NOT EXISTS entries_by_transaction ON {} (transaction_id)").format(
-            entries
-        ),
-        sql.SQL("CREATE INDEX IF NOT EXISTS entries_by_ref ON {} (ref)").format(entries),
         sql.SQL(
             "CREATE INDEX IF NOT EXISTS entries_checkpoints ON {} (sequence) "
             "WHERE entry_type = 'checkpoint'"

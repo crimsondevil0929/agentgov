@@ -2994,7 +2994,9 @@ class Ledger:
         limit: int | None = None,
     ) -> tuple[LedgerEntry, ...]:
         """Entries matching every criterion given, oldest first, within this
-        view. Over a store, each criterion is answered by an index."""
+        view. Over a store, ``scope_id`` and ``entry_type`` (with ``memo``)
+        are answered by an index; ``transaction_id`` and ``ref`` filter what
+        those find, or scan history when given alone."""
         with self._lock:
             head = self._state.length
             if self._entries is not None:
@@ -5469,9 +5471,13 @@ class BudgetManager:
     ) -> tuple[LedgerEntry, ...]:
         """The entries matching every criterion given, oldest first.
 
-        Over a store each criterion is answered by an index, so finding one
-        anchor by its memo, or the spends that settled a hold, costs what it
-        finds, not the length of history.
+        Over a store, ``scope_id`` and ``entry_type`` (with ``memo``) are
+        answered by an index, so finding one anchor by its memo, or a scope's
+        spends, costs what it finds, not the length of history.
+        ``transaction_id`` and ``ref`` are not indexed: they filter what the
+        other criteria find, and given alone they scan history. To find what
+        settled a hold, give its scope too:
+        ``find_entries(scope_id=hold.scope_id, ref=hold.authorization_id)``.
         """
         return self._ledger.find_entries(
             scope_id=scope_id,

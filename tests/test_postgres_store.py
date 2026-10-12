@@ -124,6 +124,23 @@ def test_a_fresh_database_starts_empty_and_installs_its_schema(pg_dsn: str) -> N
         "audit_marks",
         "idempotency",
     }
+    with admin(pg_dsn) as conn:
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = 'agentgov' AND tablename = 'entries'"
+            )
+        }
+    # By scope and by type, never by transaction_id or ref: their random
+    # values would cost every commit an index page under the writer lock.
+    assert indexes == {
+        "entries_pkey",
+        "entries_entry_id_key",
+        "entries_by_scope",
+        "entries_by_type_memo",
+        "entries_checkpoints",
+    }
 
 
 def test_state_survives_every_governor_closing(pg_dsn: str) -> None:

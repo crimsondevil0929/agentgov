@@ -357,8 +357,10 @@ it by `repair`), or evidence that is never edited.
 | `schema_meta` | metadata | `schema_version`. |
 
 Indexes on `entries`: `(scope_id, sequence)`, `(entry_type, memo)`
-(PostgreSQL: `(entry_type, md5(memo))`), `transaction_id`, `ref`, and the
-checkpoint entries by sequence.
+(PostgreSQL: `(entry_type, md5(memo))`), and on PostgreSQL the checkpoint
+entries by sequence. `transaction_id` and `ref` are not indexed: their values
+are random, so an index on either would cost every commit a page write, and
+no write or replay looks an entry up by them.
 
 **Upgrades** are in place and forward-only: a writer opening an older layout
 upgrades it, under the writer lock, in one transaction, before it writes

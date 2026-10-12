@@ -14,6 +14,7 @@ import itertools
 import json
 import sqlite3
 from collections.abc import Iterator
+from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -310,6 +311,30 @@ def test_history_queries_agree_with_the_chain(ledger_db: str) -> None:
 
 def _txn(trail: tuple[Any, ...], entry_id: Any) -> Any:
     return next(e.transaction_id for e in trail if e.entry_id == entry_id)
+
+
+def test_history_is_indexed_by_scope_and_type_only(tmp_path: Path) -> None:
+    """Every index on entries is a page written by every commit, and the
+    random keys of transaction_id and ref would land each on a page of its
+    own: about a fifth of a SQLite governor's writes. Lookups by them filter
+    instead, and what settled a hold is found within its scope."""
+    path = str(tmp_path / "l.db")
+    with BudgetManager.open_sqlite(path, auditor=False) as gov:
+        gov.open_root("root", money("10"))
+        gov.delegate("root", "a", money("5"))
+        hold = gov.authorize("a", money("1"))
+        spend = gov.capture(hold, money("0.4"))
+        settled = gov.find_entries(scope_id=hold.scope_id, ref=hold.authorization_id)
+        assert spend in settled and all(e.ref == hold.authorization_id for e in settled)
+        assert {e.entry_type for e in settled} == {EntryType.HOLD_VOID, EntryType.SPEND}
+    with closing(sqlite3.connect(path)) as conn:
+        indexed = {
+            name
+            for (name,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'entries'"
+            )
+        }
+    assert indexed == {"sqlite_autoindex_entries_1", "entries_by_scope", "entries_by_type_memo"}
 
 
 def test_a_named_refund_still_bounds_after_a_reopen(ledger_db: str) -> None:

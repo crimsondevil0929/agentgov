@@ -1533,10 +1533,12 @@ _SCHEMA_3 = (
         created_at TEXT NOT NULL
     )
     """,
+    # History is looked up by scope and by type (anchors by memo, checkpoints).
+    # Not by transaction_id or ref: their values are random, so an index on
+    # either would cost every commit a page write for a lookup no write path
+    # makes; find_entries() filters by them instead.
     "CREATE INDEX IF NOT EXISTS entries_by_scope ON entries (scope_id, sequence)",
     "CREATE INDEX IF NOT EXISTS entries_by_type_memo ON entries (entry_type, memo)",
-    "CREATE INDEX IF NOT EXISTS entries_by_transaction ON entries (transaction_id)",
-    "CREATE INDEX IF NOT EXISTS entries_by_ref ON entries (ref)",
     "CREATE INDEX IF NOT EXISTS control_events_by_entry ON control_events (entry_id)",
 )
 """What schema 3 adds. ``IF NOT EXISTS`` throughout: an upgrade runs it over a
