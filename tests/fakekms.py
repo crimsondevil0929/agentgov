@@ -28,6 +28,9 @@ OTHER_KEY = "other-key"
 WRONG_VERSION = "wrong-version"
 """Sign, and say it was another version."""
 NOT_JSON = "not-json"
+"""Answer a signature request with a page, not JSON."""
+NOT_AN_OBJECT = "not-an-object"
+"""Answer a signature request with JSON that is not an object."""
 OTHER_ALG = "other-alg"
 """Publish the key as another algorithm's."""
 WRONG_PIN = "wrong-pin"
@@ -59,6 +62,8 @@ class FakeKms:
         self.signed: Counter[tuple[str, int]] = Counter()
         """Signatures made, by key name and version."""
         self.requests: Counter[str] = Counter()
+        self.headers: list[tuple[str, dict[str, str]]] = []
+        """Every request's method and headers, in order."""
         self.delay = 0.0
         """Seconds every answer waits."""
         self.status: int | None = None
@@ -120,6 +125,8 @@ class FakeKms:
     # -- the protocol -------------------------------------------------------------
 
     def _handle(self, handler: BaseHTTPRequestHandler, method: str) -> None:
+        with self._lock:
+            self.headers.append((method, dict(handler.headers.items())))
         if self.delay:
             time.sleep(self.delay)
         url = urllib.parse.urlsplit(handler.path)
@@ -180,6 +187,9 @@ class FakeKms:
                 answered_version = version + 1
             elif self.misbehave == NOT_JSON:
                 self._raw(handler, 200, b"<html>signed</html>")
+                return
+            elif self.misbehave == NOT_AN_OBJECT:
+                self._answer(handler, 200, [signature.hex()])
                 return
             with self._lock:
                 self.signed[(name, version)] += 1
