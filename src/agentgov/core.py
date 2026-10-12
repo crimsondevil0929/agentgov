@@ -5257,11 +5257,37 @@ class BudgetManager:
             length, head = store.head()
             if length == len(self._ledger) and head == self._ledger.head_hash:
                 self._contended = False
+                if not self._pass_control_rows(store):
+                    self._contended = self._catch_up(store) > 0
                 return
             self._contended = self._catch_up(store) > 0
         except LedgerIntegrityError as exc:
             self._unusable = str(exc)
             raise
+
+    def _pass_control_rows(self, store: SharedStore) -> bool:
+        """A current view still moves its mark past the control rows written
+        since it last looked: its own trips' and resets', whose content the
+        chain holds. Otherwise every unit of work reads all of them again.
+        The delta comes with the session that took the lock, at no cost.
+
+        :returns: Whether that was all there was; ``False`` for a delta that
+            holds more (rows a pre-0.1.2 writer kept outside the chain), which
+            a catch-up applies.
+        """
+        if not _holds_snapshots(store):
+            return False
+        delta = store.snapshot(
+            after_sequence=len(self._ledger),
+            after_control_row=self._control_high_water,
+            authorizations=False,
+        )
+        if delta.entries or delta.legacy_control_events:
+            return False
+        if delta.schema_version != self._schema_version:
+            return False
+        self._control_high_water = delta.control_high_water
+        return True
 
     def _catch_up(self, store: PersistenceStore) -> int:
         ledger = self._ledger

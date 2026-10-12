@@ -209,6 +209,29 @@ def test_a_statement_that_fails_inside_a_unit_fails_every_mutation_it_carried(
     gov.verify_integrity()
 
 
+def test_a_governor_alone_reads_no_breaker_event_twice(
+    gov: BudgetManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by scripts/soak.py: a governor current with the ledger skipped
+    catching up, and with it the mark past the control rows its own trips and
+    resets wrote. Every unit of work then read them all again, and decoded
+    them, under the writer lock: work that grew with the ledger's history."""
+    read: list[int] = []
+    delta = PostgresStore._delta
+
+    def counted(self: PostgresStore, anchor: Any, entries: Any, rows: Any, after: int) -> Any:
+        read.append(len(rows))
+        return delta(self, anchor, entries, rows, after)
+
+    for _ in range(20):
+        gov.trip("a", "halted for review")
+        gov.reset("a")
+    monkeypatch.setattr(PostgresStore, "_delta", counted)
+    gov.spend("b", money("1"))
+    gov.spend("b", money("1"))
+    assert read and max(read) <= 1, read
+
+
 def test_a_caller_holding_the_lock_runs_alone(gov: BudgetManager) -> None:
     """A check and the act it decides, under ``ledger.lock``: work queued by
     other callers meanwhile runs after, never between them. Deprecated for
