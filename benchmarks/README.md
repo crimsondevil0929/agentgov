@@ -56,6 +56,37 @@ How to read it:
 - **File size.** 38% more per entry: the indexes that serve `find_entries()`
   and history by sequence without a scan, and AGOV3's fixed-point amounts.
 
+## Throughput
+
+`bench_throughput.py` in a closed loop: each caller loops `authorize()` and `capture()` on
+a scope of its own for 10 seconds. The median of three runs, 0.4.0 and 1.0 interleaved run
+by run on the same machine, with a load average of 3 to 7 from other work
+(`baseline/throughput-*.jsonl`):
+
+| | SQLite, 1 caller | SQLite, 8 callers | PostgreSQL, 1 governor, 8 callers | PostgreSQL, 8 governors of 8 callers |
+|---|---:|---:|---:|---:|
+| 0.4.0 | 5,907 /s, p99 0.7 ms | 5,850 /s, p99 9.7 ms | 425 /s, p99 66 ms | 188 /s, p99 1,944 ms |
+| 1.0 | 4,208 /s, p99 1.7 ms | 5,428 /s, p99 11.9 ms | 2,126 /s, p99 9.4 ms | 1,684 /s, p99 105 ms |
+
+How to read it:
+
+- **PostgreSQL.** 0.4.0 made each mutation alone, in six or more round trips under the
+  fleet's writer lock. In 1.0 a unit of work is two round trips, and it carries every
+  caller that arrived while the last one committed.
+- **SQLite, one caller.** 1.0 does more for each operation: AGOV3's canonical hashing,
+  the rule engine's checks, and two history indexes, about 70 µs in all. With eight
+  callers, units of work share one commit and one sync, and the gap nearly closes. Two
+  more indexes, on `transaction_id` and `ref`, cost a further 20% with one caller and
+  are not kept (`docs/LEDGER_FORMAT.md`, section 5).
+- **The 1.0 targets.** One governor: 1,500 a second, met. Eight governors: 2,000 a
+  second, met at `6d2dc06` on a quieter machine (2,026 to 2,187). On this machine
+  `6d2dc06` measured 1,455 against this tree's 1,837, interleaved. A p99 under 25 ms for
+  eight governors was not met: in a closed loop, mean latency is at least
+  callers / throughput, 38 ms for 64 callers at 1,700 a second. A chain per root scope,
+  in 1.1 if measurements call for it, is how that would come down.
+- **Latency at a load** is `--rate`'s: an open loop offers operations at a fixed rate and
+  counts each operation's latency from when it was due.
+
 ## Receipt issuance
 
 `bench_receipts.py` with a signer that takes 50 ms per signature, as a round
