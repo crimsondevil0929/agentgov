@@ -1539,6 +1539,9 @@ _SCHEMA_3 = (
     # makes; find_entries() filters by them instead.
     "CREATE INDEX IF NOT EXISTS entries_by_scope ON entries (scope_id, sequence)",
     "CREATE INDEX IF NOT EXISTS entries_by_type_memo ON entries (entry_type, memo)",
+    # The refunds naming a spend, which bound how much more of it may be
+    # refunded: a page only for a refund, which few writes are.
+    "CREATE INDEX IF NOT EXISTS entries_reversals ON entries (ref) WHERE entry_type = 'reversal'",
     "CREATE INDEX IF NOT EXISTS control_events_by_entry ON control_events (entry_id)",
 )
 """What schema 3 adds. ``IF NOT EXISTS`` throughout: an upgrade runs it over a

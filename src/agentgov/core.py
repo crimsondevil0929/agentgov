@@ -889,7 +889,10 @@ class _ChainState:
     :ivar hold_counts: How many holds are open in each scope.
     :ivar saw_v3: The chain contains AGOV3 entries.
     :ivar spend_refunds: How much of each spend AGOV3 refunds have named has
-        been refunded, for every spend that has been refunded at all.
+        been refunded, for a ledger whose history is kept in memory. A
+        ledger whose store keeps history asks the store instead (an index
+        of refunds by the spend they name), so its state, and its
+        checkpoint snapshots, do not grow with every spend ever refunded.
     :ivar last_timestamp: The newest entry's timestamp.
     :ivar last_checkpoint: The newest CHECKPOINT entry's sequence and
         snapshot digest.
@@ -1033,6 +1036,7 @@ class _Overlay:
         "_nodes",
         "_opened",
         "_refunded",
+        "_refunds",
         "_resolve",
         "_roots",
         "_row_scopes",
@@ -1063,14 +1067,21 @@ class _Overlay:
         base: _ChainState | _Overlay,
         *,
         resolve: Callable[[uuid.UUID], LedgerEntry | None] | None = None,
+        refunds: Callable[[uuid.UUID, int], Decimal] | None = None,
     ) -> None:
         """:param resolve: Finds a committed entry by its ``entry_id``, for a
-        REVERSAL that names the spend it reverses; inherited from a view
-        this one is staged on."""
+            REVERSAL that names the spend it reverses; inherited from a view
+            this one is staged on.
+        :param refunds: What the refunds naming a spend among the chain's
+            first ``n`` entries add up to, for a chain whose store keeps
+            history: then the state remembers no spend's refunds, and a view
+            merged into it adds none. Inherited like ``resolve``."""
         self._base = base
-        if resolve is None and isinstance(base, _Overlay):
-            resolve = base._resolve
+        if isinstance(base, _Overlay):
+            resolve = base._resolve if resolve is None else resolve
+            refunds = base._refunds if refunds is None else refunds
         self._resolve: Callable[[uuid.UUID], LedgerEntry | None] | None = resolve
+        self._refunds: Callable[[uuid.UUID, int], Decimal] | None = refunds
         self._start_head: str = base.head
         self.balances: dict[str, Decimal] = {}
         self.totals: _Totals = base.totals
@@ -1154,7 +1165,12 @@ class _Overlay:
 
     def refunded_of_spend(self, spend_id: uuid.UUID) -> Decimal:
         found = self._spend_refunds.get(spend_id)
-        return found if found is not None else self._base.refunded_of_spend(spend_id)
+        if found is not None:
+            return found
+        base = self._base
+        if isinstance(base, _Overlay) or self._refunds is None:
+            return base.refunded_of_spend(spend_id)
+        return self._refunds(spend_id, base.length) if base.length else ZERO
 
     # -- what the view stages ---------------------------------------------
 
@@ -1297,7 +1313,8 @@ class _Overlay:
         base.last_timestamp = self.last_timestamp
         base.last_checkpoint = self.last_checkpoint
         base.frontier = self.frontier
-        base.spend_refunds.update(self._spend_refunds)
+        if self._refunds is None:  # otherwise the store answers for them
+            base.spend_refunds.update(self._spend_refunds)
         for hold_id in self._closed:
             base.holds.pop(hold_id, None)
         base.holds.update(self._opened)
@@ -1763,6 +1780,7 @@ def _replay(
     *,
     finish: bool = False,
     resolve: Callable[[uuid.UUID], LedgerEntry | None] | None = None,
+    refunds: Callable[[uuid.UUID, int], Decimal] | None = None,
 ) -> _ChainState:
     """Rebuild chain state from nothing but the entries, verifying each.
 
@@ -1771,12 +1789,14 @@ def _replay(
         does (a read-only view of an unsealed pre-0.1.2 ledger).
     :param resolve: Finds an earlier entry by id, for a refund that names its
         spend. By default, the spends among ``entries`` themselves.
+    :param refunds: For entries whose store keeps history: the state then
+        remembers no spend's refunds (see :class:`_Overlay`).
     """
     if resolve is None:
         entries = entries if isinstance(entries, Sequence) else list(entries)
         resolve = _spend_index(entries)
     state = _ChainState(legacy=tuple(legacy))
-    view = _Overlay(state, resolve=resolve)
+    view = _Overlay(state, resolve=resolve, refunds=refunds)
     released: set[uuid.UUID] = set()
     for entry in entries:
         view.apply(entry, released=released)
@@ -1902,9 +1922,6 @@ def _snapshot_document(state: _ChainState) -> dict[str, object]:
         "roots": list(state.roots),
         "seal": _entry_document(state.seal) if state.seal is not None else None,
         "sequence": state.length,
-        "spend_refunds": {
-            str(spend): _fixed(value) for spend, value in state.spend_refunds.items()
-        },
         "spent": {scope: _fixed(value) for scope, value in state.spent.items()},
         "totals": {
             "funded": _fixed(totals.funded),
@@ -2351,10 +2368,6 @@ def _decode_snapshot(body: bytes) -> _ChainState:
         refunded=amounts("refunded"),
         hold_counts=counts,
         saw_v3=flags.flag("saw_v3"),
-        spend_refunds={
-            _uuid(key, "$.spend_refunds"): _money_text(value, f"$.spend_refunds.{key}")
-            for key, value in r.mapping("spend_refunds").items()
-        },
         last_timestamp=_instant(last_timestamp, "$.last_timestamp") if last_timestamp else None,
         last_checkpoint=(last[0], last[1]) if isinstance(last, list) else None,
         frontier=tuple(frontier),
@@ -2483,7 +2496,9 @@ class _Pending:
 
     def __init__(self, ledger: Ledger) -> None:
         self._ledger = ledger
-        self._view = _Overlay(ledger._state, resolve=ledger._resolve)
+        self._view = _Overlay(
+            ledger._state, resolve=ledger._resolve, refunds=ledger._refund_lookup()
+        )
         self.batch = WriteBatch()
 
     @property
@@ -2805,7 +2820,11 @@ class Ledger:
         # A refund after the checkpoint may name a spend before it: found in
         # the store, up to the snapshot's sequence (this ledger's own state is
         # still empty until the replay is done).
-        view = _Overlay(state, resolve=self._resolver_with(image.entries, through=state.length))
+        view = _Overlay(
+            state,
+            resolve=self._resolver_with(image.entries, through=state.length),
+            refunds=self._refund_lookup(),
+        )
         for entry in image.entries:
             view.apply(entry)
         view.end_transaction()
@@ -2826,7 +2845,7 @@ class Ledger:
     ) -> None:
         """Replace this ledger's contents with ``entries``, verified first."""
         loaded = list(entries)
-        state = _replay(loaded, legacy, finish=finish)
+        state = _replay(loaded, legacy, finish=finish, refunds=self._refund_lookup())
         with self._lock:
             self._entries = loaded if self._entries is not None else None
             self._state = state
@@ -3124,7 +3143,9 @@ class Ledger:
         ledger exactly as it was.
         """
         with self._lock:
-            view = _Overlay(self._state, resolve=self._resolver_with(entries))
+            view = _Overlay(
+                self._state, resolve=self._resolver_with(entries), refunds=self._refund_lookup()
+            )
             for entry in entries:
                 view.apply(entry)
             view.end_transaction()
@@ -3132,6 +3153,21 @@ class Ledger:
             self._follow_holds(view)
             if self._entries is not None:
                 self._entries.extend(entries)
+
+    def _refund_lookup(self) -> Callable[[uuid.UUID, int], Decimal] | None:
+        """How the refunds of a spend are counted: from the store, when it
+        keeps history (the state then remembers none); from the state, when
+        history is kept in memory."""
+        return _refunds_in(self._store) if self._entries is None else None
+
+    def _refunded_of_spend(self, spend_id: uuid.UUID) -> Decimal:
+        """How much of a spend refunds have returned, within this view."""
+        with self._lock:
+            lookup = self._refund_lookup()
+            if lookup is None:
+                return self._state.refunded_of_spend(spend_id)
+            length = self._state.length
+        return lookup(spend_id, length)
 
     def _resolver_with(
         self, entries: Sequence[LedgerEntry], *, through: int | None = None
@@ -3295,6 +3331,21 @@ def _holds_snapshots(store: PersistenceStore | None) -> bool:
     """Whether ``store`` speaks the v1.0 store interface: checkpoint snapshots,
     and the keyword arguments of ``load`` and ``snapshot`` that go with them."""
     return store is not None and hasattr(store, "put_snapshot")
+
+
+def _refunds_in(store: Any) -> Callable[[uuid.UUID, int], Decimal]:
+    """What the refunds naming a spend among ``store``'s first ``n`` entries
+    add up to, read by the index of refunds by the spend they name: no state
+    need remember it for every spend ever refunded."""
+
+    def refunded(spend_id: uuid.UUID, through: int) -> Decimal:
+        total = ZERO
+        for entry in store.find_entries(entry_type=EntryType.REVERSAL, ref=spend_id):
+            if entry.sequence <= through:
+                total = _add(total, entry.amount)
+        return total
+
+    return refunded
 
 
 def _keeps_history(store: PersistenceStore | None) -> bool:
@@ -5221,7 +5272,11 @@ class BudgetManager:
         # Stage: verify everything in a view over the live state, by the same
         # rules every write and replay follows. Nothing this manager serves
         # changes until all of it has checked out.
-        view = _Overlay(self._state, resolve=ledger._resolver_with(delta.entries))
+        view = _Overlay(
+            self._state,
+            resolve=ledger._resolver_with(delta.entries),
+            refunds=ledger._refund_lookup(),
+        )
         for entry in delta.entries:
             view.apply(entry)
         view.end_transaction()
@@ -6136,7 +6191,7 @@ class BudgetManager:
                         f"spend {ref} was made by {spend.scope_id!r}, not {scope_id!r}; a refund "
                         f"returns money to the scope that spent it"
                     )
-                left = _subtract(spend.amount, self._state.refunded_of_spend(ref))
+                left = _subtract(spend.amount, self._ledger._refunded_of_spend(ref))
                 if credited > left:
                     raise ValueError(
                         f"cannot refund {credited} of spend {ref}: {left} of its "

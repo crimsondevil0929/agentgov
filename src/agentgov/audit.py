@@ -44,6 +44,7 @@ from agentgov.core import (
     _decode_snapshot,
     _encode_snapshot,
     _Overlay,
+    _refunds_in,
     _snapshot_digest,
 )
 from agentgov.exceptions import LedgerIntegrityError
@@ -142,8 +143,9 @@ class Auditor:
         else:
             state, start = self._resume(checkpoints, legacy)
         position, verified, replayed = start, 0, 0
+        refunds = _refunds_in(store)  # the state remembers no spend's refunds
         try:
-            view = _Overlay(state, resolve=store.entry_by_id)
+            view = _Overlay(state, resolve=store.entry_by_id, refunds=refunds)
             for entry in self._entries(start, length):
                 view.apply(entry)
                 position = entry.sequence
@@ -156,7 +158,7 @@ class Auditor:
                     self._check_snapshot(state, checkpoints[position])
                     verified += 1
                     self._mark(state, "verified", f"checkpoint at {position} matches the chain")
-                    view = _Overlay(state, resolve=store.entry_by_id)
+                    view = _Overlay(state, resolve=store.entry_by_id, refunds=refunds)
             view.end_transaction()
             view.merge()
             if state.length != length or state.head != head:

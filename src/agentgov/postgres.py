@@ -2019,6 +2019,11 @@ def _pg2_statements(schema: str) -> tuple[sql.Composed, ...]:
             "CREATE INDEX IF NOT EXISTS entries_checkpoints ON {} (sequence) "
             "WHERE entry_type = 'checkpoint'"
         ).format(entries),
+        # The refunds naming a spend, which bound how much more of it may be
+        # refunded: an index page only for a refund, which few writes are.
+        sql.SQL(
+            "CREATE INDEX IF NOT EXISTS entries_reversals ON {} (ref) WHERE entry_type = 'reversal'"
+        ).format(entries),
         sql.SQL("CREATE INDEX IF NOT EXISTS control_events_by_entry ON {} (entry_id)").format(
             control
         ),

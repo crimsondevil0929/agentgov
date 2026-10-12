@@ -134,12 +134,14 @@ def test_a_fresh_database_starts_empty_and_installs_its_schema(pg_dsn: str) -> N
         }
     # By scope and by type, never by transaction_id or ref: their random
     # values would cost every commit an index page under the writer lock.
+    # Only refunds are indexed by the spend they name, which few writes are.
     assert indexes == {
         "entries_pkey",
         "entries_entry_id_key",
         "entries_by_scope",
         "entries_by_type_memo",
         "entries_checkpoints",
+        "entries_reversals",
     }
 
 

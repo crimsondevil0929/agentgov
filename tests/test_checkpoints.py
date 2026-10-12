@@ -317,7 +317,8 @@ def test_history_is_indexed_by_scope_and_type_only(tmp_path: Path) -> None:
     """Every index on entries is a page written by every commit, and the
     random keys of transaction_id and ref would land each on a page of its
     own: about a fifth of a SQLite governor's writes. Lookups by them filter
-    instead, and what settled a hold is found within its scope."""
+    instead, and what settled a hold is found within its scope. Only refunds
+    are indexed by the spend they name, which few writes are."""
     path = str(tmp_path / "l.db")
     with BudgetManager.open_sqlite(path, auditor=False) as gov:
         gov.open_root("root", money("10"))
@@ -334,7 +335,12 @@ def test_history_is_indexed_by_scope_and_type_only(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'entries'"
             )
         }
-    assert indexed == {"sqlite_autoindex_entries_1", "entries_by_scope", "entries_by_type_memo"}
+    assert indexed == {
+        "sqlite_autoindex_entries_1",
+        "entries_by_scope",
+        "entries_by_type_memo",
+        "entries_reversals",
+    }
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
@@ -364,6 +370,58 @@ def test_a_refund_after_a_checkpoint_of_a_spend_before_it_opens(
             gov.refund("a", money("0.7"), reverses=spend)
         gov.refund("a", money("0.6"), reverses=spend)
         gov.verify_integrity()
+
+
+def test_a_snapshot_does_not_grow_with_every_spend_refunded(tmp_path: Path) -> None:
+    """Found by scripts/soak.py: the state kept every refunded spend's total,
+    so each snapshot carried all of them (1.7 MB at 31,559, written again at
+    every checkpoint). A store that keeps history answers for them instead,
+    by an index of refunds by the spend they name, and the bound holds."""
+
+    def snapshot_after(refunds: int) -> int:
+        path = str(tmp_path / f"l{refunds}.db")
+        with BudgetManager.open_sqlite(path, policy=NEVER, auditor=False) as gov:
+            gov.open_root("root", money("1000"))
+            gov.delegate("root", "a", money("500"))
+            spends = [gov.spend("a", money("1")) for _ in range(refunds)]
+            for spend in spends:
+                gov.refund("a", money("0.5"), reverses=spend)
+            assert not gov.ledger._state.spend_refunds, "the store answers for them"
+            gov.checkpoint()
+            with pytest.raises(ValueError, match="left to refund"):
+                gov.refund("a", money("0.6"), reverses=spends[-1])
+        with closing(sqlite3.connect(path)) as conn:
+            (size,) = conn.execute("SELECT max(length(body)) FROM snapshots").fetchone()
+        with BudgetManager.open_sqlite(path, policy=NEVER, auditor=False) as gov:
+            assert gov.ledger._state.last_checkpoint is not None
+            with pytest.raises(ValueError, match="left to refund"):
+                gov.refund("a", money("0.6"), reverses=spends[0])
+            gov.refund("a", money("0.5"), reverses=spends[0])
+        return int(size)
+
+    # The same state but for longer numbers and a longer Merkle frontier:
+    # 200 spends' refund totals would add some 11 KB.
+    assert snapshot_after(200) < snapshot_after(2) + 512
+
+
+def test_a_spends_refunds_are_bounded_across_governors(pg_dsn: str) -> None:
+    """One governor refunds part of a spend another made; neither can then
+    refund more than is left of it, whichever catches up with whom."""
+    with (
+        BudgetManager.open_postgres(pg_dsn, policy=NEVER) as one,
+        BudgetManager.open_postgres(pg_dsn, policy=NEVER) as other,
+    ):
+        one.open_root("root", money("10"))
+        one.delegate("root", "a", money("5"))
+        spend = one.spend("a", money("1"))
+        other.refund("a", money("0.7"), reverses=spend)
+        with pytest.raises(ValueError, match="left to refund"):
+            one.refund("a", money("0.4"), reverses=spend)
+        one.refund("a", money("0.3"), reverses=spend)
+        with pytest.raises(ValueError, match="left to refund"):
+            other.refund("a", money("0.01"), reverses=spend)
+        one.verify_integrity()
+        other.verify_integrity()
 
 
 def test_a_named_refund_still_bounds_after_a_reopen(ledger_db: str) -> None:

@@ -145,7 +145,8 @@ a replay. The state a replay keeps:
   allocation (the sum of what was granted to it), and the list of roots;
 - the **halted** scopes and why;
 - each scope's lifetime **spend** and **refunds**, and, from `AGOV3`, how
-  much of each spend named refunds have returned;
+  much of each spend named refunds have returned (counted from the chain
+  when a rule needs it, not kept: see §4.1);
 - the **head** (the last `entry_hash`), the length, the last timestamp, and
   an RFC 9162 **Merkle frontier** over every entry hash (§4.3).
 
@@ -262,7 +263,6 @@ whole state of §3 as of a sequence `s`. Its fields (the reference encoder is
 | `tripped` | scope → `[instant, reason]` |
 | `holds` | every open hold, in placement order, as the full entry (each field a string, its amounts in its own version's rendering) |
 | `spent`, `refunded` | scope → amount |
-| `spend_refunds` | spend `entry_id` → amount refunded by name |
 | `ambiguous` | the `[scope, amount]` keys `AGOV1` releases touched (§3.4.4) |
 | `flags` | `saw_v1`, `saw_v2`, `saw_v3`, `legacy_applied` |
 | `seal` | the seal entry, or null |
@@ -273,6 +273,12 @@ whole state of §3 as of a sequence `s`. Its fields (the reference encoder is
 Amounts are fixed-point strings (§2.1). The encoding is canonical, so one
 state has exactly one snapshot, and a reader refuses a snapshot whose bytes
 are not the canonical encoding of the state they hold.
+
+A snapshot holds no per-spend refund totals. The bound of §3.6 (2) counts
+the refunds naming a spend among the entries before the one being checked;
+a reader that keeps history in a store asks it, by the index of refunds by
+the spend they name (§5), so neither a snapshot nor a governor's memory
+grows with every spend ever refunded.
 
 The snapshot's **digest** is SHA-256 over the bytes
 `agentgov/snapshot/v1\n` followed by the snapshot, in lowercase hex.
@@ -357,10 +363,11 @@ it by `repair`), or evidence that is never edited.
 | `schema_meta` | metadata | `schema_version`. |
 
 Indexes on `entries`: `(scope_id, sequence)`, `(entry_type, memo)`
-(PostgreSQL: `(entry_type, md5(memo))`), and on PostgreSQL the checkpoint
-entries by sequence. `transaction_id` and `ref` are not indexed: their values
-are random, so an index on either would cost every commit a page write, and
-no write or replay looks an entry up by them.
+(PostgreSQL: `(entry_type, md5(memo))`), the `reversal` entries by `ref`
+(the spend they name, for §3.6), and on PostgreSQL the checkpoint entries by
+sequence. `transaction_id` and the `ref` of other entries are not indexed:
+their values are random, so an index on either would cost every commit a
+page write, and no write or replay looks an entry up by them.
 
 **Upgrades** are in place and forward-only: a writer opening an older layout
 upgrades it, under the writer lock, in one transaction, before it writes
