@@ -107,8 +107,10 @@ seven; `tests/test_scale.py` holds it under 500 ms, nightly).
   and only a small `CHECKPOINT` entry that commits to it is appended under the
   lock. The call that made it due returns once the checkpoint is written, so
   encoding and signing the snapshot add to that one call's latency, once every
-  `checkpoint_every` entries. Governors that race to the same checkpoint append
-  it once.
+  `checkpoint_every` entries. The other governors of a fleet leave it to that
+  one, so the fleet stores one snapshot per checkpoint. A governor that opens a
+  ledger already `checkpoint_every` entries past its newest checkpoint writes
+  one after its first write.
 - **Tuning `checkpoint_every`.** Lower it to bound open time more tightly.
   Raise it when the state is large, so the snapshot is encoded and signed less
   often. Set it to `0` only where something else checkpoints, such as

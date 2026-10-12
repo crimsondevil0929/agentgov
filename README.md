@@ -953,8 +953,11 @@ tasks: no double-spend under concurrency, conservation of value, an unbroken SHA
 chain, the latching breaker. A model-based test (Hypothesis) runs random sequences of
 every operation, with injected write failures and reopens, against a reference model; a
 mutation pass checks that the tests catch changes to the rule engine; the fleet tests race
-64 workers across 8 governors and 8 separate processes; and the whole suite runs against
-PostgreSQL 14, 16, 17 and 18, and behind PgBouncer. This is the right harness for these
+64 workers across 8 governors and 8 separate processes; the whole suite runs against
+PostgreSQL 14, 16, 17 and 18, and behind PgBouncer; and
+[`scripts/soak.py`](scripts/soak.py) runs a fleet for half an hour while it kills
+governors and cuts their connections, then checks that every operation a worker saw
+succeed is in the ledger exactly once and nothing else is. This is the right harness for these
 properties: a governor that is only *probably* correct under load is not correct, and a
 nondeterministic backend cannot prove a race is absent.
 

@@ -259,8 +259,10 @@ ARC1 1.0 and 1.1 documents, logs and vectors are byte-for-byte unchanged, and
   a message limit signs any receipt. A signer can make it its default with a
   `signature_version` attribute. 1.0 verifies both versions.
 - **A log keeps an index beside it,** `<path>.index` (SQLite), so it reopens
-  without reading everything it holds. It is derived from the log and rebuilt
-  when missing; back up the log file, not the index.
+  without reading the receipts its checkpoints cover. It still checks every
+  checkpoint's signature, so a log whose key changed without a transition
+  reopens only with the old public key in `keyring=`. The index is derived
+  from the log and rebuilt when missing; back up the log file, not the index.
 
 ## New in 1.0, worth adopting
 
