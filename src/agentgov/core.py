@@ -4022,6 +4022,10 @@ class BudgetManager:
         self._fleet_holds: dict[str, deque[datetime]] = {}
         self._recent: deque[tuple[int, str]] = deque(maxlen=_RECENT_HASHES)
         self._checkpoint_retry_at = 0.0  # after a failed automatic checkpoint
+        # The first entry this governor wrote since it last looked at whether
+        # a checkpoint is due, and whether one is its to write.
+        self._wrote_from: int | None = None
+        self._checkpoint_owed = False
         self._checkpoint_backoff = 0.0
         self._repairs: tuple[str, ...] = ()
         self._schema_version = ""
@@ -4034,6 +4038,14 @@ class BudgetManager:
                 store, opened_from_checkpoint=image.snapshot is not None, want=auditor
             )
         self._remember_head()
+        every = self._policy.checkpoint_every
+        if every > 0 and store is not None and not store.read_only:
+            # A ledger already a checkpoint's worth past its newest (upgraded
+            # from before checkpoints, or left by a governor that died owing
+            # one) is checkpointed after this governor's first write: no
+            # crossing of the next line would come soon enough.
+            last = self._state.last_checkpoint
+            self._checkpoint_owed = self._state.length - (last[0] if last else 0) >= every
         if metrics is not None and store is not None:
             metrics.record("agentgov.open.duration", time.perf_counter() - started)
 
@@ -4782,7 +4794,17 @@ class BudgetManager:
         with self._lock:
             state = self._state
             last = state.last_checkpoint[0] if state.last_checkpoint is not None else 0
-            if self._checkpointing or self._depth or state.length - last < every:
+            first, self._wrote_from = self._wrote_from, None
+            if first is not None and (first - 1 - last) // every < (state.length - last) // every:
+                # This governor's own writes took the chain across a multiple
+                # of checkpoint_every past the last checkpoint, so the
+                # checkpoint is this governor's to write. Governors whose
+                # writes did not cross one leave it: a fleet writes one
+                # snapshot, not one each, of which all but one are orphans.
+                self._checkpoint_owed = True
+            if state.length - last < every:
+                self._checkpoint_owed = False  # written, here or by another governor
+            if not self._checkpoint_owed or self._checkpointing or self._depth:
                 return
             if time.monotonic() < self._checkpoint_retry_at:
                 return  # backing off after a failure: a signer may be down
@@ -4804,6 +4826,7 @@ class BudgetManager:
                 exc_info=True,
             )
         else:
+            self._checkpoint_owed = False
             self._checkpoint_backoff = 0.0
             self._checkpoint_retry_at = 0.0
         finally:
@@ -6556,6 +6579,8 @@ class BudgetManager:
         controls = [e for e in pending.entries if e.entry_type in _CONTROL_TYPES]
         self._ledger._commit(pending)
         self._remember(pending.entries)
+        if pending.entries and self._wrote_from is None:
+            self._wrote_from = pending.entries[0].sequence
         if self._metrics is not None and controls:
             trips = sum(e.entry_type is EntryType.CIRCUIT_TRIPPED for e in controls)
             if trips:

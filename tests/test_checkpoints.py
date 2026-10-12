@@ -13,6 +13,8 @@ import dataclasses
 import itertools
 import json
 import sqlite3
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import closing
 from decimal import Decimal
@@ -422,6 +424,58 @@ def test_a_spends_refunds_are_bounded_across_governors(pg_dsn: str) -> None:
             other.refund("a", money("0.01"), reverses=spend)
         one.verify_integrity()
         other.verify_integrity()
+
+
+def test_a_fleet_writes_one_snapshot_for_each_checkpoint(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by scripts/soak.py: every governor whose view reached the next
+    checkpoint wrote a snapshot, and only one became a checkpoint; the rest
+    stayed, never read and never deleted (881 of 2,240, 734 MB in 25
+    minutes). The checkpoint is now written by the governor whose own writes
+    crossed the line. Storing a snapshot is slowed here as a large one's is,
+    which is what leaves the others time to try."""
+    from agentgov.postgres import PostgresStore
+
+    put_snapshot = PostgresStore.put_snapshot
+
+    def slow(self: PostgresStore, snapshot: Any) -> None:
+        time.sleep(0.05)
+        put_snapshot(self, snapshot)
+
+    monkeypatch.setattr(PostgresStore, "put_snapshot", slow)
+    policy = GovernancePolicy(max_calls_per_window=0, checkpoint_every=200)
+    governors = [
+        BudgetManager.open_postgres(pg_dsn, policy=policy, auditor=False) for _ in range(4)
+    ]
+    try:
+        governors[0].open_root("root", money("100000"))
+        for i in range(8):
+            governors[0].delegate("root", f"s{i}", money("1000"))
+
+        def spend(gov: BudgetManager, scope: str) -> None:
+            for _ in range(150):
+                gov.spend(scope, money("0.01"))
+
+        runs = [
+            threading.Thread(target=spend, args=(gov, f"s{2 * g + t}"))
+            for g, gov in enumerate(governors)
+            for t in range(2)
+        ]
+        for run in runs:
+            run.start()
+        for run in runs:
+            run.join(120)
+    finally:
+        for gov in governors:
+            gov.close()
+    with psycopg.connect(pg_dsn, autocommit=True, prepare_threshold=None) as conn:
+        (checkpoints,) = conn.execute(
+            "SELECT count(*) FROM agentgov.entries WHERE entry_type = 'checkpoint'"
+        ).fetchone()  # type: ignore[misc]
+        (snapshots,) = conn.execute("SELECT count(*) FROM agentgov.snapshots").fetchone()  # type: ignore[misc]
+    assert checkpoints >= 4, "1,209 entries, a checkpoint every 200"
+    assert snapshots - checkpoints <= checkpoints // 10, (snapshots, checkpoints)
 
 
 def test_a_named_refund_still_bounds_after_a_reopen(ledger_db: str) -> None:
