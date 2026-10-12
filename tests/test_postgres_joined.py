@@ -316,9 +316,10 @@ def test_governors_racing_to_redeem_book_each_claim_once(
 def test_the_store_refuses_to_book_a_claim_that_is_not_pending(gov: BudgetManager) -> None:
     store = gov.store
     assert isinstance(store, PostgresStore)
-    with store.writer() as session:
-        with pytest.raises(Exception, match="booked once"):
-            store.commit(WriteBatch(redeemed=[uuid.uuid4()]))
+    with pytest.raises(StorageError, match="none of it was committed"):
+        with store.writer() as session:
+            with pytest.raises(Exception, match="booked once"):
+                store.commit(WriteBatch(redeemed=[uuid.uuid4()]))
     assert not session.committed
 
 

@@ -166,6 +166,49 @@ def test_a_commit_that_fails_fails_every_mutation_it_carried(
     gov.verify_integrity()
 
 
+def test_a_statement_that_fails_inside_a_unit_fails_every_mutation_it_carried(
+    gov: BudgetManager, monkeypatch: pytest.MonkeyPatch, pg_dsn: str
+) -> None:
+    """Found by scripts/soak.py: a connection cut mid-unit failed one caller's
+    read inside the session (a refund resolving the spend it names), and that
+    caller raised it as its own error. The database had aborted the whole
+    transaction, but the session ended quietly, rolled back, and the other
+    callers were told their writes had committed. Every mutation a unit of
+    work carried fails when anything inside its transaction did."""
+    spend = gov.spend("a", money("1"))
+    original = PostgresStore.entry_by_id
+
+    def cut(self: PostgresStore, entry_id: Any) -> Any:
+        if self._session is not None:  # the transaction aborts, as a cut connection's does
+            with self._errors("read an entry"):
+                self._conn.execute("SELECT 1/0")
+        return original(self, entry_id)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PostgresStore, "entry_by_id", cut)
+        # In this order: the two that touch nothing but memory first, then the
+        # refund whose read fails. One failing first poisons the rest at once.
+        with gov._lock:
+            runs = []
+            for call in (
+                lambda: gov.spend("b", money("1")),
+                lambda: gov.authorize("c", money("1")),
+                lambda: gov.refund("a", money("0.5"), reverses=spend),
+            ):
+                runs.append(Run(call))
+                deadline = time.monotonic() + 10
+                while len(gov._queue) < len(runs):
+                    assert time.monotonic() < deadline, "the callers never queued"
+                    time.sleep(0.001)
+        outcomes = [run.outcome() for run in runs]
+    assert all(isinstance(o, StorageError) for o in outcomes), outcomes
+    assert [gov.available(s) for s in "abc"] == [money("9"), money("10"), money("10")]
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as view:
+        assert [view.available(s) for s in "abc"] == [money("9"), money("10"), money("10")]
+    gov.spend("b", money("1"))
+    gov.verify_integrity()
+
+
 def test_a_caller_holding_the_lock_runs_alone(gov: BudgetManager) -> None:
     """A check and the act it decides, under ``ledger.lock``: work queued by
     other callers meanwhile runs after, never between them. Deprecated for

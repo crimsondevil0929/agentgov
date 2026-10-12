@@ -372,12 +372,14 @@ def test_writer_sessions_nest_and_only_the_outermost_commits(pg_dsn: str) -> Non
 
 def test_a_failure_the_store_did_not_see_still_rolls_the_session_back(pg_dsn: str) -> None:
     """PostgreSQL answers COMMIT in an aborted transaction with ROLLBACK, not an
-    error; the session must not report that as committed."""
+    error; the session must not report that as committed, and says so as it
+    ends, whoever caught the error inside it."""
     store = PostgresStore(pg_dsn)
     try:
-        with store.writer() as session:
-            with suppress(psycopg.Error):
-                store._conn.execute("SELECT 1 / 0")
+        with pytest.raises(StorageError, match="none of it was committed"):
+            with store.writer() as session:
+                with suppress(psycopg.Error):
+                    store._conn.execute("SELECT 1 / 0")
         assert not session.committed
     finally:
         store.close()
@@ -394,12 +396,13 @@ def test_a_write_the_database_refuses_fails_the_whole_session(pg_dsn: str) -> No
                 store.commit(WriteBatch(entries=[_forged_first_entry()]))
         assert session.wrote and not session.committed
         assert store.head() == (0, GENESIS_HASH)
-        with store.writer() as session:
-            store.commit(WriteBatch(entries=[_forged_first_entry()]))
-            with pytest.raises(LedgerIntegrityError, match="durably append 1 entry"):
-                store.find_entries(scope_id="org")
-            with pytest.raises(StorageError, match="earlier write in this session failed"):
+        with pytest.raises(StorageError, match="none of it was committed"):
+            with store.writer() as session:
                 store.commit(WriteBatch(entries=[_forged_first_entry()]))
+                with pytest.raises(LedgerIntegrityError, match="durably append 1 entry"):
+                    store.find_entries(scope_id="org")
+                with pytest.raises(StorageError, match="earlier write in this session failed"):
+                    store.commit(WriteBatch(entries=[_forged_first_entry()]))
         assert session.wrote and not session.committed
         assert store.head() == (0, GENESIS_HASH)
     finally:

@@ -521,6 +521,15 @@ class PostgresStore:
                 raise
             self._session = None
             self._end(session)
+            if session.failed:
+                # A statement inside the session failed and whoever ran it
+                # caught the error: one mutation's own failure, in a unit of
+                # work several callers share. The database aborted the whole
+                # transaction, so nothing in it committed, and every caller
+                # whose work it carried must learn so, not just that one.
+                raise StorageError(
+                    "a statement in this ledger transaction failed, so none of it was committed"
+                )
 
     @_guarded
     def writer_lock_held(self, timeout: float = 0.1) -> bool:
