@@ -148,14 +148,13 @@ def test_a_log_whose_key_rotated_reopens_with_the_old_key_in_its_keyring(tmp_pat
         assert signers == [OLD.key_id] * 5 + [NEW.key_id] * 4
         keys = [c.signature.key_id for c in log.checkpoints() if c.signature is not None]
         assert keys == [OLD.key_id, OLD.key_id, NEW.key_id, NEW.key_id]
-    # The newest checkpoint is NEW's and vouches for the whole log, so it
-    # opens; the old key's checkpoints are checked when they are read, and a
-    # full verification reads them all at once.
-    with ReceiptLog(LOG_ID, NEW, path=path) as unchecked:
-        with pytest.raises(ReceiptLogError, match=f"signed by key {OLD.key_id}, which is not"):
-            unchecked.checkpoints()
-    with pytest.raises(ReceiptLogError, match=f"signed by key {OLD.key_id}, which is not among"):
-        ReceiptLog(LOG_ID, NEW, path=path, verify="full")
+    # Every checkpoint's signature is checked at reopen, the old key's too:
+    # without that key the log is refused at the first checkpoint it signed.
+    for verify in ("checkpoint", "full"):
+        with pytest.raises(
+            ReceiptLogError, match=f"checkpoints line 1: .*signed by key {OLD.key_id}, which is not"
+        ):
+            ReceiptLog(LOG_ID, NEW, path=path, verify=verify)
 
 
 def test_a_receipt_signed_before_the_rotation_is_still_checked(tmp_path: Path) -> None:

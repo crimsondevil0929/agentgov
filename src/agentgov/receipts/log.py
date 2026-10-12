@@ -18,16 +18,18 @@ With a ``path``, the log is durable: receipts are appended one per line to a
 JSON-lines file and forced to stable storage before :meth:`issue` returns,
 and checkpoints go to ``<path>.checkpoints``. An index of the file in SQLite,
 ``<path>.index``, derived from it and rebuilt from it when needed, lets the
-log reopen in time that does not grow with it and hold none of its receipts
-in memory: reopening checks the newest checkpoint's signature, and its root
-against the index's tree; indexes, checks and verifies any receipts appended
-since the index last saw the file; re-verifies the receipts the log signed
-since its last checkpoint; and cuts off a final line torn by a crash
-mid-append. Each receipt read is checked against the leaf hash recorded for
-it. ``verify="full"`` rebuilds the index, re-checking every receipt and
-every checkpoint, as every reopen did before. Every signature is checked
-under the log's keyring, never by the signer, so reopening a log whose key is
-held by a key service makes no calls to it.
+log reopen without reading its receipts and hold none of them in memory:
+reopening checks the newest checkpoint's signature, and its root against the
+index's tree; every older checkpoint's signature (one per many receipts), so
+a forged checkpoint stops the log at its line; indexes, checks and verifies
+any receipts appended since the index last saw the file; re-verifies the
+receipts the log signed since its last checkpoint; and cuts off a final line
+torn by a crash mid-append. An older checkpoint's root is checked against
+the receipts when the checkpoint is first read, and each receipt read
+against the leaf hash recorded for it. ``verify="full"`` rebuilds the index,
+re-checking every receipt and every checkpoint, as every reopen did before.
+Every signature is checked under the log's keyring, never by the signer, so
+reopening a log whose key is held by a key service makes no calls to it.
 
 A log outlives its key (ARC1 1.2). :meth:`ReceiptLog.rotate` has the outgoing
 key sign a :class:`~agentgov.receipts.schema.KeyTransition` to the incoming
@@ -64,8 +66,6 @@ from agentgov.receipts._leaves import (
     IndexWriteError,
     MemoryLeaves,
     complete_length,
-    count_lines,
-    last_line,
     lines_from,
     write_lines,
 )
@@ -193,9 +193,10 @@ class ReceiptLog:
         a key service's message limit; 1 signs as ARC1 1.0 and 1.1 do. The
         signer's own ``signature_version``, or 1, by default.
     :param verify: What to check when a durable log reopens: ``"checkpoint"``
-        (the default) the newest checkpoint and what was appended since, in
-        time that does not grow with the log; ``"full"`` every receipt and
-        every checkpoint, rebuilding the index.
+        (the default) the newest checkpoint, every checkpoint's signature,
+        and what was appended since, without reading the receipts the
+        checkpoints cover; ``"full"`` every receipt and every checkpoint,
+        rebuilding the index.
     :raises ReceiptLogError: If another process holds ``path``, the existing
         file does not check out, or the log's key in force (after its
         transitions) is not ``signer``'s.
@@ -813,7 +814,14 @@ class ReceiptLog:
     def _checked_checkpoint(self, line: bytes, number: int) -> Checkpoint:
         """A checkpoint line, checked: signed by the key in force at its size,
         this log's, and the root of the receipts up to it. Lock held."""
-        path = self._path
+        checkpoint = self._signed_checkpoint(line, number)
+        if checkpoint.root_hash != self._leaves.tree.root(checkpoint.tree_size).hex():
+            raise self._edited(checkpoint, number)
+        return checkpoint
+
+    def _signed_checkpoint(self, line: bytes, number: int) -> Checkpoint:
+        """A checkpoint line, signed by the key in force at its size, this
+        log's, and of no more receipts than it holds. Lock held."""
         try:
             checkpoint = Checkpoint.from_json(loads_strict(line), f"checkpoint {number}")
             if self._schedule is not None:
@@ -821,17 +829,16 @@ class ReceiptLog:
             else:
                 checkpoint.verify(self._keyring)
         except (MalformedReceiptError, ReceiptSignatureError) as exc:
-            raise ReceiptLogError(f"{path}.checkpoints line {number}: {exc}") from exc
-        if (
-            checkpoint.log_id != self._log_id
-            or checkpoint.tree_size > len(self._leaves)
-            or checkpoint.root_hash != self._leaves.tree.root(checkpoint.tree_size).hex()
-        ):
-            raise ReceiptLogError(
-                f"checkpoint {number} ({checkpoint.log_id}@{checkpoint.tree_size}) does not "
-                f"match the receipts in {path}: the log was edited"
-            )
+            raise ReceiptLogError(f"{self._path}.checkpoints line {number}: {exc}") from exc
+        if checkpoint.log_id != self._log_id or checkpoint.tree_size > len(self._leaves):
+            raise self._edited(checkpoint, number)
         return checkpoint
+
+    def _edited(self, checkpoint: Checkpoint, number: int) -> ReceiptLogError:
+        return ReceiptLogError(
+            f"checkpoint {number} ({checkpoint.log_id}@{checkpoint.tree_size}) does not "
+            f"match the receipts in {self._path}: the log was edited"
+        )
 
     # -- internals --------------------------------------------------------
 
@@ -929,12 +936,18 @@ class ReceiptLog:
             found = self._all_checkpoints()
             self._latest = found[-1] if found else None
         else:
-            end = complete_length(checkpoints, repair=True)
-            newest = last_line(checkpoints, end)
-            if newest is None:
+            complete_length(checkpoints, repair=True)
+            # The newest checkpoint in full; every older one's signature, which
+            # costs one signature per many receipts, so a forged checkpoint
+            # stops the log at its line. The older ones' roots are checked
+            # against the receipts when first read: the newest's covers them.
+            lines = list(read_complete_lines(checkpoints))
+            for number, line in enumerate(lines[:-1], start=1):
+                self._signed_checkpoint(line, number)
+            if not lines:
                 self._checkpoint_list = []  # none yet: every later one is appended here
             else:
-                self._latest = self._checked_checkpoint(newest, count_lines(checkpoints, end))
+                self._latest = self._checked_checkpoint(lines[-1], len(lines))
         count = len(leaves)
         if self._schedule is not None and self._transitions[-1].tree_size > count:
             raise ReceiptLogError(

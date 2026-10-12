@@ -470,6 +470,27 @@ def test_a_checkpoint_the_log_did_not_sign_does_not_reopen(tmp_path: Path) -> No
         _reopen(path)
 
 
+def test_a_forged_older_checkpoint_stops_the_log_at_its_line(tmp_path: Path) -> None:
+    """Reopening checks the newest checkpoint in full and every older one's
+    signature, which costs a signature per many receipts: a forged one is
+    refused at its line, as it was before the log kept an index."""
+    path = tmp_path / "receipts.jsonl"
+    with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=NEVER, clock=Clock()) as receipt_log:
+        for i in range(6):
+            receipt_log.issue(draft(i))
+            if i in (1, 3, 5):
+                receipt_log.checkpoint()
+    checkpoints = tmp_path / "receipts.jsonl.checkpoints"
+    lines = checkpoints.read_bytes().splitlines(keepends=True)
+    assert len(lines) == 3
+    forged = loads_strict(lines[1])
+    forged["sig"]["signature"] = bytes(64).hex()  # the same length: the file's size is unchanged
+    lines[1] = canonical_bytes(forged) + b"\n"
+    checkpoints.write_bytes(b"".join(lines))
+    with pytest.raises(ReceiptLogError, match=r"\.checkpoints line 2: .*signature"):
+        _reopen(path)
+
+
 def test_the_log_refuses_to_reopen_under_another_key(tmp_path: Path) -> None:
     path = _durable_log(tmp_path)
     with pytest.raises(ReceiptLogError):

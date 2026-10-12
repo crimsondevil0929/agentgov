@@ -108,13 +108,16 @@ every 1,000), reopened:
 | | Reopen | Memory held open |
 |---|---:|---:|
 | 0.4.0 | 24,326 ms | 672 MB |
-| 1.0 | 1.3 ms | 27 KB |
+| 1.0 | 25 ms | 45 KB |
 
 0.4.0 parsed every receipt into memory and checked every checkpoint. 1.0
 keeps an index of the file beside it, checks the newest checkpoint against
-the index's tree and re-verifies only what was signed since it; receipts are
-read from the file when asked for, each checked against the leaf hash
-recorded for it.
+the index's tree, checks every older checkpoint's signature (so a forged one
+stops the log at its line, as in 0.4.0), and re-verifies only what was
+signed since the newest; receipts are read from the file when asked for,
+each checked against the leaf hash recorded for it. Reopening costs about
+0.25 ms a checkpoint, so it grows with checkpoints, not receipts: the default
+policy writes one every 64 receipts.
 
 ## Scale gates
 

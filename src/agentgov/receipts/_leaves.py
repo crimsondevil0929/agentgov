@@ -114,38 +114,6 @@ def lines_from(path: Path, start: int, end: int) -> Iterator[tuple[int, bytes]]:
                 yield here, body
 
 
-def count_lines(path: Path, end: int) -> int:
-    """How many newlines the file's first ``end`` bytes hold."""
-    total = 0
-    with path.open("rb") as handle:
-        remaining = end
-        while remaining > 0:
-            chunk = handle.read(min(remaining, 1 << 20))
-            if not chunk:
-                break
-            total += chunk.count(b"\n")
-            remaining -= len(chunk)
-    return total
-
-
-def last_line(path: Path, end: int) -> bytes | None:
-    """The last non-blank line of the file's first ``end`` bytes."""
-    if end <= 0:
-        return None
-    with path.open("rb") as handle:
-        position = end
-        tail = b""
-        while position > 0:
-            start = max(0, position - 65536)
-            handle.seek(start)
-            tail = handle.read(position - start) + tail
-            position = start
-            lines = [line for line in tail.rstrip(b"\n").split(b"\n") if line.strip()]
-            if len(lines) > 1 or (lines and position == 0):
-                return lines[-1]
-    return None
-
-
 def write_lines(path: Path, lines: Sequence[bytes], *, fsync: bool) -> int:
     """Append ``lines`` with one write, forced to disk with ``fsync``.
 
