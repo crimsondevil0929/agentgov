@@ -139,7 +139,11 @@ class GovernorMachine(RuleBasedStateMachine):
         super().__init__()
         self.tmp = Path(tempfile.mkdtemp(prefix="agentgov-model-"))
         self.path = self.tmp / "ledger.db"
-        self.policy = GovernancePolicy(max_calls_per_window=0, max_depth=MAX_DEPTH)
+        # A checkpoint every few entries: most opens then start from one and
+        # replay only what follows, which must still find what came before.
+        self.policy = GovernancePolicy(
+            max_calls_per_window=0, max_depth=MAX_DEPTH, checkpoint_every=4
+        )
         self.store = _FlakyStore(self.path, synchronous="OFF")
         self.gov = BudgetManager(store=self.store, policy=self.policy)
         self.model = _Model()
@@ -431,6 +435,25 @@ class GovernorMachine(RuleBasedStateMachine):
         m.refunded[name] = EXACT.add(m.refunded.get(name, Decimal(0)), credited)
         m.add(name, credited)
 
+    @rule(spend=spends, eighths=st.integers(1, 8))
+    def refund_part_of_a_spend(self, spend: LedgerEntry, eighths: int) -> None:
+        """A refund of part of what a spend has left: one that succeeds, so a
+        spend refunded across a checkpoint is a sequence the model reaches."""
+        m = self.model
+        name = spend.scope_id
+        left = EXACT.subtract(spend.amount, m.spend_refunds.get(spend.entry_id, Decimal(0)))
+        refundable = EXACT.subtract(m.spent.get(name, Decimal(0)), m.refunded.get(name, Decimal(0)))
+        credited = floor(min(left, refundable) * eighths / 8)
+        if credited <= 0 or self.store.armed:
+            return
+        entry = self.call(self.gov.refund, name, credited, reverses=spend)
+        assert entry.ref == spend.entry_id and entry.amount == credited
+        m.spend_refunds[spend.entry_id] = EXACT.add(
+            m.spend_refunds.get(spend.entry_id, Decimal(0)), credited
+        )
+        m.refunded[name] = EXACT.add(m.refunded.get(name, Decimal(0)), credited)
+        m.add(name, credited)
+
     @rule(name=st.sampled_from(NAMES), amount=st.decimals(0, 1, places=10))
     def refund_naming_no_spend(self, name: str, amount: Decimal) -> None:
         """Deprecated, still bounded by everything the scope spent."""
@@ -598,6 +621,17 @@ class GovernorMachine(RuleBasedStateMachine):
         for scope, node in m.nodes.items():
             assert self.gov.available(scope) <= node.allocated, scope
             assert m.refunded.get(scope, Decimal(0)) <= m.spent.get(scope, Decimal(0)), scope
+
+    @precondition(lambda self: len(self.gov.ledger) > 0)
+    @rule()
+    def checkpoint(self) -> None:
+        """A checkpoint: every later open starts from it and replays only what
+        follows, which must still find what came before (a refund's spend)."""
+        armed, self.store.armed = self.store.armed, False
+        try:
+            self.call(self.gov.checkpoint)
+        finally:
+            self.store.armed = armed
 
     @precondition(lambda self: len(self.gov.ledger) > 0)
     @rule()

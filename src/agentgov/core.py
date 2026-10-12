@@ -2802,7 +2802,10 @@ class Ledger:
                 "the pre-0.1.2 control events are not the ones the checkpoint folded in: a "
                 "legacy trip or reset was edited, added or deleted"
             )
-        view = _Overlay(state, resolve=self._resolver_with(image.entries))
+        # A refund after the checkpoint may name a spend before it: found in
+        # the store, up to the snapshot's sequence (this ledger's own state is
+        # still empty until the replay is done).
+        view = _Overlay(state, resolve=self._resolver_with(image.entries, through=state.length))
         for entry in image.entries:
             view.apply(entry)
         view.end_transaction()
@@ -2840,15 +2843,16 @@ class Ledger:
         self._adopt(self._entries[:length])
         self._keys = {key: r for key, r in self._keys.items() if r.sequence <= length}
 
-    def _resolve(self, entry_id: uuid.UUID) -> LedgerEntry | None:
-        """The committed entry with this id, within this view, or ``None``."""
+    def _resolve(self, entry_id: uuid.UUID, *, through: int | None = None) -> LedgerEntry | None:
+        """The committed entry with this id, within this view (or the first
+        ``through`` entries), or ``None``."""
         with self._lock:
             if self._entries is not None:
                 for entry in reversed(self._entries):
                     if entry.entry_id == entry_id:
                         return entry
                 return None
-            length = self._state.length
+            length = self._state.length if through is None else through
         assert self._store is not None
         found = self._store.entry_by_id(entry_id)  # type: ignore[attr-defined]
         return found if found is not None and found.sequence <= length else None
@@ -3130,11 +3134,12 @@ class Ledger:
                 self._entries.extend(entries)
 
     def _resolver_with(
-        self, entries: Sequence[LedgerEntry]
+        self, entries: Sequence[LedgerEntry], *, through: int | None = None
     ) -> Callable[[uuid.UUID], LedgerEntry | None]:
-        """A resolver over this ledger's entries and ``entries``, new ones."""
+        """A resolver over this ledger's entries (or its store's first
+        ``through``) and ``entries``, new ones."""
         new = _spend_index(entries)
-        return lambda entry_id: new(entry_id) or self._resolve(entry_id)
+        return lambda entry_id: new(entry_id) or self._resolve(entry_id, through=through)
 
     def _follow_holds(self, view: _Overlay) -> None:
         """Open and close authorizations as a merged view's holds did. Lock held.

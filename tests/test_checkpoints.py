@@ -337,6 +337,35 @@ def test_history_is_indexed_by_scope_and_type_only(tmp_path: Path) -> None:
     assert indexed == {"sqlite_autoindex_entries_1", "entries_by_scope", "entries_by_type_memo"}
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_a_refund_after_a_checkpoint_of_a_spend_before_it_opens(
+    backend: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """Found by scripts/soak.py: an open from a checkpoint replays the entries
+    after it, and a refund among them may name a spend from before it, which
+    only the store holds. It must be found there, and still bound the refunds
+    of that spend, across the checkpoint, at open and after."""
+
+    def open_governor() -> BudgetManager:
+        if backend == "sqlite":
+            return BudgetManager.open_sqlite(str(tmp_path / "l.db"), policy=NEVER, auditor=False)
+        return BudgetManager.open_postgres(request.getfixturevalue("pg_dsn"), policy=NEVER)
+
+    with open_governor() as gov:
+        gov.open_root("root", money("10"))
+        gov.delegate("root", "a", money("5"))
+        spend = gov.spend("a", money("1"))
+        gov.checkpoint()
+        gov.refund("a", money("0.4"), reverses=spend)
+    with open_governor() as gov:
+        assert gov.ledger._state.last_checkpoint is not None, "opened from the checkpoint"
+        assert gov.available("a") == money("4.4")
+        with pytest.raises(ValueError, match="left to refund"):
+            gov.refund("a", money("0.7"), reverses=spend)
+        gov.refund("a", money("0.6"), reverses=spend)
+        gov.verify_integrity()
+
+
 def test_a_named_refund_still_bounds_after_a_reopen(ledger_db: str) -> None:
     with BudgetManager.open_sqlite(ledger_db) as gov:
         (refund,) = gov.find_entries(entry_type=EntryType.REVERSAL)
