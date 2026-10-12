@@ -18,13 +18,15 @@ keywords = [
     "governance",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Security",
     "Typing :: Typed",
@@ -132,14 +134,7 @@ ignore_missing_imports = true
 module = ["opentelemetry", "opentelemetry.*"]
 ignore_missing_imports = true
 
-# Explicitly tell the build system where the module is, 
-# overriding the PyPI package name auto-discovery.
-[tool.uv_build]
-packages = ["src/agentgov"]
-
+# The distribution is interlock-agentgov and the package agentgov, so the
+# wheel names its package rather than deriving it from the project name.
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentgov"]
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["agentgov*"]

@@ -310,3 +310,10 @@ with its extra and imported only when the feature is used:
 
 The development toolchain (pytest, ruff, mypy, hypothesis) is pinned in
 `uv.lock`.
+
+Releases are built and published by CI ([`.github/workflows/release.yml`](.github/workflows/release.yml)),
+by PyPI trusted publishing: no upload token exists. Every file carries a PEP 740
+attestation that PyPI verifies and displays, and a GitHub build provenance
+attestation (`gh attestation verify <file> --repo crimsondevil0929/agentgov`). Each
+GitHub release carries a CycloneDX SBOM of everything the extras can install, at the
+versions the release was tested with.

@@ -1018,9 +1018,15 @@ uv run python examples/persistence_demo.py
 ```
 
 Every gate above runs in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on
-Python 3.11 and 3.12, on Linux and macOS, with a 95% coverage floor and a build that
-fails on packaging warnings. Both example scripts are executed end to end so a broken
-demo cannot merge.
+Python 3.11 to 3.14 on Linux, on macOS, on free-threaded 3.14t, and on Windows (reported,
+not yet required); against PostgreSQL 14, 16, 17 and 18, and behind PgBouncer; with a 95%
+coverage floor and a build that fails on packaging warnings. Interlock's whole suite runs
+against every change. Both example scripts are executed end to end so a broken demo
+cannot merge. Nightly ([`.github/workflows/nightly.yml`](.github/workflows/nightly.yml)):
+the absolute scale gates, a deep model-based run, and the mutation pass. Releases are
+published from CI by trusted publishing, every file with a PEP 740 attestation and build
+provenance, and an SBOM of the extras' dependencies
+([`.github/workflows/release.yml`](.github/workflows/release.yml)).
 
 [`docs/DEMO_RUNBOOK.md`](docs/DEMO_RUNBOOK.md) walks the four commands end to
 end (adopt, halt a runaway, read the chain, catch unmetered spend); start with
