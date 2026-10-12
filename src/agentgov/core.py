@@ -2705,12 +2705,55 @@ class Ledger:
         full, or from the checkpoint snapshot the image carries, checked
         against ``signing``."""
         if image.snapshot is None:
-            return cls._from_entries(store, image.entries, _legacy_events(image), finish=finish)
+            replayed = cls._from_entries(store, image.entries, _legacy_events(image), finish=finish)
+            if signing is not None:
+                replayed._check_newest_statement(signing)
+            return replayed
         ledger = cls()
         ledger._store = store
         ledger._entries = None if _keeps_history(store) else []
         ledger._adopt_snapshot(image, signing)
         return ledger
+
+    def _check_newest_statement(self, signing: CheckpointSigning) -> None:
+        """After a replay from genesis, the newest checkpoint's signed statement.
+
+        A replay proves the chain links, not who wrote it: a consistent
+        rewrite links as well. So the newest checkpoint's statement is checked
+        as an open from that checkpoint checks it, and its snapshot must be of
+        the chain just replayed: the entry hash at its sequence covers every
+        entry before it.
+
+        :raises LedgerIntegrityError: If the statement does not check out, or
+            signatures are required and the checkpoint has none, or no
+            snapshot that matches its digest.
+        """
+        store: Any = self._store
+        last = self._state.last_checkpoint
+        if last is None or store is None or not hasattr(store, "snapshot_at"):
+            return
+        sequence, digest = last
+        snapshot = store.snapshot_at(sequence)
+        if (
+            snapshot is None
+            or snapshot.digest != digest
+            or _snapshot_digest(snapshot.body) != digest
+        ):
+            if signing.required:
+                raise LedgerIntegrityError(
+                    f"the checkpoint of sequence {sequence} has no snapshot that matches its "
+                    f"digest, so no signed statement of it can be checked, and this governor "
+                    f"requires signed checkpoints"
+                )
+            return
+        state = _decode_snapshot(snapshot.body)
+        at = self.entry(sequence)
+        if state.length != sequence or at is None or state.head != at.entry_hash:
+            raise LedgerIntegrityError(
+                f"the snapshot of sequence {sequence} is not of the chain it is stored with"
+            )
+        first = self.entry(1)
+        signing.check(snapshot, state, first.entry_hash if first is not None else "")
 
     def _adopt_snapshot(self, image: StoreImage, signing: CheckpointSigning | None = None) -> None:
         """Serve the state a checkpoint snapshot holds, and the entries after it.

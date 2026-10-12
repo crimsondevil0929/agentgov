@@ -139,6 +139,34 @@ def test_a_rewritten_history_does_not_carry_the_keys_word(tmp_path: Path) -> Non
         BudgetManager.open_sqlite(str(forged), auditor=False, signing=TRUSTING)
 
 
+def test_a_replay_from_genesis_checks_the_newest_statement_too(tmp_path: Path) -> None:
+    """verify="full" replays every entry, which proves the chain links, not
+    who wrote it: a consistent rewrite links as well as the original. So a
+    governor that trusts keys checks the newest checkpoint's statement after
+    a full replay as an open from that checkpoint does, against the chain it
+    replayed."""
+    genuine = _ledger(tmp_path / "genuine.db", CheckpointSigning(signer=KEY))
+    BudgetManager.open_sqlite(str(genuine), auditor=False, verify="full", signing=TRUSTING).close()
+    unsigned = _ledger(tmp_path / "unsigned.db", None)
+    with pytest.raises(LedgerIntegrityError, match="is not signed, and this governor requires"):
+        BudgetManager.open_sqlite(str(unsigned), auditor=False, verify="full", signing=TRUSTING)
+    optional = CheckpointSigning(keys=KEY.public_key())
+    BudgetManager.open_sqlite(str(unsigned), auditor=False, verify="full", signing=optional).close()
+    by_attacker = _ledger(tmp_path / "attacker.db", CheckpointSigning(signer=ATTACKER))
+    with pytest.raises(LedgerIntegrityError, match="not among the keys"):
+        BudgetManager.open_sqlite(str(by_attacker), auditor=False, verify="full", signing=optional)
+    sequence, text = _statements(genuine)[-1]
+    _set_statement(unsigned, sequence, text)  # the genuine statement, on a rewritten history
+    with pytest.raises(LedgerIntegrityError, match="does not describe its snapshot"):
+        BudgetManager.open_sqlite(str(unsigned), auditor=False, verify="full", signing=TRUSTING)
+    with sqlite3.connect(genuine) as conn:  # the snapshot that carries the statement, gone
+        conn.execute("DELETE FROM snapshots WHERE sequence = ?", (sequence,))
+    conn.close()
+    with pytest.raises(LedgerIntegrityError, match=f"checkpoint of sequence {sequence} has no"):
+        BudgetManager.open_sqlite(str(genuine), auditor=False, verify="full", signing=TRUSTING)
+    BudgetManager.open_sqlite(str(genuine), auditor=False, verify="full", signing=optional).close()
+
+
 def test_a_key_and_its_successor_both_count(tmp_path: Path) -> None:
     path = _ledger(tmp_path / "g.db", CheckpointSigning(signer=KEY))
     rotated = CheckpointSigning(signer=NEXT, keys=[KEY.public_key()], required=True)
@@ -249,6 +277,26 @@ def test_agentgov_verify_checks_every_statement_against_the_keys_given(tmp_path:
     assert main(["verify", str(unsigned), "--checkpoint-key", key, "--require-signed"], out) == 1
     assert "is not signed" in out.getvalue()
     assert main(["verify", str(path), "--require-signed"], io.StringIO()) == 2
+
+
+def test_agentgov_audit_checks_statements_against_the_keys_given(tmp_path: Path) -> None:
+    import io
+
+    from agentgov.cli import main
+
+    key, other = KEY.public_key().spec(), ATTACKER.public_key().spec()
+    path = _ledger(tmp_path / "g.db", CheckpointSigning(signer=KEY))
+    out = io.StringIO()
+    assert main(["audit", str(path), "--checkpoint-key", key, "--require-signed"], out) == 0
+    assert out.getvalue().startswith("PASS"), out.getvalue()
+    out = io.StringIO()
+    assert main(["audit", str(path), "--from-genesis", "--checkpoint-key", other], out) == 1
+    assert "not among the keys" in out.getvalue()
+    unsigned = _ledger(tmp_path / "u.db", None)
+    out = io.StringIO()
+    assert main(["audit", str(unsigned), "--checkpoint-key", key, "--require-signed"], out) == 1
+    assert "is not signed" in out.getvalue()
+    assert main(["audit", str(unsigned), "--require-signed"], io.StringIO()) == 2
 
 
 def test_witnesses_cosign_a_ledgers_checkpoints_and_refuse_a_rewrite(tmp_path: Path) -> None:

@@ -1,6 +1,6 @@
 """``agentgov`` — inspect and verify a ledger from the terminal.
 
-Two commands, aimed at two different readers:
+The commands, and the readers each is for:
 
 ``agentgov inspect <db>``
     For a developer: the double-entry ledger, the balance tree, and breaker
@@ -8,8 +8,11 @@ Two commands, aimed at two different readers:
 
 ``agentgov verify <db>``
     For a pipeline: re-derives the hash chain, the balance cache, the
-    conservation identity, and the delegation topology, then exits ``0`` or
-    ``1``. Drop it in CI to assert an archived ledger is intact.
+    conservation identity, the delegation topology and every checkpoint
+    snapshot, then exits ``0`` or ``1``. Drop it in CI to assert an archived
+    ledger is intact. ``--checkpoint-key`` checks every checkpoint's signed
+    statement against the keys given, and ``--require-signed`` fails on an
+    unsigned one.
 
 ``agentgov reconcile <db> <provider-export>``
     For finance and security: matches a provider's invoice against the ledger
@@ -27,7 +30,8 @@ Two commands, aimed at two different readers:
     For an operator or a sidecar: replays the chain from genesis, checks every
     checkpoint snapshot against it, and records how far it verified in the
     ledger itself (see :mod:`agentgov.audit`). A governor opens from its
-    newest checkpoint; this is what verifies the history before it.
+    newest checkpoint; this is what verifies the history before it. It takes
+    ``--checkpoint-key`` and ``--require-signed`` as ``verify`` does.
 
 ``agentgov checkpoint <ledger>``
     Writes a checkpoint now, rather than waiting for the next automatic one.
@@ -220,20 +224,26 @@ def _command_inspect(args: argparse.Namespace, out: TextIO) -> int:
         manager.close()
 
 
+def _checkpoint_signing(args: argparse.Namespace, out: TextIO) -> CheckpointSigning | int | None:
+    """The keys ``--checkpoint-key`` trusts to sign checkpoints, ``None``
+    without any, or the exit code for options that cannot be used."""
+    if not args.checkpoint_key and not args.require_signed:
+        return None
+    if not args.checkpoint_key:
+        out.write("error: --require-signed needs --checkpoint-key, the key that signs\n")
+        return 2
+    try:
+        return CheckpointSigning(keys=_read_keys(args.checkpoint_key), required=args.require_signed)
+    except (OSError, MalformedReceiptError) as exc:
+        out.write(f"error: {exc}\n")
+        return 2
+
+
 def _command_verify(args: argparse.Namespace, out: TextIO) -> int:
     """Re-derive every invariant and report PASS/FAIL for a pipeline."""
-    signing = None
-    if args.checkpoint_key or args.require_signed:
-        if not args.checkpoint_key:
-            out.write("error: --require-signed needs --checkpoint-key, the key that signs\n")
-            return 2
-        try:
-            signing = CheckpointSigning(
-                keys=_read_keys(args.checkpoint_key), required=args.require_signed
-            )
-        except (OSError, MalformedReceiptError) as exc:
-            out.write(f"error: {exc}\n")
-            return 2
+    signing = _checkpoint_signing(args, out)
+    if isinstance(signing, int):
+        return signing
     try:
         manager = _open(args.path)
     except AgentGovError as exc:
@@ -300,6 +310,9 @@ def _command_audit(args: argparse.Namespace, out: TextIO) -> int:
     """Replay the chain from genesis, check every snapshot, record the marks."""
     from agentgov.opening import parse_url
 
+    signing = _checkpoint_signing(args, out)
+    if isinstance(signing, int):
+        return signing
     kind, target, options = parse_url(args.path)
     store: Any
     if kind == "postgres":
@@ -314,7 +327,7 @@ def _command_audit(args: argparse.Namespace, out: TextIO) -> int:
         out.write("error: a memory: ledger has nothing to audit\n")
         return 2
     try:
-        auditor = Auditor(store, name=args.name or None)
+        auditor = Auditor(store, name=args.name or None, signing=signing)
         if args.follow:
             report = auditor.follow(interval=args.interval)
         else:
@@ -524,6 +537,21 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
     return report.exit_code
 
 
+def _add_checkpoint_keys(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--checkpoint-key",
+        action="append",
+        default=[],
+        help="a key trusted to sign the ledger's checkpoints ('ed25519:<hex>' or a file); "
+        "repeatable. Every signed checkpoint must then check out under one",
+    )
+    command.add_argument(
+        "--require-signed",
+        action="store_true",
+        help="fail on a checkpoint no --checkpoint-key signed",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser."""
     parser = argparse.ArgumentParser(
@@ -553,18 +581,7 @@ def build_parser() -> argparse.ArgumentParser:
         "verify", help="re-derive every invariant; exit 0 on PASS, 1 on FAIL"
     )
     verify.add_argument("path", help=_TARGET)
-    verify.add_argument(
-        "--checkpoint-key",
-        action="append",
-        default=[],
-        help="a key trusted to sign the ledger's checkpoints ('ed25519:<hex>' or a file); "
-        "repeatable. Every signed checkpoint must then check out under one",
-    )
-    verify.add_argument(
-        "--require-signed",
-        action="store_true",
-        help="fail on a checkpoint no --checkpoint-key signed",
-    )
+    _add_checkpoint_keys(verify)
     verify.set_defaults(handler=_command_verify)
 
     reconcile_cmd = subcommands.add_parser(
@@ -624,6 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--from-genesis", action="store_true", help="ignore earlier audit marks and replay all"
     )
     audit.add_argument("--name", default="", help="who is auditing, recorded in each mark")
+    _add_checkpoint_keys(audit)
     audit.set_defaults(handler=_command_audit)
 
     checkpoint = subcommands.add_parser("checkpoint", help="write a checkpoint of the ledger now")
