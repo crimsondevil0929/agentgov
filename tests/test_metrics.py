@@ -108,10 +108,14 @@ def test_a_fleet_governor_reports_its_lock_and_catch_ups(
     gov = BudgetManager.open_postgres(pg_dsn, policy=POLICY, auditor=False, metrics=metrics)
     other = BudgetManager.open_postgres(pg_dsn, policy=POLICY, auditor=False)
     try:
+        started = time.perf_counter()
         gov.open_root("root", money("10"))
         gov.delegate("root", "a", money("5"))
+        elapsed = time.perf_counter() - started
         assert len(metrics.seen["agentgov.lock.wait"]) == 2
         assert len(metrics.seen["agentgov.lock.hold"]) == 2
+        lock = metrics.seen["agentgov.lock.wait"] + metrics.seen["agentgov.lock.hold"]
+        assert all(0 <= seconds <= elapsed for seconds in lock), "durations, in seconds"
         other.spend("a", money("1"))  # three entries this governor has not seen
         gov.authorize("a", money("1"))
         assert 3 in metrics.seen["agentgov.catch_up.entries"]

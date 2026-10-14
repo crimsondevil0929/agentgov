@@ -286,6 +286,35 @@ def test_a_zero_claim_books_a_zero_value_anchor(
     assert gov.available("agent") == money("2.00")
 
 
+def test_a_zero_claim_on_a_hold_releases_it_and_spends_nothing(
+    gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    hold = gov.authorize("agent", "0.40")
+    claim = commit_claim(gov, caller, "0", hold=hold)
+    (release,) = gov.redeem(claim)
+    assert release.entry_type is EntryType.HOLD_VOID and release.ref == hold.entry.entry_id
+    assert gov.audit_trail("agent")[-1] == release, "no spend after it"
+    assert gov.available("agent") == money("2.00")
+    gov.verify_integrity()
+
+
+def test_a_claim_that_spends_its_hold_to_zero_exhausts_the_scope(
+    pg_dsn: str, gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    """Zero is not an overdraw: a claim that settles the scope's last hold at
+    exactly what is left exhausts it, as a capture does."""
+    hold = gov.authorize("agent", "2.00")
+    claim = commit_claim(gov, caller, "2.00", hold=hold)
+    (spend,) = gov.redeem(claim)
+    assert spend.balance_after == money("0")
+    trip = gov.audit_trail("agent")[-1]
+    assert trip.entry_type is EntryType.CIRCUIT_TRIPPED
+    assert trip.memo == "spend envelope exhausted"
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
+        assert reader.is_halted("agent")
+        reader.verify_integrity()
+
+
 def test_governors_racing_to_redeem_book_each_claim_once(
     pg_dsn: str, gov: BudgetManager, caller_role: str
 ) -> None:
@@ -439,6 +468,15 @@ def test_the_chain_is_not_written_inside_a_joined_transaction(
             store.rebuild_caches(nodes=(), control_events=(), authorizations=())
         caller.execute("ROLLBACK")
     gov.anchor("agent", "digest")  # and outside, as ever
+
+
+def test_a_governor_joins_no_transaction_inside_its_own(
+    gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    with gov.transaction():
+        with pytest.raises(RuntimeError, match="inside its own mutation"), gov.joined(caller):
+            pytest.fail("the block must not run")  # pragma: no cover
+    caller.execute("ROLLBACK")
 
 
 def test_a_claim_must_be_well_formed(gov: BudgetManager, caller: psycopg.Connection[Any]) -> None:
