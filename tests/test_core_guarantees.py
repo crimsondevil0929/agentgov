@@ -883,6 +883,17 @@ def test_a_sealed_legacy_control_event_cannot_be_deleted(tmp_path: Path) -> None
         BudgetManager.open_sqlite(path, repair=True)  # the seal cannot be rebuilt
 
 
+def test_a_sealed_legacy_control_event_cannot_be_edited(tmp_path: Path) -> None:
+    """The seal counts the pre-0.1.2 events and digests them: an edit keeps
+    the count and changes the digest."""
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    BudgetManager.open_sqlite(path).close()  # upgrade and seal
+    _run_sql(path, "UPDATE control_events SET reason = 'edited' WHERE entry_id IS NULL")
+    with pytest.raises(LedgerIntegrityError, match="no longer match the seal"):
+        BudgetManager.open_sqlite(path)
+
+
 def test_legacy_crash_state_is_refused_not_served_and_repair_cannot_mint_money(
     tmp_path: Path,
 ) -> None:
