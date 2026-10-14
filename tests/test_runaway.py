@@ -12,6 +12,7 @@ import subprocess
 import sys
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -205,3 +206,92 @@ def test_the_benchmark_script_runs_and_proves_its_own_claim() -> None:
     assert "verify_integrity()" in result.stdout
     assert "PASS - no money created or destroyed" in result.stdout
     assert "LATCHED OPEN" in result.stdout
+
+
+# -- the velocity window's bounds, on a clock the test sets -----------------------------------
+
+
+class _Clock:
+    """``time`` for agentgov.core, with a monotonic clock the test sets."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> object:
+        import time
+
+        return getattr(time, name)
+
+
+def _calls(policy: GovernancePolicy, *instants: float, monkeypatch: pytest.MonkeyPatch) -> int:
+    """How many authorizations, one at each instant, are made before the
+    breaker trips."""
+    import agentgov.core
+
+    clock = _Clock(instants[0])
+    monkeypatch.setattr(agentgov.core, "time", clock)
+    gov = BudgetManager(policy=policy)
+    gov.open_root("root", money("100"))
+    for made, instant in enumerate(instants):
+        clock.now = instant
+        try:
+            gov.authorize("root", money("1"))
+        except RunawayLoopDetectedError:
+            assert gov.is_halted("root")
+            return made
+    return len(instants)
+
+
+def test_one_call_a_window_is_a_limit_and_a_zero_window_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    one_a_minute = GovernancePolicy(max_calls_per_window=1, window_seconds=60.0)
+    one_a_second = GovernancePolicy(max_calls_per_window=1, window_seconds=1.0)
+    unbounded = GovernancePolicy(max_calls_per_window=1, window_seconds=0.0)
+    assert _calls(one_a_minute, 100.0, 100.0, monkeypatch=monkeypatch) == 1
+    assert _calls(one_a_second, 100.0, 100.0, monkeypatch=monkeypatch) == 1
+    assert _calls(unbounded, 100.0, 100.0, 100.0, monkeypatch=monkeypatch) == 3
+
+
+def test_a_call_a_whole_window_after_another_is_still_in_its_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    one_a_second = GovernancePolicy(max_calls_per_window=1, window_seconds=1.0)
+    assert _calls(one_a_second, 100.0, 101.0, monkeypatch=monkeypatch) == 1
+    assert _calls(one_a_second, 100.0, 101.5, 103.0, monkeypatch=monkeypatch) == 3
+
+
+def test_the_fleet_window_counts_holds_by_their_time_in_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hold a whole window old is still in the window; older, it has left
+    it, and the window forgets it."""
+    from datetime import UTC, datetime, timedelta
+
+    import agentgov.core
+
+    start = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
+
+    class _At(datetime):
+        instant = start
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return cls.instant
+
+    monkeypatch.setattr(agentgov.core, "datetime", _At)
+    policy = GovernancePolicy(max_calls_per_window=1, window_seconds=60.0, fleet_velocity=True)
+    gov = BudgetManager(policy=policy)
+    gov.open_root("root", money("100"))
+    gov.open_root("other", money("100"))
+    gov.authorize("root", money("1"))
+    gov.authorize("other", money("1"))
+    _At.instant = start + timedelta(seconds=61)
+    gov.authorize("other", money("1"))  # a minute and a second on, the first has left
+    _At.instant = start + timedelta(seconds=121)
+    with pytest.raises(RunawayLoopDetectedError):
+        gov.authorize("other", money("1"))  # the second, exactly a minute old, has not
+    assert gov.is_halted("other") and not gov.is_halted("root")
