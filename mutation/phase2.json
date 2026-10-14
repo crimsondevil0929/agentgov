@@ -184,6 +184,7 @@
     "test_f8_",
     "tests/test_scale.py",
     "test_a_governor_opens_while_another_holds_the_writer_lock",
-    "test_an_open_in_progress_makes_no_writer_wait"
+    "test_an_open_in_progress_makes_no_writer_wait",
+    "test_a_fleet_writes_one_snapshot_for_each_checkpoint"
   ]
 }
