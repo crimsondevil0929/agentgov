@@ -1901,15 +1901,17 @@ def test_a_ledger_rewritten_at_the_same_length_is_rewritten_not_current(pg_dsn: 
     try:
         writer.open_root("org", money("1"))
         writer.anchor("org", "2")
-        follower.refresh()
+        follower.anchor("org", "3")  # catches up with the writer's entries
+        follower.anchor("org", "4")  # finds itself current: no longer contended
+        assert not follower._contended
         _admin(
             pg_dsn,
             "ALTER TABLE agentgov.entries DISABLE TRIGGER USER",
-            "UPDATE agentgov.entries SET entry_hash = repeat('e', 64) WHERE sequence = 2",
+            "UPDATE agentgov.entries SET entry_hash = repeat('e', 64) WHERE sequence = 4",
             _ENTRIES_REARM,
         )
         with pytest.raises(LedgerIntegrityError, match="rewritten"):
-            follower.anchor("org", "3")
+            follower.anchor("org", "5")
     finally:
         writer.close()
         follower.close()
