@@ -2069,3 +2069,29 @@ def test_a_join_whose_wait_the_server_cancels_is_an_error(pg_dsn: str) -> None:
     finally:
         holder.close()
     store.close()
+
+
+def test_a_governor_given_a_ledger_serves_that_ledger(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "ledger.db")
+    ledger = Ledger(store=store)
+    gov = BudgetManager(ledger=ledger, store=store, policy=NEVER)
+    assert gov.ledger is ledger
+    gov.open_root("root", money("1"))
+    assert len(ledger) == 1
+    gov.close()
+
+
+def test_a_ledger_read_before_a_shared_store_moved_on_is_brought_up_to_it(pg_dsn: str) -> None:
+    """A ledger read from a shared store before other governors wrote is
+    behind the snapshot the constructor reads: the governor serves the
+    snapshot, which the store's caches match."""
+    store = PostgresStore(pg_dsn)
+    ledger = Ledger(store=store)
+    assert len(ledger) == 0
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as other:
+        other.open_root("org", money("1"))
+        other.trip("org", "halted meanwhile")
+    gov = BudgetManager(ledger=ledger, store=store, policy=NEVER)
+    assert len(gov.ledger) == 2 and gov.is_halted("org")
+    gov.verify_integrity()
+    gov.close()
