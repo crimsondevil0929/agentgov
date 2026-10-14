@@ -119,6 +119,7 @@
     "src/agentgov/postgres.py::PostgresStore._installed_version"
   ],
   "tests": [
+    "tests/test_ledger_mechanisms.py",
     "tests/test_public_api.py",
     "tests/test_rule_engine.py",
     "tests/test_ledger_format.py",
