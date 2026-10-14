@@ -1983,3 +1983,87 @@ def test_a_sqlite_store_that_cannot_read_its_calls_says_so(tmp_path: Path) -> No
     with pytest.raises(StorageError, match="cannot read the calls recorded under keys"):
         store.idempotency(["k"])
     store.close()
+
+
+def test_an_audit_balances_the_last_transaction_too(tmp_path: Path) -> None:
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("root", money("1"))
+        gov.delegate("root", "child", money("0.5"))
+        last = gov.audit_trail()[-1]
+    unbalanced = _appended(
+        last,
+        entry_type=EntryType.RELEASE,
+        direction=Direction.DEBIT,
+        scope_id="child",
+        counterparty_id="root",
+        amount=money("0.1"),
+        balance_after=money("0.4"),
+    )
+    store = SqliteStore(tmp_path / "ledger.db")
+    store.commit(WriteBatch(entries=[unbalanced]))
+    report = Auditor(store, record=False).run()
+    assert report.failure is not None and "does not balance" in report.failure
+    store.close()
+
+
+def test_a_refund_past_its_spend_is_refused_by_the_rules_over_a_store_too(tmp_path: Path) -> None:
+    """The rules count the refunds a store holds of a spend, not only those
+    its own unit of work stages: a raw refund gets no further than refund()."""
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("root", money("1"))
+        spend = gov.spend("root", money("0.20"))
+        gov.spend("root", money("0.20"))
+        gov.refund("root", money("0.15"), reverses=spend)
+        over = LedgerLine(
+            EntryType.REVERSAL, Direction.CREDIT, "root", money("0.10"), ref=spend.entry_id
+        )
+        with pytest.raises(LedgerIntegrityError, match=r"bringing its refunds to 0\.25000000"):
+            gov.ledger._post([over])
+
+
+def test_a_commit_the_server_cancels_leaves_the_store_able_to_begin_again(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+        last = gov.audit_trail()[-1]
+    many: list[LedgerEntry] = []
+    for n in range(500):
+        many.append(
+            _appended(
+                many[-1] if many else last,
+                entry_type=EntryType.ANCHOR,
+                direction=Direction.NONE,
+                scope_id="org",
+                amount=Decimal(0),
+                balance_after=money("1"),
+                memo=f"tick {n}",
+            )
+        )
+    store = PostgresStore(pg_dsn)
+    with pytest.raises(StorageError, match="did not commit"):
+        with store.writer():
+            store._conn.execute("SET statement_timeout = 1")  # undone with the transaction
+            store.commit(WriteBatch(entries=many))
+    with store.writer() as session:
+        pass
+    assert session.committed and store.head()[0] == 1
+    store.close()
+
+
+def test_a_join_whose_wait_the_server_cancels_is_an_error(pg_dsn: str) -> None:
+    import psycopg
+
+    from tests.test_lock_free_open import _hold_writer_lock
+
+    with BudgetManager.open_postgres(pg_dsn, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+    store = PostgresStore(pg_dsn)
+    holder = _hold_writer_lock(pg_dsn)
+    try:
+        with psycopg.connect(pg_dsn, prepare_threshold=None) as conn:
+            conn.execute("SET LOCAL statement_timeout = 50")
+            with pytest.raises(StorageError, match="cannot join the transaction"):
+                with store.join(conn):
+                    pass
+    finally:
+        holder.close()
+    store.close()

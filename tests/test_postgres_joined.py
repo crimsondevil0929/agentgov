@@ -34,7 +34,12 @@ from agentgov.core import (
     WriteBatch,
     money,
 )
-from agentgov.exceptions import LedgerConflictError, StorageError, UnknownScopeError
+from agentgov.exceptions import (
+    LedgerConflictError,
+    LedgerIntegrityError,
+    StorageError,
+    UnknownScopeError,
+)
 from agentgov.postgres import PostgresStore
 
 pytestmark = pytest.mark.usefixtures("pg_dsn")
@@ -509,3 +514,27 @@ def test_a_redemption_follows_what_its_unit_of_work_wrote_before_it(
     assert memos[-3] == "before the redemption" and memos[-1] == spend.memo == "settles"
     with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
         reader.verify_integrity()
+
+
+def test_a_claim_booked_meanwhile_by_another_governor_is_not_booked_again(
+    pg_dsn: str,
+    gov: BudgetManager,
+    caller: psycopg.Connection[Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Between reading the pending claims and deleting the one it books, a
+    governor can lose the claim to another: then the claim's delete finds
+    nothing, and nothing the redemption wrote commits."""
+    hold = gov.authorize("agent", "0.40")
+    with gov.joined(caller) as txn:
+        claim = txn.claim("agent", "0.25", memo="settles", hold=hold)
+        caller.execute("COMMIT")
+    with BudgetManager.open_postgres(pg_dsn) as other:
+        (booked,) = other.redeem(claim)
+    monkeypatch.setattr(PostgresStore, "pending_claims", lambda self: (claim,))  # read too early
+    with pytest.raises(LedgerIntegrityError, match="only 0 were still pending"):
+        gov.redeem(claim)
+    monkeypatch.undo()
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
+        reader.verify_integrity()
+        assert [s.entry_hash for s in spends(pg_dsn)] == [booked.entry_hash], "booked once"
