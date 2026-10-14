@@ -2110,3 +2110,83 @@ def test_a_ledger_opened_a_checkpoints_worth_past_its_last_is_checkpointed_at_on
         assert _checkpointed(reopened) == []
         reopened.anchor("root", "the first write")
         assert _checkpointed(reopened) == [11]
+
+
+def test_a_ledger_reopened_just_after_a_checkpoint_owes_none(tmp_path: Path) -> None:
+    with _sqlite(tmp_path, EVERY_FOUR) as gov:
+        gov.open_root("root", money("1"))
+        for n in range(3):
+            gov.anchor("root", f"tick {n}")
+        assert _checkpointed(gov) == [4]
+    with _sqlite(tmp_path, EVERY_FOUR) as reopened:
+        reopened.anchor("root", "6")
+        assert _checkpointed(reopened) == [4], "two entries since the checkpoint"
+
+
+def test_a_ledger_of_exactly_a_checkpoints_worth_owes_one(tmp_path: Path) -> None:
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("root", money("1"))
+        for n in range(3):
+            gov.anchor("root", f"tick {n}")  # 4 entries, no checkpoint
+    with _sqlite(tmp_path, EVERY_FOUR) as reopened:
+        reopened.anchor("root", "5")
+        assert _checkpointed(reopened) == [5]
+
+
+class _Recorded:
+    def __init__(self) -> None:
+        self.values: dict[str, list[float]] = {}
+
+    def record(self, name: str, value: float) -> None:
+        self.values.setdefault(name, []).append(value)
+
+    def add(self, name: str, value: int = 1) -> None:
+        pass
+
+    def set(self, name: str, value: float) -> None:
+        pass
+
+
+def test_an_open_reports_how_long_it_took(tmp_path: Path) -> None:
+    metrics = _Recorded()
+    with _sqlite(tmp_path, metrics=metrics) as gov:
+        gov.open_root("root", money("1"))
+    (took,) = metrics.values["agentgov.open.duration"]
+    assert 0 <= took < 60
+
+
+def _halted_twice(tmp_path: Path) -> Path:
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("one", money("1"))
+        gov.open_root("two", money("1"))
+        gov.trip("one", "halted")
+        gov.trip("two", "halted")
+    return tmp_path / "ledger.db"
+
+
+def test_a_cache_that_disagrees_with_the_chain_is_named_and_counted(tmp_path: Path) -> None:
+    path = _halted_twice(tmp_path)
+    _sql(path, "DELETE FROM control_events WHERE scope_id = 'one'")
+    with pytest.raises(LedgerIntegrityError) as one:
+        _sqlite(tmp_path)
+    assert "missing from the control_events table" in str(one.value)
+    assert "more)" not in str(one.value)
+    _sql(path, "DELETE FROM control_events")
+    with pytest.raises(LedgerIntegrityError, match=r"\(and 1 more\)"):
+        _sqlite(tmp_path)
+
+
+def test_a_repair_is_made_only_where_it_can_be_written_and_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _halted_twice(tmp_path)
+    _sql(path, "DELETE FROM control_events")
+    with pytest.raises(LedgerIntegrityError, match="a read-only store cannot be repaired"):
+        BudgetManager.open_sqlite(str(path), read_only=True, repair=True)
+    with caplog.at_level(logging.WARNING, logger="agentgov.audit"):
+        with _sqlite(tmp_path, repair=True) as repaired:
+            assert repaired.is_halted("one") and repaired.is_halted("two")
+    logged = [r.getMessage() for r in caplog.records if "|repair|" in r.getMessage()]
+    assert len(logged) == 2
+    with _sqlite(tmp_path) as reopened:  # repaired for good
+        assert reopened.is_halted("one")
