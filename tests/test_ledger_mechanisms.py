@@ -1000,8 +1000,11 @@ def test_a_settlement_at_no_cost_keeps_its_memo() -> None:
     assert lifted.memo == "captured at zero cost"
 
 
-def test_a_call_retried_within_its_transaction_returns_what_it_returned() -> None:
-    gov = BudgetManager(policy=NEVER)
+@pytest.mark.parametrize("stored", [False, True], ids=["in memory", "over sqlite"])
+def test_a_call_retried_within_its_transaction_returns_what_it_returned(
+    stored: bool, tmp_path: Path
+) -> None:
+    gov = _sqlite(tmp_path) if stored else BudgetManager(policy=NEVER)
     gov.open_root("root", money("1"))
     held = gov.authorize("root", money("0.5"))
     with gov.transaction() as txn:
@@ -1010,6 +1013,7 @@ def test_a_call_retried_within_its_transaction_returns_what_it_returned() -> Non
     with pytest.raises(DoubleSpendError):
         gov.capture(held, money("0.2"))
     assert gov.available("root") == money("0.8")
+    gov.close()
 
 
 def test_a_call_recorded_before_a_restart_is_found_inside_a_transaction(tmp_path: Path) -> None:
@@ -1942,3 +1946,40 @@ def test_a_witness_is_given_a_proof_from_the_size_it_cosigned(tmp_path: Path) ->
         assert gov.publish_checkpoint([witness]).tree_size == 4
         gov.publish_checkpoint([witness])  # the same size again: nothing between
     assert witness.proofs[0] == [] and len(witness.proofs[1]) > 0 and witness.proofs[2] == []
+
+
+class _BeginRefused:
+    """A connection on which another process holds the write lock too long."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def execute(self, statement: str, *args: Any) -> Any:
+        if statement == "BEGIN IMMEDIATE":
+            raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(statement, *args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def test_a_sqlite_unit_that_cannot_begin_is_an_error_and_leaves_no_unit(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "ledger.db")
+    real = store._conn
+    store._conn = _BeginRefused(real)  # type: ignore[assignment]
+    with pytest.raises(StorageError, match="cannot begin a ledger transaction: database is locked"):
+        with store.unit():
+            pass
+    store._conn = real
+    with store.unit() as unit:
+        pass
+    assert unit.committed
+    store.close()
+
+
+def test_a_sqlite_store_that_cannot_read_its_calls_says_so(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "ledger.db")
+    _sql(tmp_path / "ledger.db", "DROP TABLE idempotency")
+    with pytest.raises(StorageError, match="cannot read the calls recorded under keys"):
+        store.idempotency(["k"])
+    store.close()
