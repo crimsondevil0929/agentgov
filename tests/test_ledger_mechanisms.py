@@ -2095,3 +2095,18 @@ def test_a_ledger_read_before_a_shared_store_moved_on_is_brought_up_to_it(pg_dsn
     assert len(gov.ledger) == 2 and gov.is_halted("org")
     gov.verify_integrity()
     gov.close()
+
+
+def test_a_ledger_opened_a_checkpoints_worth_past_its_last_is_checkpointed_at_once(
+    tmp_path: Path,
+) -> None:
+    """Written without checkpoints (or by a governor that died owing one), it
+    is checkpointed after the first write, not at the next multiple."""
+    with _sqlite(tmp_path) as gov:  # checkpoint_every=0: none written
+        gov.open_root("root", money("1"))
+        for n in range(9):
+            gov.anchor("root", f"tick {n}")
+    with _sqlite(tmp_path, EVERY_FOUR) as reopened:
+        assert _checkpointed(reopened) == []
+        reopened.anchor("root", "the first write")
+        assert _checkpointed(reopened) == [11]
