@@ -580,6 +580,11 @@ _V1 = ("AGOV1",)
             "did not release",
         ),
         ([_FUND, (EntryType.CHECKPOINT, Direction.NONE, "", "0", None)], (), "AGOV3 only"),
+        (
+            [_FUND, (EntryType.REVERSAL, Direction.CREDIT, "root", "0.10", None)],
+            ("AGOV3", "AGOV3"),
+            "more than the 0 it ever spent",
+        ),
     ],
     ids=[
         "illegal-direction",
@@ -595,6 +600,7 @@ _V1 = ("AGOV1",)
         "unmatched-v1-release",
         "spend-of-a-hold-an-earlier-transaction-released",
         "agov2-checkpoint",
+        "agov3-refund-past-the-scopes-spend",
     ],
 )
 def test_every_replay_rule_rejects_a_forged_chain(
