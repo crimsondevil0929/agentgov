@@ -687,3 +687,43 @@ def test_history_queries_on_postgres_match_sqlite(pg_dsn: str, ledger_db: str) -
             assert gov.entries(after=0, limit=3) == gov.audit_trail()[:3]
         assert len(pg.find_entries(scope_id="a")) == len(lite.find_entries(scope_id="a"))
         pg.verify_integrity()
+
+
+def _checkpointed_as(path: Path, forge: Any) -> None:
+    """A ledger at ``path`` whose newest checkpoint commits to a snapshot of
+    the state ``forge`` changed: what the chain implies, said otherwise, with
+    its digest in the chain. Only a replay from genesis shows it is not the
+    chain's; an open takes it, and checks what a state must be on its own."""
+    from agentgov.storage import Snapshot
+
+    with BudgetManager.open_sqlite(str(path), policy=NEVER, auditor=False) as gov:
+        gov.open_root("root", money("1"))
+        gov.delegate("root", "child", money("0.5"))
+        state = gov.ledger._state.copy()
+        forge(state)
+        body = _encode_snapshot(state)
+        digest = _snapshot_digest(body)
+        store: Any = gov.store
+        store.put_snapshot(Snapshot(sequence=state.length, digest=digest, body=body))
+        memo = f"agentgov-checkpoint v1 seq={state.length} sha256={digest}"
+        gov.ledger._post(
+            [LedgerLine(EntryType.CHECKPOINT, Direction.NONE, "", Decimal(0), memo=memo)]
+        )
+
+
+def test_an_open_from_a_snapshot_that_creates_money_is_refused(tmp_path: Path) -> None:
+    def ten_cents_from_nowhere(state: Any) -> None:
+        state.balances["root"] = money("0.6")
+
+    _checkpointed_as(tmp_path / "ledger.db", ten_cents_from_nowhere)
+    with pytest.raises(LedgerIntegrityError, match="conservation violated"):
+        BudgetManager.open_sqlite(str(tmp_path / "ledger.db"), read_only=True)
+
+
+def test_an_open_from_a_snapshot_whose_tree_is_not_one_is_refused(tmp_path: Path) -> None:
+    def disowned(state: Any) -> None:
+        state.nodes["root"] = dataclasses.replace(state.nodes["root"], child_ids=[])
+
+    _checkpointed_as(tmp_path / "ledger.db", disowned)
+    with pytest.raises(LedgerIntegrityError, match="not listed as a child of 'root'"):
+        BudgetManager.open_sqlite(str(tmp_path / "ledger.db"), read_only=True)

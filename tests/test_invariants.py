@@ -255,6 +255,25 @@ def test_manager_exposes_chain_and_conservation_checks(gov: BudgetManager) -> No
     gov.verify_integrity()
 
 
+def test_verify_integrity_names_a_conservation_violation(gov: BudgetManager) -> None:
+    """Before a replay could only say a balance differs, the identity says
+    money was made: the defect, by name."""
+    gov.ledger._balances["root"] = money("9999.00")
+    with pytest.raises(LedgerIntegrityError, match="conservation violated"):
+        gov.verify_integrity()
+
+
+def test_verify_integrity_catches_an_open_hold_no_authorization_serves(
+    gov: BudgetManager,
+) -> None:
+    """A replay rebuilds the chain's holds, not the authorizations served on
+    them: that every open hold has exactly one is a check of its own."""
+    auth = gov.authorize("child", money("0.10"))
+    del gov.ledger._open_auths[auth.authorization_id]
+    with pytest.raises(LedgerIntegrityError, match="open authorizations disagree"):
+        gov.verify_integrity()
+
+
 def test_manager_conservation_check_catches_a_tampered_ledger(gov: BudgetManager) -> None:
     """A pass-through that never fails is not a check."""
     gov.open_root("orchestrator", money("5.00"))
