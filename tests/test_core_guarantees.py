@@ -1195,6 +1195,19 @@ def _run_sql(path: str, sql: str, params: tuple[object, ...] = ()) -> None:
             "('ghost', NULL, 0, '1.00000000', '2026-09-01T00:00:00.000000Z')",
             "never created",
         ),
+        (
+            "INSERT INTO control_events (event_id, timestamp, event_type, scope_id, reason, "
+            "ledger_head_hash, entry_id) SELECT lower(hex(randomblob(16))), timestamp, "
+            "event_type, scope_id, reason, ledger_head_hash, entry_id FROM control_events",
+            "records chain entry .* twice",
+        ),
+        (
+            "INSERT INTO control_events (event_id, timestamp, event_type, scope_id, reason, "
+            "ledger_head_hash, entry_id) SELECT lower(hex(randomblob(16))), timestamp, "
+            "event_type, scope_id, reason, ledger_head_hash, "
+            "(SELECT entry_id FROM entries WHERE sequence = 1) FROM control_events",
+            "which is not a control entry in the chain",
+        ),
     ],
 )
 def test_editing_governance_tables_is_refused_and_repair_restores_the_chains_view(

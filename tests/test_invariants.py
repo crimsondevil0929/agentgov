@@ -195,6 +195,25 @@ def test_a_delegation_cycle_is_caught(gov: BudgetManager) -> None:
         gov.verify_integrity()
 
 
+def test_a_delegation_cycle_above_a_scope_is_caught(gov: BudgetManager) -> None:
+    """The cycle need not run through the scope a walk starts from: one walk
+    up from a scope under it finds it all the same, and ends."""
+    gov.delegate("root", "a", money("0.20"))
+    gov.delegate("a", "b", money("0.10"))
+    gov.delegate("b", "x", money("0.05"))
+    nodes = gov.ledger._state.nodes
+    a, b, x = nodes["a"], nodes["b"], nodes["x"]
+    a.parent_id = "b"  # a and b: each the other's parent
+    b.child_ids = ["a"]
+    x.parent_id = "a"  # x, under them
+    a.child_ids = ["b", "x"]
+    x.depth = a.depth + 1
+    gov.ledger._state.nodes = {k: nodes[k] for k in ("root", "child", "x", "a", "b")}
+
+    with pytest.raises(LedgerIntegrityError, match="delegation cycle detected"):
+        gov.verify_integrity()
+
+
 # -- velocity window -------------------------------------------------------
 
 

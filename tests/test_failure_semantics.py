@@ -237,3 +237,41 @@ def test_writes_never_wait_on_a_checkpoint_signer_that_is_down(tmp_path: Path) -
         assert gov._checkpoint_backoff == 0.0
     finally:
         gov.close()
+
+
+def test_a_governor_forgets_what_it_wrote_and_did_not_commit(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that did not commit leaves its entries in the governor's view
+    and their hashes among those it remembers. It re-reads the ledger and
+    forgets them: a failover that later loses others' commits at those very
+    sequences is then a rollback, not a ledger rewritten under it."""
+    from agentgov.exceptions import StorageError
+    from agentgov.postgres import PostgresStore
+
+    writer = BudgetManager.open_postgres(pg_dsn, policy=POLICY, auditor=False)
+    follower = BudgetManager.open_postgres(pg_dsn, policy=POLICY, auditor=False)
+    try:
+        writer.open_root("root", money("10"))
+        writer.delegate("root", "agent", money("5"))
+        follower.refresh()
+        kept = len(follower.ledger)
+        _copy_tables(pg_dsn)
+
+        def refuse(self: PostgresStore, session: Any) -> None:
+            self._rollback_quietly()
+            session.batches.clear()
+            raise StorageError("the database refused the commit")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(PostgresStore, "_end", refuse)
+            with pytest.raises(StorageError):
+                follower.spend("agent", money("0.01"))
+        _spend(writer, 5)
+        follower.refresh()
+        _cut_back(pg_dsn, kept + 1)  # the writer's first entry kept, where the follower's was
+        with pytest.raises(LedgerRollbackError, match="not rewritten"):
+            follower.spend("agent", money("0.01"))
+    finally:
+        follower.close()
+        writer.close()

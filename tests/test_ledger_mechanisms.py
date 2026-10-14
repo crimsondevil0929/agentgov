@@ -2428,3 +2428,42 @@ def test_a_governor_others_write_beside_catches_up_before_it_asks_for_the_lock(
         gov.anchor("root", "after the spend")
         assert under_the_lock == [0]
         assert gov.available("root") == money("9")
+
+
+def test_a_view_reads_its_ledger_afresh_only_when_asked(tmp_path: Path) -> None:
+    with _sqlite(tmp_path) as writer:
+        node = writer.open_root("root", money("1"))
+        assert (node.scope_id, node.parent_id, node.allocated) == ("root", None, money("1"))
+        writer.delegate("root", "team", money("0.5"))
+        with _sqlite(tmp_path, read_only=True) as reader:
+            writer.spend("team", money("0.2"))
+            assert reader.subtree_available("root") == money("1"), "what it last read"
+            assert reader.subtree_available("root", fresh=True) == money("0.8")
+            assert reader.subtree_available("root") == money("0.8")
+
+
+def test_a_reader_reloaded_across_an_upgrade_keeps_following(tmp_path: Path) -> None:
+    """A reader follows a pre-0.1.2 writer, then a writer that upgrades the
+    ledger under it: it re-reads the ledger in full, and from then on knows
+    which control rows it has folded in, and which authorization each hold a
+    legacy row names belongs to."""
+    from tests.test_core_guarantees import _legacy_database, _V1Writer
+
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    with BudgetManager.open_sqlite(path, read_only=True, policy=NEVER) as reader:
+        v1 = _V1Writer(path, fresh=False)  # still writing, after the reader opened
+        (hold,) = v1.post((EntryType.HOLD, Direction.DEBIT, "worker", "0.07", None))
+        v1.authorization("worker", "0.07", hold)
+        v1.control("circuit_tripped", "worker", "halted by a v0.1.1 writer")
+        v1.close()
+        with BudgetManager.open_sqlite(path, policy=NEVER, auditor=False) as writer:
+            writer.reset("worker")  # sealed on this open, then re-armed
+        reader.refresh()  # across the upgrade: a full re-read
+        assert not reader.is_halted("worker")
+        with BudgetManager.open_sqlite(path, policy=NEVER, auditor=False) as writer:
+            (legacy,) = [a for a in writer._open_auths.values() if a.entry.entry_id == hold]
+            writer.capture(legacy, money("0.01"))
+        assert reader.refresh() == 2  # the release and the spend
+        assert hold not in {a.entry.entry_id for a in reader._open_auths.values()}
+        reader.verify_integrity()
