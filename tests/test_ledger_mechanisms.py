@@ -1909,3 +1909,36 @@ def test_a_ledger_rewritten_at_the_same_length_is_rewritten_not_current(pg_dsn: 
     finally:
         writer.close()
         follower.close()
+
+
+class _RecordingWitness:
+    """A witness that cosigns whatever it is asked, keeping the proofs."""
+
+    witness_id = "recorder"
+
+    def __init__(self) -> None:
+        self.proofs: list[list[bytes]] = []
+        self.seen: Any = None
+
+    def latest(self, log_id: str) -> Any:
+        return self.seen
+
+    def cosign(self, checkpoint: Any, proof: Any) -> None:
+        self.proofs.append(list(proof))
+        self.seen = checkpoint
+
+
+def test_a_witness_is_given_a_proof_from_the_size_it_cosigned(tmp_path: Path) -> None:
+    """RFC 9162 consistency, from the size of the witness's latest
+    cosignature: none at all for a witness that has cosigned nothing."""
+    witness = _RecordingWitness()
+    with _sqlite(tmp_path, signing=CheckpointSigning(signer=KEY)) as gov:
+        gov.open_root("root", money("1"))
+        gov.anchor("root", "2")
+        gov.checkpoint()
+        assert gov.publish_checkpoint([witness]).tree_size == 2
+        gov.anchor("root", "4")
+        gov.checkpoint()
+        assert gov.publish_checkpoint([witness]).tree_size == 4
+        gov.publish_checkpoint([witness])  # the same size again: nothing between
+    assert witness.proofs[0] == [] and len(witness.proofs[1]) > 0 and witness.proofs[2] == []
