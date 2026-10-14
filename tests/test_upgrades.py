@@ -111,3 +111,5 @@ def test_a_release_postgres_schema_upgrades_and_keeps_working(release: str, pg_d
     with BudgetManager.open_postgres(pg_dsn, schema="fixture") as reopened:
         assert reopened.ledger._state.last_checkpoint is not None
         reopened.verify_integrity()
+    with BudgetManager.open_postgres(pg_dsn, schema="fixture", read_only=True) as after:
+        assert after.store is not None and after.store.schema_version == "pg2"  # type: ignore[attr-defined]

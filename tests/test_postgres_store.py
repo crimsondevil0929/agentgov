@@ -471,9 +471,13 @@ def test_a_read_only_view_refuses_history_rewritten_under_it(
 # --------------------------------------------------------------------------
 
 
-def test_a_role_with_only_dml_grants_can_run_a_governor(pg_admin_dsn: str, pg_dsn: str) -> None:
+def test_a_role_with_only_dml_grants_can_run_a_governor(
+    pg_admin_dsn: str, pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Install once as the owner; run the fleet as a role that cannot alter the
-    schema, lift the triggers, or edit history."""
+    schema, lift the triggers, or edit history. One that looked before another
+    governor upgraded the schema looks again under the writer lock, and finds
+    nothing left to do: it runs no DDL it could not run."""
     from psycopg.conninfo import make_conninfo
 
     seeded(pg_dsn).close()
@@ -505,6 +509,18 @@ def test_a_role_with_only_dml_grants_can_run_a_governor(pg_admin_dsn: str, pg_ds
             assert isinstance(store, PostgresStore)
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 store._conn.execute("ALTER TABLE agentgov.entries DISABLE TRIGGER append_only")
+        looked: list[str | None] = []
+        installed = PostgresStore._installed_version
+
+        def stale_at_first(self: PostgresStore) -> str | None:
+            found = installed(self)
+            looked.append(found)
+            return "pg1" if len(looked) == 1 else found
+
+        with monkeypatch.context() as patch:
+            patch.setattr(PostgresStore, "_installed_version", stale_at_first)
+            BudgetManager.open_postgres(dsn).close()
+        assert looked[:2] == ["pg2", "pg2"], "looked again under the writer lock"
     finally:
         with admin(pg_dsn) as conn:
             conn.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))

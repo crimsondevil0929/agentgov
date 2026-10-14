@@ -295,3 +295,20 @@ def test_the_fleet_window_counts_holds_by_their_time_in_the_chain(
     with pytest.raises(RunawayLoopDetectedError):
         gov.authorize("other", money("1"))  # the second, exactly a minute old, has not
     assert gov.is_halted("other") and not gov.is_halted("root")
+
+
+def test_a_reset_starts_the_window_afresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tripped scope reset by its operator is not tripped again by the
+    calls that tripped it."""
+    import agentgov.core
+
+    clock = _Clock(100.0)
+    monkeypatch.setattr(agentgov.core, "time", clock)
+    gov = BudgetManager(policy=GovernancePolicy(max_calls_per_window=1, window_seconds=60.0))
+    gov.open_root("root", money("100"))
+    gov.authorize("root", money("1"))
+    with pytest.raises(RunawayLoopDetectedError):
+        gov.authorize("root", money("1"))
+    gov.reset("root")
+    gov.authorize("root", money("1"))
+    assert not gov.is_halted("root")

@@ -67,8 +67,12 @@ def test_a_sqlite_governor_reports_its_work(tmp_path: Path) -> None:
         with pytest.raises(DenialOfWalletError):
             gov.authorize("a", money("50"))
         assert metrics.seen["agentgov.trips"] == [1]
+        gov.reset("a")
+        assert metrics.seen["agentgov.trips"] == [1], "a reset is not a trip"
+        started = time.perf_counter()
         gov.verify_integrity()
-        assert len(metrics.seen["agentgov.verify.duration"]) == 1
+        (verified,) = metrics.seen["agentgov.verify.duration"]
+        assert 0 <= verified <= time.perf_counter() - started
         # Callers that arrive together share a unit of work, and say how many.
         gov.delegate("root", "b", money("4"))
         with gov._lock:
