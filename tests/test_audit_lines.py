@@ -190,7 +190,13 @@ def test_an_audit_line_has_fixed_fields_in_a_fixed_order() -> None:
 
 
 def test_ordinary_text_is_written_as_it_is() -> None:
-    for text in ("agent.research", "task/42/step-3", "settled call cost", "a=b c:d (e) [f]"):
+    for text in (
+        "agent.research",
+        "task/42/step-3",
+        "settled call cost",
+        "a=b c:d (e) [f]",
+        'a "quoted" memo',
+    ):
         assert _escape(text) == text
 
 
