@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import itertools
 import logging
+import re
 import shutil
 import sqlite3
 import threading
@@ -23,12 +25,13 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from agentgov import BudgetManager, CheckpointSigning, GovernancePolicy, money
-from agentgov.audit import Auditor
+from agentgov.audit import Auditor, AuditorThread
 from agentgov.core import (
     GENESIS_HASH,
     MAX_ID_BYTES,
@@ -432,11 +435,7 @@ def test_a_call_recorded_just_before_a_rolled_back_transaction_is_kept() -> None
 # -- history ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("stored", [False, True], ids=["in memory", "over sqlite"])
-def test_history_is_answered_alike_from_memory_and_from_a_store(
-    stored: bool, tmp_path: Path
-) -> None:
-    gov = _sqlite(tmp_path) if stored else BudgetManager(policy=NEVER)
+def _answers_history_alike(gov: BudgetManager) -> None:
     gov.open_root("root", money("10"))
     held = gov.authorize("root", money("1"))
     captured = gov.capture(held, money("0.5"), memo="paid")
@@ -459,7 +458,25 @@ def test_history_is_answered_alike_from_memory_and_from_a_store(
     assert gov.ledger.entry(0) is None and gov.ledger.entry(len(trail) + 1) is None
     with pytest.raises(IndexError):
         gov.entry(0)
+    assert gov.entries(after=len(trail) - 2) == trail[-2:]
+    store: Any = gov.store
+    if store is not None:
+        assert [e.sequence for e in store.iter_entries()] == [e.sequence for e in trail]
+        assert list(store.iter_entries(after=len(trail))) == []
+
+
+@pytest.mark.parametrize("stored", [False, True], ids=["in memory", "over sqlite"])
+def test_history_is_answered_alike_from_memory_and_from_a_store(
+    stored: bool, tmp_path: Path
+) -> None:
+    gov = _sqlite(tmp_path) if stored else BudgetManager(policy=NEVER)
+    _answers_history_alike(gov)
     gov.close()
+
+
+def test_history_is_answered_alike_over_postgres(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
+        _answers_history_alike(gov)
 
 
 # -- a governor over PostgreSQL, among others ---------------------------------------------
@@ -1261,3 +1278,629 @@ def test_a_probe_the_server_cancels_is_an_error_and_the_store_still_probes(pg_ds
         holder.close()
     assert store.writer_lock_held(0.5) is False
     store.close()
+
+
+# -- the PostgreSQL store's own word --------------------------------------------------------
+
+_ENTRIES_REARM = (
+    "ALTER TABLE agentgov.entries ENABLE ALWAYS TRIGGER append_only, "
+    "ENABLE ALWAYS TRIGGER append_only_truncate, ENABLE ALWAYS TRIGGER extend_chain"
+)
+
+
+def _admin(dsn: str, *statements: str) -> None:
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as conn:
+        for statement in statements:
+            conn.execute(statement)
+
+
+def test_a_postgres_store_keeps_its_word_as_the_sqlite_store_does(pg_dsn: str) -> None:
+    import psycopg
+
+    store = PostgresStore(pg_dsn)
+    assert store.head() == (0, GENESIS_HASH)
+    assert store.idempotency([]) == {}
+    snapshot = Snapshot(sequence=7, digest="a" * 64, body=b"{}")
+    store.put_snapshot(snapshot)
+    store.put_snapshot(snapshot)
+    with pytest.raises(LedgerIntegrityError, match="a different snapshot of sequence 7"):
+        store.put_snapshot(dataclasses.replace(snapshot, digest="b" * 64))
+    with store.writer():
+        with pytest.raises(StorageError, match="outside a writer session"):
+            store.put_snapshot(dataclasses.replace(snapshot, sequence=8))
+        with psycopg.connect(pg_dsn, prepare_threshold=None) as conn:
+            conn.execute("SELECT 1")
+            with pytest.raises(StorageError, match="inside another writer session"):
+                with store.join(conn):
+                    pass
+    with psycopg.connect(pg_dsn, prepare_threshold=None) as conn:
+        conn.execute("SELECT 1")
+        conn.close()
+        with pytest.raises(StorageError, match=r"joins an open transaction|cannot join"):
+            with store.join(conn):
+                pass
+    store.close()
+    read_only = PostgresStore(pg_dsn, read_only=True)
+    with pytest.raises(ReadOnlyLedgerError):
+        read_only.put_snapshot(dataclasses.replace(snapshot, sequence=9))
+    with pytest.raises(ReadOnlyLedgerError):
+        read_only.record_audit(None)  # type: ignore[arg-type]
+    with psycopg.connect(pg_dsn, prepare_threshold=None) as conn:
+        conn.execute("SELECT 1")
+        with pytest.raises(ReadOnlyLedgerError), read_only.join(conn):
+            pass
+    read_only.close()
+
+
+def test_a_postgres_store_reads_on_a_new_connection_after_the_server_ended_one(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+        gov.spend("org", money("0.1"), idempotency_key="k")
+    store = PostgresStore(pg_dsn, read_only=True)
+    pid = store._conn.info.backend_pid
+    _admin(pg_dsn, f"SELECT pg_terminate_backend({pid})")
+    _until(lambda: _backend_gone(pg_dsn, pid))
+    with pytest.raises(StorageError):
+        store.idempotency(["k"])  # its first use finds the connection gone
+    (record,) = store.idempotency(["k"]).values()  # and the next opens a new one
+    assert record.key == "k" and record.outcome == "entry"
+    store.close()
+
+
+def _backend_gone(dsn: str, pid: int) -> bool:
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as conn:
+        row = conn.execute("SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (pid,))
+        return row.fetchone() == (0,)
+
+
+def test_an_open_from_a_postgres_checkpoint_replays_only_what_came_after(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentgov.core import _Overlay
+
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+        for n in range(5):
+            gov.anchor("org", f"tick {n}")
+        gov.checkpoint()  # of 6; its entry is 7
+        gov.trip("org", "after the checkpoint")  # the first control row, after it
+    applied: list[int] = []
+    real = _Overlay.apply
+
+    def counting(self: _Overlay, entry: LedgerEntry, **kwargs: Any) -> None:
+        applied.append(entry.sequence)
+        real(self, entry, **kwargs)
+
+    monkeypatch.setattr(_Overlay, "apply", counting)
+    with BudgetManager.open_postgres(pg_dsn, auditor=False) as reopened:
+        assert applied == [7, 8] and reopened.is_halted("org")
+    applied.clear()
+    with BudgetManager.open_postgres(pg_dsn, verify="full", auditor=False) as replayed:
+        assert applied == list(range(1, 9)) and replayed.is_halted("org")
+
+
+def test_a_full_open_of_postgres_finds_an_edit_before_the_checkpoint(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+        gov.anchor("org", "before")
+        gov.checkpoint()
+    _admin(
+        pg_dsn,
+        "ALTER TABLE agentgov.entries DISABLE TRIGGER USER",
+        "UPDATE agentgov.entries SET memo = 'edited' WHERE sequence = 2",
+        _ENTRIES_REARM,
+    )
+    with BudgetManager.open_postgres(pg_dsn, auditor=False, read_only=True):
+        pass  # from the checkpoint: the edit is before it, the auditor's to find
+    with pytest.raises(LedgerIntegrityError, match="tampered"):
+        BudgetManager.open_postgres(pg_dsn, verify="full", auditor=False)
+
+
+def test_a_postgres_checkpoint_that_names_no_snapshot_is_refused(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+        gov.checkpoint()
+    _admin(
+        pg_dsn,
+        "ALTER TABLE agentgov.snapshots DISABLE TRIGGER USER",
+        "DELETE FROM agentgov.snapshots",
+        "ALTER TABLE agentgov.snapshots ENABLE ALWAYS TRIGGER snapshots_append_only, "
+        "ENABLE ALWAYS TRIGGER snapshots_append_only_truncate",
+    )
+    with pytest.raises(LedgerIntegrityError, match="names a snapshot this store does not hold"):
+        BudgetManager.open_postgres(pg_dsn, auditor=False)
+
+
+def test_a_postgres_checkpoint_whose_memo_was_edited_names_no_snapshot(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+        gov.checkpoint()
+        gov.anchor("org", "after")
+        gov.checkpoint()
+    _admin(
+        pg_dsn,
+        "ALTER TABLE agentgov.entries DISABLE TRIGGER USER",
+        "UPDATE agentgov.entries SET memo = 'edited' WHERE sequence = 4",
+        _ENTRIES_REARM,
+    )
+    store = PostgresStore(pg_dsn, read_only=True)
+    assert [of for _, of, _ in store.checkpoints()] == [1], "only well-formed checkpoints"
+    store.close()
+    with pytest.raises(LedgerIntegrityError, match="names a snapshot this store does not hold"):
+        BudgetManager.open_postgres(pg_dsn, auditor=False)
+
+
+def test_a_postgres_control_row_whose_entry_the_chain_lacks_is_refused(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+        gov.trip("org", "halted")
+    _admin(
+        pg_dsn,
+        "INSERT INTO agentgov.control_events (event_id, timestamp, event_type, scope_id, "
+        "reason, ledger_head_hash, entry_id) SELECT gen_random_uuid(), timestamp, event_type, "
+        "scope_id, reason, ledger_head_hash, gen_random_uuid() FROM agentgov.control_events "
+        "LIMIT 1",
+    )
+    with pytest.raises(LedgerIntegrityError):
+        BudgetManager.open_postgres(pg_dsn, auditor=False)
+
+
+def test_a_postgres_ledger_an_auditor_failed_is_written_by_no_governor(pg_dsn: str) -> None:
+    every = GovernancePolicy(max_calls_per_window=0, checkpoint_every=4)
+    with BudgetManager.open_postgres(pg_dsn, policy=every, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+        for n in range(8):
+            gov.anchor("org", f"tick {n}")
+    store = PostgresStore(pg_dsn)
+    assert Auditor(store).run().ok
+    assert [m.status for m in store.audit_marks()][:1] == ["verified"]
+    store.close()
+    _admin(
+        pg_dsn,
+        "ALTER TABLE agentgov.entries DISABLE TRIGGER USER",
+        "UPDATE agentgov.entries SET memo = 'rewritten' WHERE sequence = 2",
+        _ENTRIES_REARM,
+    )
+    store = PostgresStore(pg_dsn)
+    assert not Auditor(store).run(from_genesis=True).ok
+    store.close()
+    with pytest.raises(LedgerIntegrityError, match="an auditor found"):
+        BudgetManager.open_postgres(pg_dsn, auditor=False)
+
+
+def test_a_postgres_ledger_of_the_first_layout_says_so(pg_dsn: str) -> None:
+    from tests.test_upgrades import WITH_POSTGRES, _restore
+
+    _restore(pg_dsn, WITH_POSTGRES[0])
+    store = PostgresStore(pg_dsn, schema="fixture", read_only=True)
+    assert store.load(from_checkpoint=True).schema_version == "pg1"
+    store.close()
+
+
+# -- the auditor ------------------------------------------------------------------------
+
+
+def _auditable(tmp_path: Path) -> Path:
+    """A ledger of 11 entries with checkpoints of 4 and 8 (their entries are 5 and 9)."""
+    with _sqlite(tmp_path, EVERY_FOUR) as gov:
+        gov.open_root("root", money("1"))
+        for n in range(8):
+            gov.anchor("root", f"tick {n}")
+        assert _checkpointed(gov) == [4, 8] and len(gov.ledger) == 11
+    return tmp_path / "ledger.db"
+
+
+class _Delegating:
+    """A store that answers as ``inner`` does, but for what is given."""
+
+    def __init__(self, inner: Any, **overrides: Any) -> None:
+        self._inner = inner
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _sql(path: Path, statement: str, params: tuple[object, ...] = ()) -> None:
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(statement, params)
+        conn.commit()
+
+
+def test_an_audit_counts_what_it_replayed_and_marks_where_it_stopped(tmp_path: Path) -> None:
+    path = _auditable(tmp_path)
+    store = SqliteStore(path)
+    first = Auditor(store).run()
+    assert (first.resumed_from, first.verified_to, first.entries, first.checkpoints) == (
+        0,
+        11,
+        11,
+        2,
+    )
+    marks = store.audit_marks()
+    assert [(m.sequence, m.status) for m in marks] == [
+        (4, "verified"),
+        (8, "verified"),
+        (11, "verified"),
+    ]
+    assert marks[-1].detail == "replayed 11 entries from 0"
+    second = Auditor(store).run()
+    assert (second.resumed_from, second.entries, second.checkpoints) == (8, 3, 0)
+    store.close()
+    empty = SqliteStore(tmp_path / "empty.db")
+    assert Auditor(empty).run().entries == 0
+    assert len(empty.audit_marks()) == 0, "nothing replayed, nothing to mark"
+    empty.close()
+
+
+def test_an_audit_names_the_entry_it_failed_at(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _auditable(tmp_path)
+    _sql(path, "UPDATE entries SET memo = 'rewritten' WHERE sequence = 3")
+    store = SqliteStore(path)
+    with caplog.at_level(logging.ERROR, logger="agentgov.audit"):
+        report = Auditor(store).run()
+    assert report.failure is not None and report.failure.startswith("at sequence 3: ")
+    assert report.verified_to == 2
+    assert [(m.sequence, m.status) for m in store.audit_marks()] == [(3, "failed")]
+    assert "audit of the ledger failed at sequence 3" in caplog.text
+    store.close()
+
+
+def test_an_audit_fails_when_the_chain_does_not_end_at_the_head_reported(tmp_path: Path) -> None:
+    inner = SqliteStore(_auditable(tmp_path), read_only=True)
+    length, head = inner.head()
+    lying = _Delegating(inner, head=lambda: (length, "f" * 64))
+    report = Auditor(lying, record=False).run()
+    assert report.failure is not None
+    assert (
+        f"the chain ends at {length} ({head[:16]}), not at the head the store reported "
+        f"({length}, {'f' * 16})"
+    ) in report.failure
+    inner.close()
+
+
+def test_an_audit_checks_each_checkpoint_against_the_state_the_chain_implies(
+    tmp_path: Path,
+) -> None:
+    forged, missing = tmp_path / "forged", tmp_path / "missing"
+    forged.mkdir()
+    missing.mkdir()
+    with _sqlite(forged) as gov:
+        gov.open_root("root", money("1"))
+        gov.anchor("root", "2")
+        memo = f"agentgov-checkpoint v1 seq=2 sha256={'0' * 64}"
+        gov.ledger._post(
+            [LedgerLine(EntryType.CHECKPOINT, Direction.NONE, "", Decimal(0), memo=memo)]
+        )
+    store = SqliteStore(forged / "ledger.db", read_only=True)
+    report = Auditor(store, record=False).run()
+    assert report.failure is not None
+    pattern = r"commits to snapshot 0{16}, but the state the chain implies there is [0-9a-f]{16}$"
+    assert re.search(pattern, report.failure), report.failure
+    store.close()
+    with _sqlite(missing) as gov:
+        gov.open_root("root", money("1"))
+        gov.anchor("root", "2")
+        gov.checkpoint()
+    _sql(missing / "ledger.db", "DELETE FROM snapshots")
+    store = SqliteStore(missing / "ledger.db", read_only=True)
+    report = Auditor(store, record=False).run()
+    assert report.failure is not None
+    assert "the snapshot stored for sequence 2 is not the state the chain implies" in report.failure
+    store.close()
+
+
+def test_an_audit_resumes_only_from_a_snapshot_the_chain_commits_to(tmp_path: Path) -> None:
+    """It resumes from the newest checkpoint whose stored snapshot is the one
+    its mark verified and the one the chain names; replaying from an older
+    one, it then finds the altered snapshot."""
+    path = _auditable(tmp_path)
+    store = SqliteStore(path)
+    assert Auditor(store).run().ok
+    store.close()
+    # The snapshot of 8 replaced by the one of 4: its mark no longer matches it.
+    _sql(
+        path,
+        "UPDATE snapshots SET body = (SELECT body FROM snapshots WHERE sequence = 4) "
+        "WHERE sequence = 8",
+    )
+    store = SqliteStore(path)
+    report = Auditor(store).run()
+    assert report.resumed_from == 4 and report.failure is not None
+    assert "the snapshot stored for sequence 8 is not the state" in report.failure
+    store.close()
+    # And its mark rewritten to match: the chain's checkpoint still names another.
+    with closing(sqlite3.connect(path)) as conn:
+        (digest,) = conn.execute("SELECT digest FROM snapshots WHERE sequence = 4").fetchone()
+        conn.execute("UPDATE snapshots SET digest = ? WHERE sequence = 8", (digest,))
+        conn.execute("UPDATE audit_marks SET state_digest = ? WHERE sequence = 8", (digest,))
+        conn.commit()
+    store = SqliteStore(path)
+    report = Auditor(store).run()
+    assert report.resumed_from == 4 and report.failure is not None
+    assert "the snapshot stored for sequence 8 is not the state" in report.failure
+    store.close()
+
+
+def test_an_audit_told_to_stop_stops_at_the_end_of_a_chunk(tmp_path: Path) -> None:
+    store = SqliteStore(_auditable(tmp_path), read_only=True)
+    stop = threading.Event()
+    stop.set()
+    called: list[str] = []
+    report = Auditor(store, chunk=2, record=False).follow(stop=stop, on_failure=called.append)
+    assert report.ok and report.verified_to == 2
+    assert called == [], "a stop is no failure"
+    store.close()
+
+
+@pytest.mark.parametrize(("duty", "sleeps"), [(0.25, [3.0, 3.0]), (1.0, [])])
+def test_an_audit_at_a_share_of_a_core_rests_in_proportion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, duty: float, sleeps: list[float]
+) -> None:
+    """Every chunk of entries, the auditor rests so it works ``duty`` of the
+    time: at a quarter, three times as long as the chunk took."""
+    import agentgov.audit as audit_module
+
+    store = SqliteStore(_auditable(tmp_path), read_only=True)
+    ticks = itertools.count()
+    slept: list[float] = []
+    clock = SimpleNamespace(monotonic=lambda: float(next(ticks)), sleep=slept.append)
+    monkeypatch.setattr(audit_module, "time", clock)
+    Auditor(store, chunk=4, duty=duty, record=False).run()
+    assert slept == sleeps
+    store.close()
+
+
+def test_an_audit_that_cannot_record_its_marks_says_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    inner = SqliteStore(_auditable(tmp_path))
+
+    def refused(mark: object) -> None:
+        raise StorageError("the disk is full")
+
+    with caplog.at_level(logging.WARNING, logger="agentgov.audit"):
+        assert Auditor(_Delegating(inner, record_audit=refused)).run().ok
+    logged = [r for r in caplog.records if "could not record an audit mark" in r.getMessage()]
+    assert logged and all(r.exc_info is not None for r in logged)
+    inner.close()
+
+
+def test_an_auditor_thread_that_cannot_audit_says_so_and_closes_its_store(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    closed: list[bool] = []
+
+    class Unreachable:
+        def head(self) -> tuple[int, str]:
+            raise RuntimeError("the database is unreachable")
+
+        def close(self) -> None:
+            closed.append(True)
+            raise OSError("already gone")
+
+    with caplog.at_level(logging.DEBUG, logger="agentgov.audit"):
+        thread = AuditorThread(Unreachable(), interval=0.01)
+        thread.stop()
+    assert closed == [True] and not thread.alive
+    (stopped,) = [r for r in caplog.records if "the in-process auditor stopped" in r.getMessage()]
+    (closing_,) = [
+        r for r in caplog.records if "closing the auditor's store failed" in r.getMessage()
+    ]
+    assert stopped.exc_info is not None and closing_.exc_info is not None
+
+
+def test_an_audit_balances_each_transaction_up_to_a_checkpoint(tmp_path: Path) -> None:
+    """A transfer forged just before a checkpoint, with the checkpoint forged
+    to match: the transaction it ends must still balance."""
+    from agentgov.core import _ChainState, _Overlay
+
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("root", money("1"))
+        gov.delegate("root", "child", money("0.5"))
+        last = gov.audit_trail()[-1]
+    unbalanced = _appended(
+        last,
+        entry_type=EntryType.RELEASE,
+        direction=Direction.DEBIT,
+        scope_id="child",
+        counterparty_id="root",
+        amount=money("0.1"),
+        balance_after=money("0.4"),
+    )
+    store = SqliteStore(tmp_path / "ledger.db")
+    store.commit(WriteBatch(entries=[unbalanced]))
+    state = _ChainState()
+    view = _Overlay(state)
+    for entry in store.iter_entries():
+        view.apply(entry)
+    view.merge()  # as the chain implies it, unbalanced and all
+    body = _encode_snapshot(state)
+    digest = _snapshot_digest(body)
+    store.put_snapshot(Snapshot(sequence=unbalanced.sequence, digest=digest, body=body))
+    marker = _appended(
+        unbalanced,
+        entry_type=EntryType.CHECKPOINT,
+        direction=Direction.NONE,
+        scope_id="",
+        amount=Decimal(0),
+        balance_after=Decimal(0),
+        memo=f"agentgov-checkpoint v1 seq={unbalanced.sequence} sha256={digest}",
+    )
+    store.commit(WriteBatch(entries=[marker]))
+    report = Auditor(store, record=False).run()
+    assert report.failure is not None and "does not balance" in report.failure
+    store.close()
+
+
+def test_a_sqlite_url_names_a_path_and_a_scheme_a_kind() -> None:
+    from agentgov.opening import parse_url
+
+    with pytest.raises(ValueError, match="needs a path"):
+        parse_url("sqlite:")
+    with pytest.raises(ValueError, match="names no kind of ledger"):
+        parse_url("pg://host/ledger")
+    assert parse_url("//server/ledger.db") == ("sqlite", "//server/ledger.db", {})
+    assert parse_url("C://ledgers/a.db") == ("sqlite", "C://ledgers/a.db", {})
+    _, dsn, options = parse_url("postgresql://h/db?prepare_threshold=&application_name=")
+    assert options == {"prepare_threshold": None} and "application_name=" in dsn
+
+
+def test_a_refund_of_no_spend_this_ledger_holds_is_refused(tmp_path: Path) -> None:
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("root", money("1"))
+        gov.spend("root", money("0.5"))
+        with pytest.raises(ValueError, match="is not a spend this ledger holds"):
+            gov.refund("root", money("0.1"), reverses=uuid.uuid4())
+
+
+# -- a PostgreSQL store's sessions, and its 0.4 interface -------------------------------------
+
+
+def test_a_session_the_server_cancels_is_an_error_and_the_next_one_begins(pg_dsn: str) -> None:
+    """A statement timeout shorter than the wait for the writer lock cancels
+    the message that begins a session: no session, an error, and the store's
+    connection out of the aborted transaction for the next one."""
+    from psycopg.conninfo import make_conninfo
+
+    from tests.test_lock_free_open import _hold_writer_lock
+
+    with BudgetManager.open_postgres(pg_dsn, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+    store = PostgresStore(make_conninfo(pg_dsn, options="-c statement_timeout=50"))
+    holder = _hold_writer_lock(pg_dsn)
+    try:
+        with pytest.raises(StorageError, match="cannot open a ledger transaction"):
+            with store.writer():
+                pass
+    finally:
+        holder.close()
+    with store.writer() as session:
+        pass
+    assert session.committed
+    store.close()
+
+
+def test_a_session_whose_lock_is_not_granted_says_how_long_it_waited(pg_dsn: str) -> None:
+    from tests.test_lock_free_open import _hold_writer_lock
+
+    with BudgetManager.open_postgres(pg_dsn, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+    store = PostgresStore(pg_dsn, lock_timeout=0.2)
+    holder = _hold_writer_lock(pg_dsn)
+    try:
+        with pytest.raises(StorageError, match=r"timed out after 0\.2s waiting for the writer"):
+            with store.writer():
+                pass
+    finally:
+        holder.close()
+    store.close()
+
+
+def test_a_session_whose_read_fails_leaves_the_store_able_to_begin_again(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+    store = PostgresStore(pg_dsn)
+    _admin(pg_dsn, "ALTER TABLE agentgov.control_events RENAME TO control_events_away")
+    try:
+        with pytest.raises(StorageError, match="cannot open a ledger transaction"):
+            with store.writer(after_sequence=1, after_control_row=0):
+                pass
+    finally:
+        _admin(pg_dsn, "ALTER TABLE agentgov.control_events_away RENAME TO control_events")
+    with store.writer(after_sequence=1, after_control_row=0) as session:
+        pass
+    assert session.committed
+    store.close()
+
+
+def test_a_session_whose_connection_ends_before_its_commit_did_not_commit(pg_dsn: str) -> None:
+    with BudgetManager.open_postgres(pg_dsn, auditor=False) as gov:
+        gov.open_root("org", money("1"))
+    store = PostgresStore(pg_dsn)
+    with pytest.raises(StorageError, match="did not commit, or its outcome was lost"):
+        with store.writer() as session:
+            pid = store._conn.info.backend_pid
+            _admin(pg_dsn, f"SELECT pg_terminate_backend({pid})")
+            _until(lambda: _backend_gone(pg_dsn, pid))
+    assert not session.committed
+    store.close()
+
+
+class _SharedStoreOf04:
+    """A shared store with 0.4's interface and nothing more."""
+
+    def __init__(self, dsn: str) -> None:
+        self._inner = PostgresStore(dsn)
+
+    @property
+    def read_only(self) -> bool:
+        return self._inner.read_only
+
+    def commit(self, batch: WriteBatch) -> None:
+        self._inner.commit(batch)
+
+    def load(self) -> Any:
+        return self._inner.load()
+
+    def load_entries(self) -> tuple[LedgerEntry, ...]:
+        return self._inner.load_entries()
+
+    def snapshot(self, *, after_sequence: int, after_control_row: int) -> Any:
+        return self._inner.snapshot(
+            after_sequence=after_sequence, after_control_row=after_control_row
+        )
+
+    def rebuild_caches(self, **caches: Any) -> None:
+        self._inner.rebuild_caches(**caches)
+
+    def writer(self) -> Any:
+        return self._inner.writer()
+
+    def head(self) -> tuple[int, str]:
+        return self._inner.head()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def test_governors_share_a_ledger_through_a_store_with_only_04s_interface(pg_dsn: str) -> None:
+    one = BudgetManager(store=_SharedStoreOf04(pg_dsn), policy=NEVER)  # type: ignore[arg-type]
+    two = BudgetManager(store=_SharedStoreOf04(pg_dsn), policy=NEVER)  # type: ignore[arg-type]
+    try:
+        one.open_root("org", money("1"))
+        two.spend("org", money("0.1"))  # catching up with one's funding first
+        one.spend("org", money("0.2"))  # and one with two's spend
+        one.anchor("org", "nothing new since its own write")
+        assert one.available("org") == two.available("org", fresh=True) == money("0.7")
+        one.verify_integrity()
+        two.verify_integrity()
+    finally:
+        one.close()
+        two.close()
+
+
+def test_a_ledger_rewritten_at_the_same_length_is_rewritten_not_current(pg_dsn: str) -> None:
+    writer = BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False)
+    follower = BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False)
+    try:
+        writer.open_root("org", money("1"))
+        writer.anchor("org", "2")
+        follower.refresh()
+        _admin(
+            pg_dsn,
+            "ALTER TABLE agentgov.entries DISABLE TRIGGER USER",
+            "UPDATE agentgov.entries SET entry_hash = repeat('e', 64) WHERE sequence = 2",
+            _ENTRIES_REARM,
+        )
+        with pytest.raises(LedgerIntegrityError, match="rewritten"):
+            follower.anchor("org", "3")
+    finally:
+        writer.close()
+        follower.close()

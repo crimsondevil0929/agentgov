@@ -477,3 +477,35 @@ def test_only_a_postgres_governor_holds_claims(
         assert store is not None
         with pytest.raises(StorageError, match="holds no settlement claims"):
             store.commit(WriteBatch(redeemed=[uuid.uuid4()]))
+
+
+def test_a_redemption_that_overdraws_halts_the_scope_for_good(
+    pg_dsn: str, gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    """A claim is a committed fact, booked whatever it costs; one that takes
+    the scope below zero trips its breaker, in the redemption's own writes."""
+    hold = gov.authorize("agent", "0.40")
+    with gov.joined(caller) as txn:
+        claim = txn.claim("agent", "2.50", memo="over the scope", hold=hold)
+        caller.execute("COMMIT")
+    gov.redeem(claim)
+    assert gov.is_halted("agent")
+    with BudgetManager.open_postgres(pg_dsn) as reopened:  # its control row was written too
+        assert reopened.is_halted("agent")
+        reopened.verify_integrity()
+
+
+def test_a_redemption_follows_what_its_unit_of_work_wrote_before_it(
+    pg_dsn: str, gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    hold = gov.authorize("agent", "0.40")
+    with gov.joined(caller) as txn:
+        claim = txn.claim("agent", "0.25", memo="settles", hold=hold)
+        caller.execute("COMMIT")
+    with gov.transaction() as unit:
+        unit.anchor("agent", "before the redemption")
+        (spend,) = gov.redeem(claim)
+    memos = [e.memo for e in gov.audit_trail("agent")]
+    assert memos[-3] == "before the redemption" and memos[-1] == spend.memo == "settles"
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
+        reader.verify_integrity()
