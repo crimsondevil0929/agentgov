@@ -38,6 +38,7 @@ from typing import Any
 
 import pytest
 
+from agentgov.audit import Auditor
 from agentgov.cli import main as cli_main
 from agentgov.cognitive import CognitiveBreaker, CognitivePolicy
 from agentgov.core import (
@@ -942,6 +943,157 @@ def test_current_format_crash_state_is_refused_too(tmp_path: Path) -> None:
 
     with pytest.raises(LedgerIntegrityError, match="return the same funds twice"):
         BudgetManager.open_sqlite(path)
+
+
+def _current_database_with_a_hold(path: str) -> Authorization:
+    with BudgetManager.open_sqlite(path) as gov:
+        gov.open_root("root", money("1.00"))
+        return gov.authorize("root", money("0.50"))
+
+
+def test_two_rows_naming_one_hold_are_refused_and_a_repair_keeps_one(tmp_path: Path) -> None:
+    path = str(tmp_path / "g.db")
+    auth = _current_database_with_a_hold(path)
+    _run_sql(
+        path,
+        "INSERT INTO open_authorizations "
+        "SELECT ?, scope_id, amount, opened_at, entry_id FROM open_authorizations",
+        (str(uuid.uuid4()),),
+    )
+
+    with pytest.raises(
+        LedgerIntegrityError, match=f"two open authorizations name hold {auth.entry.entry_id}"
+    ):
+        BudgetManager.open_sqlite(path)
+    with BudgetManager.open_sqlite(path, repair=True) as repaired:
+        (served,) = repaired._open_auths.values()
+        assert served.entry == auth.entry
+    with BudgetManager.open_sqlite(path) as reopened:
+        assert list(reopened._open_auths.values()) == [served], "the rows were rebuilt"
+
+
+@pytest.mark.parametrize(
+    ("misstated", "records"),
+    [
+        ("UPDATE open_authorizations SET amount = '0.40000000'", "0.40000000 in 'root'"),
+        ("UPDATE open_authorizations SET scope_id = 'elsewhere'", "0.50000000 in 'elsewhere'"),
+    ],
+    ids=["amount", "scope"],
+)
+def test_a_row_that_misstates_its_hold_is_refused_and_repaired_in_one_pass(
+    tmp_path: Path, misstated: str, records: str
+) -> None:
+    """The row is dropped and its hold, still open, is served a fresh
+    authorization: never left with none, as a lost row's hold is not."""
+    path = str(tmp_path / "g.db")
+    auth = _current_database_with_a_hold(path)
+    _run_sql(path, misstated)
+
+    with pytest.raises(LedgerIntegrityError, match=f"records {records}, but its hold encumbered"):
+        BudgetManager.open_sqlite(path)
+    with BudgetManager.open_sqlite(path, repair=True) as repaired:
+        (served,) = repaired._open_auths.values()
+        assert (served.scope_id, served.amount, served.entry) == ("root", money("0.50"), auth.entry)
+        assert len(repaired.repairs) == 1, "one row misstated, reported once"
+    with BudgetManager.open_sqlite(path) as reopened:
+        reopened.verify_integrity()
+        assert list(reopened._open_auths.values()) == [served]
+
+
+def _legacy_twins(path: str, *, holds: int, named: Sequence[int]) -> list[uuid.UUID]:
+    """A v0.1.1 file: ``holds`` holds of 0.20 placed in 'root' and one of them
+    captured by a release that names none, as v0.1.1 wrote it, so the chain
+    cannot say which. The open-authorization rows left name ``named``."""
+    v1 = _V1Writer(path)
+    v1.post((EntryType.FUNDING, Direction.CREDIT, "root", "1.00", None))
+    v1.node("root", None, 0, "1.00")
+    placed = [
+        v1.post((EntryType.HOLD, Direction.DEBIT, "root", "0.20", None))[0] for _ in range(holds)
+    ]
+    v1.post(
+        (EntryType.HOLD_VOID, Direction.CREDIT, "root", "0.20", None),
+        (EntryType.SPEND, Direction.DEBIT, "root", "0.05", None),
+    )
+    for index in named:
+        v1.authorization("root", "0.20", placed[index])
+    v1.close()
+    return placed
+
+
+def test_a_legacy_row_is_served_on_a_hold_the_chain_holds_open(tmp_path: Path) -> None:
+    """v0.1.1 captured the second of two identical holds with a release that
+    named neither: a replay takes the first as the one released, and the row
+    left names it. The row is served on the hold the chain holds open, never
+    the chain's state moved to match the row: what settles it replays, and a
+    checkpoint taken meanwhile is the state the chain implies."""
+    path = str(tmp_path / "v1.db")
+    first, second = _legacy_twins(path, holds=2, named=[0])
+
+    with BudgetManager.open_sqlite(path, read_only=True) as view:
+        (auth,) = view._open_auths.values()
+        assert auth.entry.entry_id == second
+        assert [hold.entry_id for hold in view.ledger.open_holds()] == [second]
+        view.verify_integrity()
+        moved = next(e for e in view.audit_trail() if e.entry_id == first)
+        view.ledger._state.holds = {first: moved}  # what 0.4 served
+        view.ledger._open_auths = {auth.authorization_id: replace(auth, entry=moved)}
+        with pytest.raises(LedgerIntegrityError, match="open holds disagree with the chain"):
+            view.verify_integrity()
+
+    with BudgetManager.open_sqlite(path) as gov:
+        gov.checkpoint()
+        (auth,) = gov._open_auths.values()
+        assert gov.capture(auth, money("0.05")).ref == second
+        assert gov.available("root") == money("0.90")
+    with BudgetManager.open_sqlite(path) as reopened:
+        reopened.verify_integrity()
+        assert reopened.available("root") == money("0.90")
+        assert reopened.store is not None
+        assert Auditor(reopened.store, record=False).run(from_genesis=True).ok
+
+
+def test_a_legacy_key_short_of_rows_is_repaired_one_authorization_per_open_hold(
+    tmp_path: Path,
+) -> None:
+    path = str(tmp_path / "v1.db")
+    _, second, third = _legacy_twins(path, holds=3, named=[1])
+
+    with pytest.raises(
+        LedgerIntegrityError,
+        match=r"2 hold\(s\) of 0\.20000000 are open in 'root' but 1 authorization\(s\) name one",
+    ):
+        BudgetManager.open_sqlite(path)
+    with BudgetManager.open_sqlite(path, repair=True) as gov:
+        served = {auth.entry.entry_id: auth for auth in gov._open_auths.values()}
+        assert sorted(served) == sorted([second, third])
+        assert served[second].authorization_id != second, "the row, as it was"
+        assert served[third].authorization_id == third, "the lost row's hold, repaired"
+        for auth in served.values():
+            gov.void(auth)
+        assert gov.available("root") == money("0.95")
+        gov.verify_integrity()
+    with BudgetManager.open_sqlite(path) as reopened:
+        reopened.verify_integrity()
+        assert reopened._open_auths == {}
+
+
+def test_a_legacy_hold_released_by_name_is_never_served_again(tmp_path: Path) -> None:
+    """Where pre-0.1.2 releases leave open which hold of a key is open, one
+    released by name is still known released: a row put back for it is the
+    crash state of R1, refused for what it is."""
+    path = str(tmp_path / "v1.db")
+    _legacy_twins(path, holds=2, named=[1])
+    with BudgetManager.open_sqlite(path) as gov:
+        (auth,) = gov._open_auths.values()
+        gov.capture(auth, money("0.05"))
+    _run_sql(
+        path,
+        "INSERT INTO open_authorizations VALUES (?, 'root', '0.20000000', ?, ?)",
+        (str(auth.authorization_id), "2026-09-01T00:00:00.000000Z", str(auth.entry.entry_id)),
+    )
+    for read_only in (False, True):
+        with pytest.raises(LedgerIntegrityError, match="return the same funds twice"):
+            BudgetManager.open_sqlite(path, read_only=read_only)
 
 
 def test_the_ledger_refuses_a_stale_authorization_even_if_memory_holds_one() -> None:

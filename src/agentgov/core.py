@@ -74,7 +74,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections import Counter, deque
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -870,8 +870,9 @@ class _ChainState:
         placed them, in the order they were placed.
     :ivar ambiguous: ``(scope, amount)`` keys a pre-0.1.2 release has
         touched. Those releases did not name their hold, so within such a key
-        the chain determines *how many* holds are open but not *which*; the
-        open authorizations table supplies the identities.
+        the chain determines *how many* holds are open but not *which*: a
+        release closed the first one open, and an authorization row naming
+        another hold of the key is served on one of those still open.
     :ivar saw_v1: The chain contains pre-0.1.2 (``AGOV1``) entries.
     :ivar saw_v2: The chain contains entries written from v0.1.2 on.
     :ivar seal: The migration seal, once written.
@@ -980,19 +981,6 @@ class _ChainState:
 
 def _hold_key(entry: LedgerEntry) -> _HoldKey:
     return (entry.scope_id, entry.amount)
-
-
-def _reassign_holds(state: _ChainState, key: _HoldKey, holds: Sequence[LedgerEntry]) -> None:
-    """Name which holds of an ambiguous pre-0.1.2 key are the open ones.
-
-    Pre-0.1.2 releases did not say which hold they released, so for such a key
-    the chain fixes only how many holds remain open. The caller has checked
-    that ``holds`` is that many HOLD entries of the key.
-    """
-    for hold_id in [h for h, e in state.holds.items() if _hold_key(e) == key]:
-        del state.holds[hold_id]
-    for hold in holds:
-        state.holds[hold.entry_id] = hold
 
 
 class _Overlay:
@@ -3113,11 +3101,6 @@ class Ledger:
         for hold in view.opened:
             self._open_auths[hold.entry_id] = _authorization_for(hold)
 
-    def _reassign_holds(self, key: _HoldKey, holds: Sequence[LedgerEntry]) -> None:
-        """Name which holds of an ambiguous pre-0.1.2 key are the open ones."""
-        with self._lock:
-            _reassign_holds(self._state, key, holds)
-
     def _publish(self, entries: list[LedgerEntry] | None, state: _ChainState) -> None:
         """Serve ``entries`` and the ``state`` they imply, both already verified.
 
@@ -3284,19 +3267,13 @@ def _legacy_events(image: StoreImage) -> tuple[ControlEvent, ...]:
 
 
 def _compare_holds(replayed: _ChainState, live: _ChainState) -> None:
-    """Live open holds must be the ones the chain implies.
+    """Live open holds must be exactly the ones the chain implies.
 
-    Exact by hold identity, except for keys a pre-0.1.2 release touched, where
-    the chain fixes only the count.
+    Exact by hold identity, for keys a pre-0.1.2 release touched too: an open
+    serves authorization rows on the holds a replay leaves open, and never
+    moves the state to match the rows.
     """
-    ambiguous = replayed.ambiguous | live.ambiguous
-    if Counter(map(_hold_key, replayed.holds.values())) != Counter(
-        map(_hold_key, live.holds.values())
-    ):
-        raise LedgerIntegrityError("open holds disagree with the chain")
-    exact_replayed = {h for h, e in replayed.holds.items() if _hold_key(e) not in ambiguous}
-    exact_live = {h for h, e in live.holds.items() if _hold_key(e) not in ambiguous}
-    if exact_replayed != exact_live:
+    if replayed.holds.keys() != live.holds.keys():
         raise LedgerIntegrityError("open holds disagree with the chain")
 
 
@@ -4251,7 +4228,7 @@ class BudgetManager:
 
         self._schema_version = restored.schema_version
         self._control_high_water = restored.control_high_water
-        self._adopt_authorizations(restored.authorizations, restored.identities)
+        self._adopt_authorizations(restored.authorizations)
         if not store.read_only and self._state.saw_v1 and not self._state.saw_v2:
             self._seal()
 
@@ -4267,26 +4244,19 @@ class BudgetManager:
         problems = _node_row_problems(state, image.nodes)
         chained = [_event_for(e) for e in image.entries if e.entry_type in _CONTROL_TYPES]
         problems += _control_row_problems(chained, image.control_events)
-        auths, auth_problems, identities = self._reconcile_authorizations(
+        auths, auth_problems = self._reconcile_authorizations(
             image.authorizations, self._hold_index(), repairing=repair
         )
         problems += auth_problems
         return _Restored(
             authorizations=auths,
-            identities=identities,
             problems=problems,
             schema_version=image.schema_version,
             control_high_water=image.control_high_water,
         )
 
-    def _adopt_authorizations(
-        self,
-        authorizations: dict[uuid.UUID, Authorization],
-        identities: dict[_HoldKey, list[LedgerEntry]],
-    ) -> None:
+    def _adopt_authorizations(self, authorizations: dict[uuid.UUID, Authorization]) -> None:
         """Serve these open authorizations. Lock held, or not yet shared."""
-        for key, chosen in identities.items():
-            _reassign_holds(self._state, key, chosen)
         self._ledger._open_auths = authorizations
         self._ledger._legacy_auth_ids = {
             auth.entry.entry_id: auth_id
@@ -4329,7 +4299,7 @@ class BudgetManager:
         *,
         repairing: bool,
         state: _ChainState | _Overlay | None = None,
-    ) -> tuple[dict[uuid.UUID, Authorization], list[str], dict[_HoldKey, list[LedgerEntry]]]:
+    ) -> tuple[dict[uuid.UUID, Authorization], list[str]]:
         """Match stored authorization rows against the chain's open holds.
 
         Every open hold must be named by exactly one row and every row must
@@ -4338,11 +4308,17 @@ class BudgetManager:
         could leave behind, and releasing it again would hand the same funds
         back twice; it is reported, never served.
 
+        Pre-0.1.2 releases did not name their hold, so for a key one touched
+        the chain fixes how many holds are open, not which: there each row is
+        served on an open hold of its key, the one it names if that one is
+        open. Holds of a key are interchangeable (one scope, one amount), and
+        what is served stays exactly what a replay of the chain derives, so
+        whatever releases it the chain accepts.
+
         :param state: The chain to match against: this ledger's own when
             omitted, or a view of it with new entries staged.
         :returns: The authorizations to serve (repaired when ``repairing``),
-            the disagreements found, and the open-hold identities to adopt for
-            ambiguous pre-0.1.2 keys.
+            and the disagreements found.
         """
         view: _ChainState | _Overlay = self._state if state is None else state
         problems: list[str] = []
@@ -4396,21 +4372,33 @@ class BudgetManager:
                 result[row.authorization_id] = authorization
 
         open_holds = list(view.iter_holds())
+        served = {authorization.entry.entry_id for authorization in result.values()}
         for hold_id, hold in open_holds:
-            if view.is_ambiguous(_hold_key(hold)) or hold_id in named:
+            if view.is_ambiguous(_hold_key(hold)) or hold_id in served:
                 continue
-            problems.append(
-                f"hold {hold_id} of {hold.amount} in {hold.scope_id!r} is open in the chain "
-                f"but no authorization names it; its funds would stay encumbered with "
-                f"nothing able to release them"
-            )
+            if hold_id not in named:  # else the row naming it was reported
+                problems.append(
+                    f"hold {hold_id} of {hold.amount} in {hold.scope_id!r} is open in the "
+                    f"chain but no authorization names it; its funds would stay encumbered "
+                    f"with nothing able to release them"
+                )
             if repairing:
                 result[hold_id] = _authorization_for(hold)
 
-        identities: dict[_HoldKey, list[LedgerEntry]] = {}
         for key in sorted(view.ambiguous_keys(), key=repr):
-            in_key = [e for _, e in open_holds if _hold_key(e) == key]
-            candidates = ambiguous_rows.get(key, [])
+            # In an order every governor agrees on: rows naming an open hold
+            # first, so a repair keeps those, then by the hold each names.
+            in_key = sorted(
+                (e for _, e in open_holds if _hold_key(e) == key), key=lambda e: e.sequence
+            )
+            candidates = sorted(
+                ambiguous_rows.get(key, []),
+                key=lambda a: (
+                    view.open_hold(a.entry.entry_id) is None,
+                    a.entry.sequence,
+                    str(a.authorization_id),
+                ),
+            )
             if len(candidates) != len(in_key):
                 scope_id, amount = key
                 problems.append(
@@ -4418,18 +4406,21 @@ class BudgetManager:
                     f"{len(candidates)} authorization(s) name one"
                 )
             kept = candidates[: len(in_key)]
-            chosen = [authorization.entry for authorization in kept]
-            chosen_ids = {hold.entry_id for hold in chosen}
+            claimed = {authorization.entry.entry_id for authorization in kept}
+            free = deque(hold for hold in in_key if hold.entry_id not in claimed)
             for authorization in kept:
+                if view.open_hold(authorization.entry.entry_id) is None:
+                    authorization = Authorization(
+                        authorization_id=authorization.authorization_id,
+                        scope_id=authorization.scope_id,
+                        amount=authorization.amount,
+                        opened_at=authorization.opened_at,
+                        entry=free.popleft(),
+                    )
                 result[authorization.authorization_id] = authorization
-            for hold in in_key:
-                if len(chosen) == len(in_key):
-                    break
-                if hold.entry_id not in chosen_ids:
-                    chosen.append(hold)
-                    result[hold.entry_id] = _authorization_for(hold)
-            identities[key] = chosen
-        return result, problems, identities
+            for hold in free:  # more holds open than rows name: repaired
+                result[hold.entry_id] = _authorization_for(hold)
+        return result, problems
 
     # -- refresh ----------------------------------------------------------
 
@@ -5255,7 +5246,7 @@ class BudgetManager:
         for event in delta.legacy_control_events:
             view.apply_legacy_event(event)
         if legacy_live:
-            auths, problems, identities = self._reconcile_authorizations(
+            auths, problems = self._reconcile_authorizations(
                 delta.authorizations,
                 self._hold_index(extra=delta.entries),
                 repairing=False,
@@ -5269,7 +5260,7 @@ class BudgetManager:
         if ledger._entries is not None:
             ledger._entries.extend(delta.entries)
         if legacy_live:
-            self._adopt_authorizations(auths, identities)
+            self._adopt_authorizations(auths)
         else:
             ledger._follow_holds(view)
         self._control_high_water = delta.control_high_water
@@ -6822,7 +6813,6 @@ class _Restored:
     """What a store's image implies, checked against a verified chain."""
 
     authorizations: dict[uuid.UUID, Authorization]
-    identities: dict[_HoldKey, list[LedgerEntry]]
     problems: list[str]
     schema_version: str
     control_high_water: int
