@@ -27,6 +27,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -1379,6 +1380,46 @@ def test_async_streams_are_observed_by_their_request() -> None:
 
     asyncio.run(run())
     assert not gov.is_halted("agent")
+
+
+def test_awaited_calls_show_the_breaker_their_requests_and_results() -> None:
+    """ainvoke() as invoke(): the breaker sees each request before its hold
+    and each result after, so near-identical requests are told apart by what
+    they return; and a call's latency is how long it took."""
+    from agentgov.dummy import DummyResponse
+
+    pages = [f"Fetch page {n} of the audit log for tenant acme" for n in range(1, 7)]
+
+    def replying(answer: Callable[[str], str]) -> Callable[[str], Any]:
+        async def reply(prompt: str) -> DummyResponse:
+            return DummyResponse(
+                text=answer(prompt),
+                usage=TokenUsage(input_tokens=20, output_tokens=10),
+                model="claude-sonnet-5",
+            )
+
+        return reply
+
+    async def run(metered: Interceptor, answer: Callable[[str], str]) -> list[float]:
+        latencies = []
+        for prompt in pages:
+            started = time.perf_counter()
+            call = await metered.ainvoke(replying(answer), prompt)
+            assert 0 <= call.latency_seconds <= time.perf_counter() - started
+            latencies.append(call.latency_seconds)
+        return latencies
+
+    def rows(prompt: str) -> str:
+        return f"{prompt}: {' '.join(f'row-{uuid.uuid4().hex}' for _ in range(8))}"
+
+    gov, metered = _streaming()
+    assert len(asyncio.run(run(metered, rows))) == 6
+    assert not gov.is_halted("agent"), "different answers are progress"
+
+    gov, metered = _streaming()
+    with pytest.raises(AgentThrashingError):
+        asyncio.run(run(metered, lambda p: "The audit log is unavailable."))
+    assert gov.is_halted("agent")
 
 
 def test_an_opaque_stream_adds_no_evidence_but_respects_a_halt() -> None:

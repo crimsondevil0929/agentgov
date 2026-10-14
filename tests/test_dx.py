@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -150,6 +151,17 @@ def test_the_call_s_own_max_tokens_is_used_for_the_output_bound(gov: BudgetManag
     small = metered.size_hold((), {"messages": [{"content": "hi"}], "max_tokens": 64})
     large = metered.size_hold((), {"messages": [{"content": "hi"}], "max_tokens": 8192})
     assert small < large, "the caller's own max_tokens should size the output estimate"
+
+
+def test_a_max_tokens_that_bounds_nothing_leaves_the_configured_bound(gov: BudgetManager) -> None:
+    """Zero, or a bool, bounds nothing, so the configured bound stands; one
+    token is a bound like any other."""
+    metered = Interceptor(gov, "root", model="claude-opus-5", max_output_tokens=8192)
+    long = {"messages": [{"content": "word " * 20_000}]}
+    configured = metered.size_hold((), long)
+    assert metered.size_hold((), {**long, "max_tokens": 0}) == configured
+    assert metered.size_hold((), {**long, "max_tokens": True}) == configured
+    assert metered.size_hold((), {**long, "max_tokens": 1}) < configured
 
 
 def test_sizing_falls_back_to_the_static_ceiling(gov: BudgetManager) -> None:
@@ -644,6 +656,76 @@ def test_an_async_stream_must_be_entered_and_can_be_closed(gov: BudgetManager) -
         await stream.aclose()  # a no-op before entry; must not raise
 
     asyncio.run(run())
+
+
+def test_an_async_stream_that_fails_to_open_releases_its_hold(gov: BudgetManager) -> None:
+    """Whether the provider's call fails, or the stream it returns cannot be
+    entered, the hold is released and the failure is the caller's."""
+
+    class Unopenable:
+        async def __aenter__(self) -> AsyncIterator[Event]:
+            raise ConnectionError("the stream did not open")
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    async def refusing(**_ignored: object) -> object:
+        raise ConnectionError("the provider refused the stream")
+
+    async def unopenable(**_ignored: object) -> Unopenable:
+        return Unopenable()
+
+    async def run(opener: Any) -> None:
+        metered = Interceptor(gov, "root", model="claude-opus-5")
+        with pytest.raises(ConnectionError):
+            async with metered.astream(opener):
+                pytest.fail("the block must not run")  # pragma: no cover
+
+    available = gov.available("root")
+    for opener in (refusing, unopenable):
+        asyncio.run(run(opener))
+        assert gov._open_auths == {} and gov.available("root") == available
+    gov.verify_integrity()
+
+
+def test_an_async_stream_settles_by_hand_and_through_a_context_with_no_exit(
+    gov: BudgetManager,
+) -> None:
+    """aclose() settles the hold, as leaving the block does; a provider's
+    context that has no __aexit__ is entered, read and left all the same."""
+
+    async def chunks() -> AsyncIterator[Event]:
+        yield Event(TokenUsage(input_tokens=700))
+        yield Event(TokenUsage(input_tokens=700, output_tokens=250))
+
+    class EnterOnly:
+        async def __aenter__(self) -> AsyncIterator[Event]:
+            return chunks()
+
+    async def enter_only(**_ignored: object) -> EnterOnly:
+        return EnterOnly()
+
+    async def by_hand() -> tuple[bool, Decimal | None]:
+        stream = Interceptor(gov, "root", model="claude-opus-5").astream(chunks)
+        await stream.__aenter__()
+        async for _ in stream:
+            pass
+        await stream.aclose()
+        return stream.resolved, stream.cost
+
+    async def without_exit() -> Decimal | None:
+        stream = Interceptor(gov, "root", model="claude-opus-5").astream(enter_only)
+        async with stream:
+            async for _ in stream:
+                pass
+        return stream.cost
+
+    expected = pricing_for("claude-opus-5").cost_of(TokenUsage(input_tokens=700, output_tokens=250))
+    assert asyncio.run(by_hand()) == (True, expected)
+    assert gov._open_auths == {}
+    assert asyncio.run(without_exit()) == expected
+    assert gov._open_auths == {}
+    gov.verify_integrity()
 
 
 def test_usage_can_be_recorded_manually(gov: BudgetManager) -> None:

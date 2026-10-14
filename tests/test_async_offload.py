@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import logging
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -195,3 +197,38 @@ def test_an_undo_that_fails_is_logged_and_the_cancellation_still_raised(
 
     asyncio.run(run())
     assert "undoing a governor call whose caller was cancelled failed" in caplog.text
+
+
+def test_a_cancelled_call_is_undone_only_if_it_succeeded_and_only_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The caller that was cancelled sees its cancellation, whatever became of
+    the call: a call that succeeded is undone, quietly; one that failed, or
+    has no undo, has nothing to undo."""
+    gate = threading.Event()
+    undone: list[int] = []
+
+    def work() -> int:
+        gate.wait(5)
+        return 7
+
+    def failing() -> int:
+        gate.wait(5)
+        raise ValueError("the call failed")
+
+    async def cancelled(call: Any, undo: Any) -> None:
+        running = off_loop(call) if undo is None else off_loop_or_undo(call, undo)
+        task = asyncio.ensure_future(running)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        gate.clear()
+
+    with caplog.at_level(logging.ERROR, logger="agentgov"):
+        asyncio.run(cancelled(work, undone.append))
+        asyncio.run(cancelled(failing, undone.append))
+        asyncio.run(cancelled(work, None))
+    assert undone == [7]
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
