@@ -91,6 +91,8 @@ __all__ = ["CheckpointPolicy", "ReceiptLog"]
 
 logger = logging.getLogger("agentgov.receipts")
 
+_INDEX_BATCH = 4096  # receipts a reopen indexes in one transaction
+
 D = TypeVar("D", ActionReceipt, DeliveryReceipt)
 
 
@@ -997,7 +999,7 @@ class ReceiptLog:
             ids[receipt.receipt_id] = index
             found.append((offset, line, receipt))
             index += 1
-            if len(found) >= 4096:
+            if len(found) >= _INDEX_BATCH:
                 leaves.adopt(found, last=False)
                 found, staged, ids = [], {}, {}
         leaves.adopt(found, last=True)

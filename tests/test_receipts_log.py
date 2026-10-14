@@ -46,6 +46,7 @@ from agentgov.receipts import (
     verify_consistency,
     verify_inclusion,
 )
+from agentgov.receipts._leaves import complete_length
 from agentgov.receipts.schema import Signature
 
 VECTORS = Path(__file__).resolve().parent.parent / "vectors" / "arc1"
@@ -371,6 +372,27 @@ def test_a_torn_final_line_is_cut_off(tmp_path: Path, caplog: pytest.LogCaptureF
         assert len(reopened) == 4
 
 
+@pytest.mark.parametrize(
+    ("data", "length"),
+    [
+        (b"", 0),
+        (b"\n", 1),
+        (b"torn", 0),
+        (b"one\ntorn", 4),
+        (b"\n" + b"x" * 65536, 1),  # the newline is in the second read back from the end
+    ],
+)
+def test_the_complete_part_of_a_file_ends_at_its_last_newline(
+    tmp_path: Path, data: bytes, length: int
+) -> None:
+    path = tmp_path / "receipts.jsonl"
+    path.write_bytes(data)
+    assert complete_length(path, repair=False) == length
+    assert path.read_bytes() == data, "without repair the file is left as it is"
+    assert complete_length(path, repair=True) == length
+    assert path.read_bytes() == data[:length]
+
+
 def test_a_failed_write_leaves_no_torn_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -434,6 +456,19 @@ def test_an_edited_receipt_after_the_last_checkpoint_is_caught_by_its_signature(
     path.write_bytes(b"\n".join(lines) + b"\n")
     with pytest.raises(ReceiptLogError, match=r"line 4: .*the log was edited"):
         _reopen(path)
+
+
+def test_a_receipt_signed_elsewhere_is_left_to_its_own_key_at_reopen(tmp_path: Path) -> None:
+    """Reopening re-verifies the receipts the log signed since its newest
+    checkpoint. One another party signed and the log appended is not the
+    log's to check: its key is not the log's, and the reopen goes on."""
+    path = tmp_path / "receipts.jsonl"
+    elsewhere = draft(1).with_log_anchor(LOG_ID, 1).sign(ATTACKER)
+    with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=NEVER) as receipt_log:
+        receipt_log.issue(draft(0))
+        receipt_log.append(elsewhere)
+    with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=NEVER) as reopened:
+        assert reopened.receipts()[1] == elsewhere
 
 
 def test_swapped_lines_do_not_reopen(tmp_path: Path) -> None:

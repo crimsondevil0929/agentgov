@@ -250,6 +250,38 @@ def test_a_rotated_log_reopens_under_its_schedule_and_only_with_its_key(tmp_path
         ReceiptLog(LOG_ID, B, path=path, policy=INLINE)  # trusts B alone: cannot follow A to B
 
 
+def test_a_log_reopens_with_nothing_issued_since_its_rotation(tmp_path: Path) -> None:
+    """A transition at exactly the log's size hands over the leaves still to
+    come: the log reopens, and the incoming key signs the next one."""
+    path = tmp_path / "r.jsonl"
+    _rotated(path, after=0)[0].close()
+    with ReceiptLog(LOG_ID, B, path=path, keyring=[A.public_key()], policy=INLINE) as log:
+        assert len(log) == 3 and log.transitions()[-1].tree_size == 3
+        assert log.issue(draft(3)).signature.key_id == B.key_id  # type: ignore[union-attr]
+
+
+def test_a_log_handed_on_twice_learns_the_key_between_from_its_transitions(
+    tmp_path: Path,
+) -> None:
+    """Reopened trusting the first key and holding the key in force, the log
+    learns the key in between from the transitions, and checks that era
+    under it."""
+    path = tmp_path / "r.jsonl"
+    log, _ = _rotated(path, after=1)
+    log.rotate(C)
+    log.issue(draft(4))
+    log.close()
+    with ReceiptLog(LOG_ID, C, path=path, keyring=[A.public_key()], policy=INLINE) as log:
+        assert [k for k in (A.key_id, B.key_id, C.key_id) if k in log.keyring] == [
+            A.key_id,
+            B.key_id,
+            C.key_id,
+        ]
+        bundle = log.bundle(3)  # B's era
+    assert bundle.receipt.signature is not None and bundle.receipt.signature.key_id == B.key_id
+    assert verify_bundle(bundle, issuer_key=log.keyring).passed
+
+
 def test_a_reopened_log_holds_each_signature_to_its_era(tmp_path: Path) -> None:
     path = tmp_path / "r.jsonl"
     _rotated(path)[0].close()
@@ -414,6 +446,53 @@ def test_rotate_waits_for_issues_in_flight_and_refuses_the_same_key(tmp_path: Pa
     with pytest.raises(ValueError, match="already signed by key"):
         log.rotate(B)
     assert log.checkpoint().tree_size == 2
+    log.close()
+
+
+def test_rotate_waits_out_an_issue_whose_signature_fails(tmp_path: Path) -> None:
+    """The issue in flight gives its position back, which ends the wait."""
+    gate, entered = threading.Event(), threading.Event()
+
+    class Refusing:
+        alg, key_id = A.alg, A.key_id
+
+        def public_key(self) -> Verifier:
+            return A.public_key()
+
+        def sign(self, message: bytes) -> bytes:
+            if b"00000000-0000-0000-0000-000000000001" in message:
+                entered.set()
+                assert gate.wait(10)
+                raise SignerUnavailableError("the key service refused")
+            return A.sign(message)
+
+        def verify(self, message: bytes, signature: bytes) -> bool:
+            return A.verify(message, signature)
+
+    log = ReceiptLog(LOG_ID, Refusing(), path=tmp_path / "r.jsonl", policy=INLINE)
+    log.issue(draft(1))
+    refused: list[BaseException] = []
+
+    def issue() -> None:
+        try:
+            log.issue(draft(0))
+        except SignerUnavailableError as exc:
+            refused.append(exc)
+
+    issuing = threading.Thread(target=issue, daemon=True)
+    issuing.start()
+    assert entered.wait(5)
+    rotated: list[KeyTransition] = []
+    rotating = threading.Thread(target=lambda: rotated.append(log.rotate(B)), daemon=True)
+    rotating.start()
+    rotating.join(0.2)
+    assert rotating.is_alive(), "rotate waits for the issue in flight"
+    gate.set()
+    issuing.join(5)
+    rotating.join(5)
+    assert refused, "the issue failed"
+    assert rotated and rotated[0].tree_size == 1, "and the rotation went on"
+    assert log.issue(draft(2)).signature.key_id == B.key_id  # type: ignore[union-attr]
     log.close()
 
 

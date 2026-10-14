@@ -163,6 +163,7 @@ def test_slow_signatures_overlap(tmp_path: Path) -> None:
         assert took < 1.2, f"64 receipts took {took:.2f}s"
         assert sorted(position(r) for r in issued) == list(range(64))
         assert log.receipts() == tuple(sorted(issued, key=position))
+        assert not (log._held or log._held_ids or log._signed), "nothing held once issued"
     for receipt in issued:
         receipt.verify(KEY.public_key())
     with ReceiptLog(LOG_ID, KEY, path=tmp_path / "r.jsonl", policy=NEVER) as reopened:
@@ -223,6 +224,63 @@ def test_a_failed_signature_gives_back_its_position_and_later_ones_sign_again() 
         assert log.issue(draft(2)).anchors.log == LogAnchor(LOG_ID, 1)
 
 
+def test_a_signature_that_fails_after_its_position_was_taken_back_gives_back_nothing_more() -> None:
+    """0 and 1 sign at once and both fail, 0 first. 0's failure took back 1's
+    position already, so 1's gives back nothing, and the next receipt takes 0."""
+    signer = GatedSigner()
+    with ReceiptLog(LOG_ID, signer, policy=NEVER) as log:
+        entered_0, release_0 = signer.hold(draft(0).receipt_id, fail=True)
+        entered_1, release_1 = signer.hold(draft(1).receipt_id, fail=True)
+        first = Run(lambda: log.issue(draft(0)))
+        assert entered_0.wait(5)
+        second = Run(lambda: log.issue(draft(1)))
+        assert entered_1.wait(5)
+        release_0.set()
+        assert isinstance(first.outcome(), SignerUnavailableError)
+        release_1.set()
+        assert isinstance(second.outcome(), SignerUnavailableError)
+        assert position(Run(lambda: log.issue(draft(2))).outcome()) == 0
+
+
+def test_a_signature_that_returns_after_its_position_was_taken_back_is_dropped() -> None:
+    """1 is still signing when 0 fails and takes back 1's position: the
+    signature for position 1 is dropped when it returns, and 1 signs again for
+    position 0. The log holds it once."""
+    signer = GatedSigner()
+    with ReceiptLog(LOG_ID, signer, policy=NEVER) as log:
+        entered_0, release_0 = signer.hold(draft(0).receipt_id, fail=True)
+        entered_1, release_1 = signer.hold(draft(1).receipt_id)
+        first = Run(lambda: log.issue(draft(0)))
+        assert entered_0.wait(5)
+        second = Run(lambda: log.issue(draft(1)))
+        assert entered_1.wait(5)
+        release_0.set()
+        assert isinstance(first.outcome(), SignerUnavailableError)
+        release_1.set()
+        moved = second.outcome()
+        assert position(moved) == 0
+        assert log.receipts() == (moved,)
+        assert signer.calls == 3, "0 once; 1 for position 1, then for position 0"
+
+
+def test_a_receipt_signed_while_its_log_closes_is_not_appended(tmp_path: Path) -> None:
+    """Closing releases the file to the next process to claim it: a signature
+    that returns after that is refused, and the file is left as it was."""
+    path = tmp_path / "r.jsonl"
+    signer = GatedSigner()
+    log = ReceiptLog(LOG_ID, signer, path=path, policy=NEVER)
+    log.issue(draft(0))
+    intact = path.read_bytes()
+    entered, release = signer.hold(draft(1).receipt_id)
+    late = Run(lambda: log.issue(draft(1)))
+    assert entered.wait(5)
+    log.close()
+    release.set()
+    refused = late.outcome()
+    assert isinstance(refused, ReceiptLogError) and "is closed" in str(refused)
+    assert path.read_bytes() == intact
+
+
 def test_appended_receipts_share_one_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import os
 
@@ -236,12 +294,13 @@ def test_appended_receipts_share_one_write(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr("agentgov.receipts._leaves.os.fsync", counting)
     signer = GatedSigner()
     with ReceiptLog(LOG_ID, signer, path=tmp_path / "r.jsonl", policy=NEVER) as log:
+        before = len(syncs)  # (opening the log synced its lock file)
         entered, release = signer.hold(draft(0).receipt_id)
         runs = [Run(lambda: log.issue(draft(0)))]
         assert entered.wait(5)
         runs += [Run(functools.partial(log.issue, draft(n))) for n in (1, 2, 3)]
         wait_until(lambda: len(log._signed) == 3)
-        before = len(syncs)  # (opening the log synced its lock file)
+        assert len(syncs) == before, "1 to 3 wait for 0, and write nothing"
         release.set()
         issued = [run.outcome() for run in runs]
         assert len(syncs) - before == 1, "four receipts, one fsync"

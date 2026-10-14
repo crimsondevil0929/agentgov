@@ -11,6 +11,7 @@ Every receipt read is checked against the leaf hash recorded for it.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import uuid
@@ -142,6 +143,62 @@ def test_a_rewritten_file_is_rebuilt_from_and_an_edit_is_caught(tmp_path: Path) 
         ReceiptLog(LOG_ID, KEY, path=path, policy=INLINE)
 
 
+def test_an_edit_in_place_is_caught_at_open_by_the_files_modification_time(
+    tmp_path: Path,
+) -> None:
+    """Every line keeps its length, so the index's offsets still fit the file
+    and its last line is intact; but the file was written since the index
+    recorded it, so the index is rebuilt from the file at open, and the edit
+    does not match the checkpoint."""
+    path = tmp_path / "r.jsonl"
+    _log(path, 5, checkpoint_at=4)
+    stat = path.stat()
+    data = path.read_bytes()
+    edited = data.replace(b'"settled_usd":"0.00549500"', b'"settled_usd":"0.00049500"', 1)
+    assert edited != data and len(edited) == len(data)
+    path.write_bytes(edited)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    with pytest.raises(
+        ReceiptLogError, match=r"does not match the receipts .*: the log was edited"
+    ):
+        ReceiptLog(LOG_ID, KEY, path=path, policy=INLINE)
+
+
+def test_an_open_that_finds_nothing_new_records_the_file_as_it_stands(tmp_path: Path) -> None:
+    """A blank line appended (an editor's save, say) is nothing to index, but
+    the file changed: the open records it as it now stands, so an edit in
+    place after that is caught at the next open, as one before it would be."""
+    path = tmp_path / "r.jsonl"
+    _log(path, 5, checkpoint_at=4)
+    path.write_bytes(path.read_bytes() + b"\n")
+    with ReceiptLog(LOG_ID, KEY, path=path, policy=INLINE) as log:
+        assert len(log) == 5
+    stat = path.stat()
+    data = path.read_bytes()
+    path.write_bytes(data.replace(b'"settled_usd":"0.00549500"', b'"settled_usd":"0.00049500"', 1))
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    with pytest.raises(
+        ReceiptLogError, match=r"does not match the receipts .*: the log was edited"
+    ):
+        ReceiptLog(LOG_ID, KEY, path=path, policy=INLINE)
+
+
+def test_a_log_is_indexed_from_its_file_in_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuilt index takes the file a batch of receipts at a time (4,096),
+    each batch one transaction; what it holds is the same."""
+    monkeypatch.setattr("agentgov.receipts.log._INDEX_BATCH", 2)
+    path = tmp_path / "r.jsonl"
+    issued = _log(path, 5, checkpoint_at=5)
+    with ReceiptLog(LOG_ID, KEY, path=path, policy=INLINE, verify="full") as log:
+        assert log.receipts() == tuple(issued)
+        assert log.root() == MerkleTree(r.leaf_hash() for r in issued).root().hex()
+        log.issue(draft(5))
+    with ReceiptLog(LOG_ID, KEY, path=path, policy=INLINE) as log:
+        assert len(log) == 6
+
+
 def test_a_lost_or_stale_index_is_rebuilt_from_the_file(tmp_path: Path) -> None:
     path = tmp_path / "r.jsonl"
     issued = _log(path, 300, checkpoint_at=300)
@@ -186,20 +243,23 @@ def test_receipts_appended_before_the_index_caught_up_are_indexed(tmp_path: Path
 
 
 def test_an_index_that_cannot_be_written_stops_the_log_until_it_reopens(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = tmp_path / "r.jsonl"
     log = ReceiptLog(LOG_ID, KEY, path=path, policy=INLINE)
-    log.issue(draft(0))
+    first = log.issue(draft(0))
 
     def full(self: object, rows: object, file_state: object = None) -> None:
         raise sqlite3.OperationalError("database or disk is full")
 
     monkeypatch.setattr(_leaves._Index, "add", full)
-    issued = log.issue(draft(1))  # durable in the file: issued
+    with caplog.at_level(logging.ERROR, logger="agentgov.receipts"):
+        issued = log.issue(draft(1))  # durable in the file: issued
     assert issued.anchors.log is not None and issued.anchors.log.leaf_index == 1
+    assert "database or disk is full" in caplog.text, "an operator hears of it"
     with pytest.raises(ReceiptLogError, match=r"could not index receipts it appended .*reopen it"):
         log.issue(draft(2))
+    assert log.receipts() == (first,), "it reads what it indexed, up to where that ends"
     monkeypatch.undo()
     log.close()
     with ReceiptLog(LOG_ID, KEY, path=path, policy=INLINE) as reopened:
