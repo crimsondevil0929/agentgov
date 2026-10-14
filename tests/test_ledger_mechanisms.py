@@ -58,6 +58,7 @@ from agentgov.exceptions import (
     MalformedReceiptError,
     ReadOnlyLedgerError,
     StorageError,
+    UnknownScopeError,
 )
 from agentgov.postgres import PostgresStore
 from agentgov.receipts import Ed25519Signer
@@ -1765,8 +1766,31 @@ def test_a_refund_of_no_spend_this_ledger_holds_is_refused(tmp_path: Path) -> No
     with _sqlite(tmp_path) as gov:
         gov.open_root("root", money("1"))
         gov.spend("root", money("0.5"))
-        with pytest.raises(ValueError, match="is not a spend this ledger holds"):
-            gov.refund("root", money("0.1"), reverses=uuid.uuid4())
+        funding = gov.audit_trail()[0]
+        for named in (uuid.uuid4(), funding, funding.entry_id):
+            with pytest.raises(ValueError, match="is not a spend this ledger holds"):
+                gov.refund("root", money("0.1"), reverses=named)
+
+
+@pytest.mark.parametrize("amount", ["0", "-0.01", "0.000000001"])
+def test_a_refund_must_return_something(tmp_path: Path, amount: str) -> None:
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("root", money("1"))
+        spend = gov.spend("root", money("0.5"))
+        with pytest.raises(ValueError, match="refund must be positive"):
+            gov.refund("root", amount, reverses=spend)
+
+
+def test_a_refund_returns_money_only_to_the_scope_that_spent_it(tmp_path: Path) -> None:
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("a", money("1"))
+        gov.open_root("b", money("1"))
+        spend = gov.spend("a", money("0.5"))
+        gov.spend("b", money("0.5"))
+        with pytest.raises(ValueError, match="was made by 'a', not 'b'"):
+            gov.refund("b", money("0.1"), reverses=spend)
+        with pytest.raises(UnknownScopeError):
+            gov.refund("nowhere", money("0.1"), reverses=spend)
 
 
 # -- a PostgreSQL store's sessions, and its 0.4 interface -------------------------------------
