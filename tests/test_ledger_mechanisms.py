@@ -2181,8 +2181,9 @@ def test_a_repair_is_made_only_where_it_can_be_written_and_is_logged(
 ) -> None:
     path = _halted_twice(tmp_path)
     _sql(path, "DELETE FROM control_events")
-    with pytest.raises(LedgerIntegrityError, match="a read-only store cannot be repaired"):
+    with pytest.raises(LedgerIntegrityError, match="a read-only store cannot be repaired") as read:
         BudgetManager.open_sqlite(str(path), read_only=True, repair=True)
+    assert "'one'" in str(read.value) and "(and 1 more)" in str(read.value), "the first named"
     with caplog.at_level(logging.WARNING, logger="agentgov.audit"):
         with _sqlite(tmp_path, repair=True) as repaired:
             assert repaired.is_halted("one") and repaired.is_halted("two")
