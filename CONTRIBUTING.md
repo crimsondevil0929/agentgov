@@ -47,6 +47,49 @@ uv run pytest tests/test_cognitive_breaker.py -v
 uv run pytest tests/test_cognitive_breaker.py::test_near_duplicate_detector -v
 ```
 
+The PostgreSQL tests run when `AGENTGOV_TEST_POSTGRES_DSN` names a server and a
+role that may create databases and roles (each test gets a database of its own),
+and are skipped otherwise; `AGENTGOV_REQUIRE_POSTGRES=1` makes a missing server a
+failure instead:
+
+```bash
+docker run -d --name agentgov-pg -e POSTGRES_PASSWORD=agentgov -p 5432:5432 postgres:16
+AGENTGOV_TEST_POSTGRES_DSN=postgresql://postgres:agentgov@localhost:5432/postgres \
+  AGENTGOV_REQUIRE_POSTGRES=1 uv run pytest
+```
+
+## Mutation testing
+
+`scripts/mutate.py` changes one thing at a time in the functions a spec under
+`mutation/` names (a comparison turned around, a guard removed, a state update
+dropped) and runs the spec's tests against each change. Every mutant must be
+killed by a test, or named in the spec's `equivalent` table with the reason no
+test can tell it apart from the original. A change to one of those functions
+that leaves a mutant alive needs a test, or a reason:
+
+```bash
+uv run python scripts/mutate.py mutation/phase2.json --jobs 8      # the rule engine
+uv run python scripts/mutate.py mutation/phase6-ledger.json --only BudgetManager.checkpoint
+uv run python scripts/mutate.py mutation/phase6-receipts.json --list
+```
+
+A spec's `recheck` names tests that bound time: a mutant they kill under the
+parallel load is run again alone, and counts as killed only if they kill it
+there too. The runner copies `src/` once per worker but reads `tests/` as they
+stand, so do not edit the sources while a pass runs.
+
+## The soak
+
+`scripts/soak.py` runs governor processes against one ledger under load while
+it SIGKILLs them and cuts their connections, then checks every operation a
+worker saw succeed is in the ledger exactly once, the ledger verifies, the
+auditor found nothing, and memory and connections stayed bounded:
+
+```bash
+uv run python scripts/soak.py --ledger postgresql://postgres:agentgov@localhost:5432/postgres --minutes 30
+uv run python scripts/soak.py --ledger sqlite:///tmp/soak.db --minutes 10
+```
+
 ## Linting and type checking
 
 All three must pass clean before a PR is merged — this is what CI enforces:
@@ -92,8 +135,10 @@ uv run agentgov verify /tmp/agentgov-demo/governor.db
    making. "Fixes a bug" is not enough context to review a change to a
    double-entry ledger.
 6. **CI must pass.** The workflow in `.github/workflows/ci.yml` runs the
-   full lint/type/test/coverage gate on Python 3.11 and 3.12, on Linux and
-   macOS, plus the demo scripts end to end.
+   full lint/type/test/coverage gate on Python 3.11 to 3.14, on Linux and
+   macOS, on free-threaded 3.14t, against PostgreSQL 14, 16, 17 and 18 and
+   behind PgBouncer, plus the demo scripts end to end; Windows is reported,
+   not yet required.
 
 ## Reporting bugs and requesting features
 
