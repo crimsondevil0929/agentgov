@@ -106,6 +106,11 @@ def _v3(
     return entries
 
 
+def _traced(record: logging.LogRecord) -> bool:
+    """Whether a log record carries the exception it reports, traceback and all."""
+    return isinstance(record.exc_info, tuple) and record.exc_info[0] is not None
+
+
 def _load(entries: list[LedgerEntry]) -> Ledger:
     ledger = Ledger()
     ledger._adopt(entries)
@@ -314,7 +319,7 @@ def test_a_failed_automatic_checkpoint_backs_off_doubling_and_says_why(
         for n in range(3):
             gov.anchor("root", f"tick {n}")
     (failed,) = [r for r in caplog.records if "automatic checkpoint failed" in r.getMessage()]
-    assert failed.exc_info is not None and "the next try is in 1 s" in failed.getMessage()
+    assert _traced(failed) and "the next try is in 1 s" in failed.getMessage()
     assert gov._checkpoint_backoff == 1.0
     gov._checkpoint_retry_at = 0.0  # a second has passed
     with caplog.at_level(logging.WARNING):
@@ -417,7 +422,7 @@ def test_a_trip_a_rolled_back_transaction_recorded_and_could_not_write_is_logged
             monkeypatch.setattr(gov, "_trip", unrecorded)
             raise RuntimeError("abandoned")
     (logged,) = [r for r in caplog.records if "could not record the breaker trip" in r.getMessage()]
-    assert "'root'" in logged.getMessage() and logged.exc_info is not None
+    assert "'root'" in logged.getMessage() and _traced(logged)
 
 
 def test_a_call_recorded_just_before_a_rolled_back_transaction_is_kept() -> None:
@@ -505,7 +510,7 @@ def test_a_governor_left_dirty_re_reads_before_it_checkpoints(
         with pytest.raises(StorageError, match="dropped before COMMIT"):
             gov.spend("org", money("1"))
     (logged,) = [r for r in caplog.records if "write that did not commit" in r.getMessage()]
-    assert logged.exc_info is not None and gov._dirty
+    assert _traced(logged) and gov._dirty
     assert gov.checkpoint() == 1
     gov.close()
     with BudgetManager.open_postgres(pg_dsn, auditor=False) as reopened:
@@ -1668,7 +1673,7 @@ def test_an_audit_that_cannot_record_its_marks_says_so(
     with caplog.at_level(logging.WARNING, logger="agentgov.audit"):
         assert Auditor(_Delegating(inner, record_audit=refused)).run().ok
     logged = [r for r in caplog.records if "could not record an audit mark" in r.getMessage()]
-    assert logged and all(r.exc_info is not None for r in logged)
+    assert logged and all(_traced(r) for r in logged)
     inner.close()
 
 
@@ -1693,7 +1698,7 @@ def test_an_auditor_thread_that_cannot_audit_says_so_and_closes_its_store(
     (closing_,) = [
         r for r in caplog.records if "closing the auditor's store failed" in r.getMessage()
     ]
-    assert stopped.exc_info is not None and closing_.exc_info is not None
+    assert _traced(stopped) and _traced(closing_)
 
 
 def test_an_audit_balances_each_transaction_up_to_a_checkpoint(tmp_path: Path) -> None:

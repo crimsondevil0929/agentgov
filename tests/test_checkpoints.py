@@ -229,6 +229,37 @@ def test_every_part_of_a_snapshot_must_have_its_type(tmp_path: Path) -> None:
     assert not wrong, "\n".join(wrong)
 
 
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("format",), "agentgov-snapshot/0", "is not agentgov-snapshot/1"),
+        (("totals", "funded"), "a lot", r"\$\.totals\.funded is not an amount: 'a lot'"),
+        (("totals", "funded"), "NaN", r"\$\.totals\.funded is not an amount: 'NaN'"),
+        (("totals", "spent"), "Infinity", r"\$\.totals\.spent is not an amount: 'Infinity'"),
+        (("last_timestamp",), "yesterday", r"\$\.last_timestamp is not a timestamp: 'yesterday'"),
+        (("holds", 0, "entry_id"), "a hold", r"\$\.holds\[0\]\.entry_id is not an id: 'a hold'"),
+    ],
+    ids=["format", "amount", "not a number", "infinite", "timestamp", "id"],
+)
+def test_every_text_part_of_a_snapshot_must_have_its_form(
+    tmp_path: Path, path: tuple[Any, ...], value: str, message: str
+) -> None:
+    from agentgov.receipts.canonical import canonical_bytes
+
+    document = _full_snapshot(tmp_path)
+    parent = document
+    for key in path[:-1]:
+        parent = parent[key]
+    parent[path[-1]] = value
+    with pytest.raises(LedgerIntegrityError, match=message):
+        _decode_snapshot(canonical_bytes(document))
+
+
+def test_a_snapshot_that_is_not_json_is_refused() -> None:
+    with pytest.raises(LedgerIntegrityError, match="is not canonical JSON"):
+        _decode_snapshot(b'{"format": ')
+
+
 # -- writing checkpoints -----------------------------------------------------------
 
 
