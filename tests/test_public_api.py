@@ -8,7 +8,10 @@ retired are still served, with a ``DeprecationWarning``, until 2.0.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import warnings
+from pathlib import Path
 
 import pytest
 
@@ -158,6 +161,31 @@ def test_ledger_post_is_gone_and_ledger_lock_warns() -> None:
         lock = gov.ledger.lock
     with lock:
         gov.open_root("root", agentgov.money("1"))
+
+
+def test_a_refund_naming_no_spend_is_deprecated_at_the_callers_line(tmp_path: Path) -> None:
+    """A DeprecationWarning shows only where the caller's code made it, so
+    the warning names the caller's line, whichever way the call comes."""
+    with agentgov.BudgetManager.open_sqlite(str(tmp_path / "g.db")) as gov:
+        gov.open_root("root", agentgov.money("1"))
+        spend = gov.spend("root", agentgov.money("0.5"))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            gov.refund("root", agentgov.money("0.1"), reverses=spend)  # names its spend
+        with pytest.warns(DeprecationWarning, match="names no spend") as direct:
+            gov.refund("root", agentgov.money("0.1"))
+        with gov.transaction() as txn:
+            with pytest.warns(DeprecationWarning, match="names no spend") as inside:
+                txn.refund("root", agentgov.money("0.1"))
+
+        async def refund_off_the_loop() -> list[warnings.WarningMessage]:
+            manager = agentgov.AsyncBudgetManager(gov)
+            with pytest.warns(DeprecationWarning, match="names no spend") as caught:
+                await manager.refund("root", agentgov.money("0.1"))
+            return list(caught)
+
+        off_loop = asyncio.run(refund_off_the_loop())
+    assert [w.filename for w in (*direct, *inside, *off_loop)] == [__file__] * 3
 
 
 def test_open_names_any_ledger_by_url(tmp_path: object) -> None:

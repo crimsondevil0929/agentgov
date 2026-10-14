@@ -69,7 +69,9 @@ import hashlib
 import itertools
 import json
 import logging
+import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -3727,6 +3729,28 @@ def _grouped(
     return grouped
 
 
+_PACKAGE = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+_REFUND_NAMING_NO_SPEND = (
+    "a refund that names no spend is deprecated: pass reverses=<the SPEND entry>, "
+    "so the refund is bounded by that spend and the chain records which it reverses"
+)
+
+
+def _deprecated(message: str) -> None:
+    """Warn of a deprecation at the caller's own line: the first frame outside
+    agentgov, whatever of its own frames (a transaction's, the async API's)
+    lie between. A warning placed on agentgov's lines is one the default
+    filters never show. Called before any work is queued, so the frames are
+    the caller's thread's, not those of whichever caller runs the queue."""
+    frame = sys._getframe(1)
+    level = 2
+    while frame.f_back is not None and frame.f_code.co_filename.startswith(_PACKAGE):
+        frame = frame.f_back
+        level += 1
+    warnings.warn(message, DeprecationWarning, stacklevel=level)
+
+
 _RECENT_HASHES: Final = 4096
 """How many of the newest entries' hashes a governor keeps, to tell a ledger
 cut back under it from one rewritten: a failover loses at most the last few
@@ -6080,7 +6104,6 @@ class BudgetManager:
             auth = self.authorize(scope_id, cost, memo=memo)
             return self._capture(auth, cost, memo, call)
 
-    @_grouped
     def refund(
         self,
         scope_id: str,
@@ -6117,17 +6140,26 @@ class BudgetManager:
             it; or if ``amount`` exceeds what the scope has spent and not
             already had refunded.
         """
+        if reverses is None:
+            _deprecated(_REFUND_NAMING_NO_SPEND)
+        return self._refund(
+            scope_id, amount, memo=memo, reverses=reverses, idempotency_key=idempotency_key
+        )
+
+    @_grouped
+    def _refund(
+        self,
+        scope_id: str,
+        amount: Decimal | int | str,
+        *,
+        memo: str,
+        reverses: LedgerEntry | uuid.UUID | None,
+        idempotency_key: str | None,
+    ) -> LedgerEntry:
+        """:meth:`refund`, in a unit of work it may share."""
         credited = _credit(amount)
         if credited <= ZERO:
             raise ValueError(f"refund must be positive, got {credited}")
-        if reverses is None:
-            warnings.warn(
-                "a refund that names no spend is deprecated: pass reverses=<the SPEND entry>, "
-                "so the refund is bounded by that spend and the chain records which it reverses",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
         named = reverses.entry_id if isinstance(reverses, LedgerEntry) else reverses
         with self._mutating():
             call = self._called(

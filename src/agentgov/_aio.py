@@ -339,8 +339,12 @@ class AsyncBudgetManager:
         idempotency_key: str | None = None,
     ) -> LedgerEntry:
         """:meth:`BudgetManager.refund`."""
+        if reverses is None:  # warned here: the refund itself runs in another thread
+            from agentgov.core import _REFUND_NAMING_NO_SPEND, _deprecated
+
+            _deprecated(_REFUND_NAMING_NO_SPEND)
         return await self._call(
-            self._manager.refund,
+            self._manager._refund,
             scope_id,
             amount,
             memo=memo,
