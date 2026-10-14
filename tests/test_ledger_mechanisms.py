@@ -2191,3 +2191,188 @@ def test_a_repair_is_made_only_where_it_can_be_written_and_is_logged(
     assert len(logged) == 2
     with _sqlite(tmp_path) as reopened:  # repaired for good
         assert reopened.is_halted("one")
+
+
+# -- following a ledger --------------------------------------------------------------------
+
+
+def _unbalanced_release_appended(tmp_path: Path) -> None:
+    """Append a release that nothing balances to the ledger at ``tmp_path``,
+    valid in hash and link: the newest transaction of the chain."""
+    with _sqlite(tmp_path, read_only=True) as gov:
+        last = gov.audit_trail()[-1]
+    unbalanced = _appended(
+        last,
+        entry_type=EntryType.RELEASE,
+        direction=Direction.DEBIT,
+        scope_id="child",
+        counterparty_id="root",
+        amount=money("0.1"),
+        balance_after=money("0.4"),
+    )
+    store = SqliteStore(tmp_path / "ledger.db")
+    store.commit(WriteBatch(entries=[unbalanced]))
+    store.close()
+
+
+def test_a_reader_balances_the_last_transaction_it_follows(tmp_path: Path) -> None:
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("root", money("1"))
+        gov.delegate("root", "child", money("0.5"))
+    with _sqlite(tmp_path, read_only=True) as reader:
+        _unbalanced_release_appended(tmp_path)
+        with pytest.raises(LedgerIntegrityError, match="does not balance"):
+            reader.refresh()
+
+
+def test_a_reader_that_stopped_following_is_still_refused_writes_as_read_only(
+    tmp_path: Path,
+) -> None:
+    """Its writes were never its to make: that is what it says, whatever else
+    went wrong."""
+    with _sqlite(tmp_path) as gov:
+        gov.open_root("root", money("1"))
+        gov.delegate("root", "child", money("0.5"))
+    with _sqlite(tmp_path, read_only=True) as reader:
+        _unbalanced_release_appended(tmp_path)
+        with pytest.raises(LedgerIntegrityError):
+            reader.refresh()
+        with pytest.raises(ReadOnlyLedgerError):
+            reader.spend("root", money("0.01"))
+        assert reader.available("child") == money("0.5"), "what it last verified"
+
+
+class _ReadOnlyStoreOf04(_StoreOf04):
+    def __init__(self, path: Path) -> None:
+        self._inner = SqliteStore(path, read_only=True)
+
+
+def test_a_reader_over_a_store_of_04_follows_its_writer(tmp_path: Path) -> None:
+    """0.4's snapshot() takes no word on authorization rows, and a store that
+    keeps no history leaves the view to keep the entries it follows."""
+    path = tmp_path / "ledger.db"
+    writer = BudgetManager(store=_StoreOf04(path), policy=NEVER)  # type: ignore[arg-type]
+    writer.open_root("root", money("1"))
+    reader = BudgetManager(store=_ReadOnlyStoreOf04(path))  # type: ignore[arg-type]
+    held = writer.authorize("root", money("0.5"))
+    writer.capture(held, money("0.2"))
+    try:
+        assert reader.refresh() == 3  # the hold, its release, the spend
+        assert reader.audit_trail() == writer.audit_trail()
+        assert reader.available("root") == money("0.8")
+        reader.verify_integrity()
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_a_reader_following_a_legacy_writer_serves_the_row_it_left(tmp_path: Path) -> None:
+    """A pre-0.1.2 release names no hold: which authorization it settled only
+    the writer's rows say. The reader serves the one whose row is left, not
+    the one its replay took as released."""
+    from tests.test_core_guarantees import _V1Writer
+
+    path = str(tmp_path / "v1.db")
+    v1 = _V1Writer(path)
+    v1.post((EntryType.FUNDING, Direction.CREDIT, "root", "1.00", None))
+    v1.node("root", None, 0, "1.00")
+    v1.close()
+    with BudgetManager.open_sqlite(path, read_only=True) as reader:
+        v1 = _V1Writer(path, fresh=False)
+        first, second = (
+            v1.post((EntryType.HOLD, Direction.DEBIT, "root", "0.30", None))[0] for _ in range(2)
+        )
+        v1.authorization("root", "0.30", first)
+        v1.authorization("root", "0.30", second)
+        assert reader.refresh() == 2
+        ids = {auth.entry.entry_id: auth_id for auth_id, auth in reader._open_auths.items()}
+        v1.post(  # the second authorization captured, as v0.1.1 wrote it
+            (EntryType.HOLD_VOID, Direction.CREDIT, "root", "0.30", None),
+            (EntryType.SPEND, Direction.DEBIT, "root", "0.10", None),
+        )
+        v1.conn.execute("DELETE FROM open_authorizations WHERE entry_id = ?", (str(second),))
+        v1.conn.commit()
+        v1.close()
+        assert reader.refresh() == 2
+        assert list(reader._open_auths) == [ids[first]]
+        assert reader.available("root") == money("0.60")
+
+
+def test_a_reader_reads_authorization_rows_only_while_a_legacy_writer_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Until a ledger is sealed a pre-0.1.2 writer may still write, naming its
+    holds in rows alone; once it is, every entry names its own, and following
+    the ledger reads no row."""
+    from tests.test_core_guarantees import _legacy_database, _V1Writer
+
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    reads: list[int] = []
+    select = SqliteStore._select_authorizations
+
+    def counted(self: SqliteStore) -> Any:
+        rows = select(self)
+        reads.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(SqliteStore, "_select_authorizations", counted)
+    with BudgetManager.open_sqlite(path, read_only=True, policy=NEVER) as reader:
+        v1 = _V1Writer(path, fresh=False)
+        v1.post((EntryType.SPEND, Direction.DEBIT, "worker", "0.01", None))
+        v1.close()
+        reads.clear()
+        assert reader.refresh() == 1
+        assert reads == [1], "unsealed: the rows say which hold is open"
+
+        with BudgetManager.open_sqlite(path, policy=NEVER, auditor=False) as writer:
+            writer.spend("worker", money("0.01"))  # sealed on this open, then a spend
+        before = len(reader.audit_trail())
+        assert reader.refresh() == len(reader.audit_trail()) - before == 4, "seal and spend"
+
+        with BudgetManager.open_sqlite(path, policy=NEVER, auditor=False) as writer:
+            writer.spend("worker", money("0.01"))
+        reads.clear()
+        assert reader.refresh() == 3
+        assert reads == [], "sealed: the entries name their holds"
+
+
+def test_a_sealed_ledger_that_gains_a_legacy_control_row_is_refused_by_its_reader(
+    tmp_path: Path,
+) -> None:
+    from tests.test_core_guarantees import _legacy_database, _V1Writer
+
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    BudgetManager.open_sqlite(path, policy=NEVER, auditor=False).close()  # sealed
+    with BudgetManager.open_sqlite(path, read_only=True) as reader:
+        v1 = _V1Writer(path, fresh=False)
+        v1.control("circuit_tripped", "worker", "a v0.1.1 writer, after the seal")
+        v1.close()
+        with pytest.raises(LedgerIntegrityError, match="gained rows outside the chain"):
+            reader.refresh()
+
+
+def test_a_legacy_writers_hold_with_no_row_is_refused_by_its_reader(tmp_path: Path) -> None:
+    from tests.test_core_guarantees import _legacy_database, _V1Writer
+
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    with BudgetManager.open_sqlite(path, read_only=True) as reader:
+        v1 = _V1Writer(path, fresh=False)
+        v1.post((EntryType.HOLD, Direction.DEBIT, "worker", "0.07", None))  # its row lost
+        v1.close()
+        with pytest.raises(LedgerIntegrityError, match="no authorization names it"):
+            reader.refresh()
+
+
+def test_a_transaction_that_crosses_a_checkpoint_is_checkpointed_at_its_end(
+    tmp_path: Path,
+) -> None:
+    with _sqlite(tmp_path, EVERY_FOUR) as gov:
+        gov.open_root("root", money("1"))
+        with gov.transaction() as txn:
+            txn.delegate("root", "child", money("0.5"))
+            txn.anchor("root", "the fourth entry")
+            assert _checkpointed(gov) == []
+        assert _checkpointed(gov) == [4]
