@@ -65,6 +65,14 @@
     "tests/test_signed_checkpoints.py"
   ],
   "env": {},
+  "recheck": [
+    "test_slow_signatures_overlap",
+    "test_readers_never_wait_on_the_signer",
+    "test_a_slow_witness_never_holds_up_an_issue",
+    "test_issue_async_signs_without_blocking_the_loop",
+    "test_a_service_that_cannot_be_used_refuses_the_signer",
+    "test_signing_off_the_loop_leaves_it_running"
+  ],
   "equivalent": {
     "src/agentgov/receipts/_leaves.py::FileLeaves._read::if-true::`if self._reader is None` -> always": "A new handle for every read reads the same bytes; the old one is dropped and closed by its reference count. A cost, not a behavior.",
     "src/agentgov/receipts/_leaves.py::FileLeaves.trustworthy::constant::False -> True::3": "Unreachable (pragma: no cover): count was read from the row locate() looks up.",
