@@ -11,14 +11,25 @@ from __future__ import annotations
 import io
 import json
 import logging
+import uuid
 from collections.abc import Iterator
+from datetime import UTC, datetime
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from agentgov import BudgetManager, money
-from agentgov.core import MAX_ID_BYTES, MAX_MEMO_BYTES, _check_text, _escape, format_audit_line
+from agentgov.core import (
+    MAX_ID_BYTES,
+    MAX_MEMO_BYTES,
+    Direction,
+    EntryType,
+    LedgerEntry,
+    _check_text,
+    _escape,
+    format_audit_line,
+)
 
 HOSTILE = [
     "line\nbreak",
@@ -126,6 +137,56 @@ def test_control_events_are_escaped_too(audit_lines: io.StringIO) -> None:
     assert all(line.isprintable() for line in controls)
     tripped = _fields(controls[0])
     assert _unescape(tripped["reason"]) == "halted\nAGOV2|ctrl=circuit_reset|scope=ops"
+
+
+def _entry(**fields: object) -> LedgerEntry:
+    known: dict[str, object] = dict(
+        prev_hash="0" * 64, counterparty_id=None, memo="", ref=None, version="AGOV3"
+    )
+    return LedgerEntry(**{**known, **fields})  # type: ignore[arg-type]
+
+
+def test_an_audit_line_has_fixed_fields_in_a_fixed_order() -> None:
+    """What a log pipeline parses: every field, the first 16 hex digits of the
+    entry hash, and ``ref`` and ``memo`` only when the entry has one."""
+    released = _entry(
+        sequence=7,
+        entry_id=uuid.UUID(int=1),
+        transaction_id=uuid.UUID(int=2),
+        timestamp=datetime(2026, 10, 13, 12, 0, 0, 250000, tzinfo=UTC),
+        entry_type=EntryType.HOLD_VOID,
+        direction=Direction.CREDIT,
+        scope_id="agent",
+        amount=money("0.5"),
+        balance_after=money("1.25"),
+        entry_hash="0123456789abcdef" + "f" * 48,
+        memo="released",
+        ref=uuid.UUID(int=3),
+    )
+    assert format_audit_line(released) == (
+        "AGOV3|seq=0000000007|txn=00000000-0000-0000-0000-000000000002"
+        "|ts=2026-10-13T12:00:00.250000Z|type=hold_void|dir=CR|scope=agent|cpty=-"
+        "|amt=0.50000000|bal=1.25000000|h=0123456789abcdef"
+        "|ref=00000000-0000-0000-0000-000000000003|memo=released"
+    )
+    delegated = _entry(
+        sequence=8,
+        entry_id=uuid.UUID(int=4),
+        transaction_id=uuid.UUID(int=5),
+        timestamp=datetime(2026, 10, 13, 12, 0, 1, tzinfo=UTC),
+        entry_type=EntryType.ALLOCATION,
+        direction=Direction.DEBIT,
+        scope_id="root",
+        counterparty_id="agent",
+        amount=money("2"),
+        balance_after=money("8"),
+        entry_hash="fedcba9876543210" + "0" * 48,
+    )
+    assert format_audit_line(delegated) == (
+        "AGOV3|seq=0000000008|txn=00000000-0000-0000-0000-000000000005"
+        "|ts=2026-10-13T12:00:01.000000Z|type=allocation|dir=DR|scope=root|cpty=agent"
+        "|amt=2.00000000|bal=8.00000000|h=fedcba9876543210"
+    )
 
 
 def test_ordinary_text_is_written_as_it_is() -> None:

@@ -44,6 +44,7 @@ from agentgov.core import (
     GENESIS_HASH,
     Authorization,
     BudgetManager,
+    ControlEvent,
     Direction,
     EntryType,
     Ledger,
@@ -57,6 +58,7 @@ from agentgov.core import (
 from agentgov.exceptions import (
     AgentGovError,
     AgentThrashingError,
+    DenialOfWalletError,
     LedgerIntegrityError,
     ReadOnlyLedgerError,
 )
@@ -372,6 +374,14 @@ def test_the_ledger_refuses_to_release_a_hold_twice() -> None:
     ledger.verify_chain()
 
 
+def test_the_ledger_refuses_to_release_a_hold_twice_in_one_transaction() -> None:
+    ledger, hold = _raw_ledger_with_hold()
+    with pytest.raises(LedgerIntegrityError, match="not an open hold"):
+        ledger._post([_release(hold), _release(hold)])
+    assert len(ledger) == 2
+    ledger.verify_chain()
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
@@ -425,12 +435,15 @@ def test_only_releases_and_spends_may_name_a_hold() -> None:
 _Line = tuple[EntryType, Direction, str, str, uuid.UUID | int | None]
 
 
-def _chain(lines: list[_Line], *, versions: Sequence[str] = ()) -> list[LedgerEntry]:
+def _chain(
+    lines: list[_Line], *, versions: Sequence[str] = (), memos: dict[int, str] | None = None
+) -> list[LedgerEntry]:
     """Entries with valid hashes and links, however wrong their content:
     what a full rewrite by someone able to compute SHA-256 would produce.
 
     A ``ref`` given as an int names the entry at that index of this chain.
     ``versions`` sets each entry's audit version; the rest are ``AGOV2``.
+    ``memos`` replaces the memo of the entry at an index.
     """
     entries: list[LedgerEntry] = []
     head, balances = GENESIS_HASH, {"root": Decimal(0)}
@@ -441,9 +454,13 @@ def _chain(lines: list[_Line], *, versions: Sequence[str] = ()) -> list[LedgerEn
         sign = {Direction.CREDIT: 1, Direction.DEBIT: -1, Direction.NONE: 0}[direction]
         balances[scope] = balances.get(scope, Decimal(0)) + sign * value
         entry_id, txn, now = uuid.uuid4(), uuid.uuid4(), datetime.now(UTC)
-        # A seal carries a well-formed memo (for no legacy events), so a forged
-        # chain's seal fails only the rule its case names.
+        # A seal carries a well-formed memo (for no legacy events), and a
+        # checkpoint one for the entry before it, so a forged chain's seal or
+        # checkpoint fails only the rule its case names.
         memo = _seal_memo(()) if kind is EntryType.SEAL else ""
+        if kind is EntryType.CHECKPOINT:
+            memo = f"agentgov-checkpoint v1 seq={index - 1} sha256={'0' * 64}"
+        memo = (memos or {}).get(index - 1, memo)
         entry_hash = _hash_entry(
             prev_hash=head,
             sequence=index,
@@ -552,6 +569,17 @@ _V1 = ("AGOV1",)
             ("AGOV1", "AGOV1"),
             "released twice",
         ),
+        (
+            [
+                _FUND,
+                (EntryType.HOLD, Direction.DEBIT, "root", "0.50", None),
+                (EntryType.HOLD_VOID, Direction.CREDIT, "root", "0.50", 1),
+                (EntryType.SPEND, Direction.DEBIT, "root", "0.10", 1),
+            ],
+            (),
+            "did not release",
+        ),
+        ([_FUND, (EntryType.CHECKPOINT, Direction.NONE, "", "0", None)], (), "AGOV3 only"),
     ],
     ids=[
         "illegal-direction",
@@ -565,6 +593,8 @@ _V1 = ("AGOV1",)
         "second-seal",
         "unsealed-upgrade",
         "unmatched-v1-release",
+        "spend-of-a-hold-an-earlier-transaction-released",
+        "agov2-checkpoint",
     ],
 )
 def test_every_replay_rule_rejects_a_forged_chain(
@@ -573,6 +603,42 @@ def test_every_replay_rule_rejects_a_forged_chain(
     """What a writer able to compute SHA-256 could forge, the rules still refuse."""
     with pytest.raises(LedgerIntegrityError, match=message):
         _load(_chain(lines, versions=versions))
+
+
+def test_a_malformed_migration_seal_is_refused() -> None:
+    sealed = _chain(
+        [_FUND, (EntryType.SEAL, Direction.NONE, "", "0", None)],
+        versions=_V1,
+        memos={1: "agentgov-seal"},
+    )
+    with pytest.raises(LedgerIntegrityError, match="malformed migration seal"):
+        _load(sealed)
+
+
+def test_control_rows_outside_the_chain_need_a_seal_to_vouch_for_them() -> None:
+    """Rows a pre-0.1.2 governor kept outside the chain are trusted only as
+    the seal written when it was upgraded counts them: a chain with no such
+    seal has nothing to vouch for them."""
+    (funding,) = _chain([_FUND])
+    row = ControlEvent(
+        event_id=uuid.uuid4(),
+        timestamp=funding.timestamp,
+        event_type="circuit_tripped",
+        scope_id="root",
+        reason="added to the table",
+        ledger_head_hash=funding.entry_hash,
+    )
+    with pytest.raises(LedgerIntegrityError, match="no migration seal to vouch for them"):
+        Ledger()._adopt([funding], (row,))
+
+
+def test_an_entry_that_cannot_be_hashed_is_refused() -> None:
+    """An AGOV3 amount carries eight decimals at most: one with nine has no
+    hash to compare."""
+    (funding,) = _chain([_FUND], versions=("AGOV3",))
+    nine = Decimal("1.000000001")
+    with pytest.raises(LedgerIntegrityError, match="cannot be hashed"):
+        _load([replace(funding, amount=nine, balance_after=nine)])
 
 
 def test_verification_checks_every_running_balance() -> None:
@@ -879,7 +945,7 @@ def test_the_ledger_refuses_a_stale_authorization_even_if_memory_holds_one() -> 
     [
         ("AGOV1", uuid.uuid4(), EntryType.SPEND, "hash does not cover"),
         ("AGOV1", None, EntryType.ANCHOR, "a type AGOV1 did not have"),
-        ("AGOV9", None, EntryType.FUNDING, "unknown audit version"),
+        ("AGOV9", None, EntryType.FUNDING, "carries an unknown audit version"),
     ],
 )
 def test_entry_versions_are_enforced(
@@ -1385,6 +1451,7 @@ def test_refresh_follows_a_legacy_writer_and_a_schema_upgrade(tmp_path: Path) ->
     assert reader.refresh() == 1
     assert reader.is_halted("worker")
     assert reader.available("root") == money("0.30")
+    reader.verify_integrity()  # the row it followed is the one a replay folds in
 
     with BudgetManager.open_sqlite(path) as upgraded:  # a v0.1.2 writer takes over
         upgraded.open_root("new", money("2.00"))
@@ -1394,6 +1461,82 @@ def test_refresh_follows_a_legacy_writer_and_a_schema_upgrade(tmp_path: Path) ->
     assert reader.is_halted("worker") and reader.is_halted("idle")
     reader.verify_integrity()
     reader.close()
+
+
+def test_a_legacy_control_row_of_another_type_changes_no_breaker(tmp_path: Path) -> None:
+    """A pre-0.1.2 governor wrote trips and resets, nothing else: a row of any
+    other type neither halts a scope nor re-arms one."""
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    v1 = _V1Writer(path, fresh=False)
+    v1.control("circuit_paused", "idle", "no governor wrote this")
+    v1.control("circuit_paused", "worker", "nor this")
+    v1.close()
+    with BudgetManager.open_sqlite(path, read_only=True) as gov:
+        assert gov.is_halted("idle") and not gov.is_halted("worker")
+
+
+def test_a_reader_serves_the_authorizations_a_legacy_writer_opens(tmp_path: Path) -> None:
+    """A pre-0.1.2 writer names a hold only in its authorization row: the
+    reader matches the row to the hold it follows."""
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    with BudgetManager.open_sqlite(path, read_only=True) as reader:
+        v1 = _V1Writer(path, fresh=False)
+        (hold,) = v1.post((EntryType.HOLD, Direction.DEBIT, "worker", "0.07", None))
+        v1.authorization("worker", "0.07", hold)
+        v1.close()
+        assert reader.refresh() == 1
+        served = {a.entry.entry_id: a.amount for a in reader.stale_authorizations(0)}
+        assert served[hold] == money("0.07")
+        assert len(served) == 2
+
+
+def test_a_reader_refuses_the_same_funds_released_twice_by_a_legacy_writer(
+    tmp_path: Path,
+) -> None:
+    """A pre-0.1.2 release names no hold, so it pairs with any open hold of
+    its scope and amount; a second finds none left in what the reader
+    follows, though the first came in the same refresh."""
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    with BudgetManager.open_sqlite(path, read_only=True) as reader:
+        v1 = _V1Writer(path, fresh=False)
+        v1.conn.execute("DELETE FROM open_authorizations")
+        for _ in range(2):
+            v1.post((EntryType.HOLD_VOID, Direction.CREDIT, "worker", "0.05", None))
+        v1.close()
+        with pytest.raises(LedgerIntegrityError, match="released twice"):
+            reader.refresh()
+
+
+def test_a_reader_refuses_a_second_migration_seal(tmp_path: Path) -> None:
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    with BudgetManager.open_sqlite(path):  # sealed on its first writable open
+        pass
+    with BudgetManager.open_sqlite(path, read_only=True) as reader:
+        last = reader.audit_trail()[-1]
+        assert last.entry_type is EntryType.SEAL
+        store = SqliteStore(path)
+        store.commit(WriteBatch(entries=[_forge_after(last, EntryType.SEAL, "")]))
+        store.close()
+        with pytest.raises(LedgerIntegrityError, match="a second migration seal"):
+            reader.refresh()
+
+
+def test_a_latched_breaker_keeps_its_reason_when_a_settlement_overdraws() -> None:
+    """A capture on a halted scope settles; its overdraft does not trip the
+    breaker a second time, over the operator's reason."""
+    gov = BudgetManager()
+    gov.open_root("root", money("1.00"))
+    held = gov.authorize("root", money("1.00"))
+    gov.trip("root", "operator halt")
+    with pytest.raises(DenialOfWalletError):
+        gov.capture(held, money("1.50"))
+    trips = [e.memo for e in gov.audit_trail() if e.entry_type is EntryType.CIRCUIT_TRIPPED]
+    assert trips == ["operator halt"]
+    gov.verify_integrity()
 
 
 def test_a_store_image_is_one_consistent_read(tmp_path: Path) -> None:

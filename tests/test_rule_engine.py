@@ -9,9 +9,11 @@ ones its entries imply.
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Iterator, Sequence
+from datetime import UTC, datetime, timedelta, tzinfo
 from decimal import Decimal
 from pathlib import Path
 
@@ -81,6 +83,20 @@ REFUSED = {
         [LedgerLine(EntryType.REVERSAL, Direction.CREDIT, "child", money("0.01"))],
         "more than the 0 it ever spent",
     ),
+    "a transfer that does not balance": (
+        [
+            LedgerLine(EntryType.RELEASE, Direction.DEBIT, "child", money("0.1"), "root"),
+            LedgerLine(EntryType.RELEASE, Direction.CREDIT, "root", money("0.2"), "child"),
+        ],
+        "does not balance",
+    ),
+    "debiting a delegation from a scope that does not exist": (
+        [
+            LedgerLine(EntryType.ALLOCATION, Direction.DEBIT, "ghost", money("0.1"), "new"),
+            LedgerLine(EntryType.ALLOCATION, Direction.CREDIT, "new", money("0.1"), "root"),
+        ],
+        "never created",
+    ),
 }
 
 
@@ -123,20 +139,197 @@ def test_a_raw_write_the_rules_allow_keeps_every_cache_in_step(tmp_path: Path) -
         conn.close()
 
 
-def _forged(lines: list[tuple[EntryType, Direction, str, str, str | None]]) -> list[LedgerEntry]:
-    """Entries with valid hashes and links, one transaction for all of them."""
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        (
+            LedgerLine(EntryType.ANCHOR, Direction.NONE, "root", money("0.01"), memo="x"),
+            "moves no money",
+        ),
+        (
+            LedgerLine(EntryType.ALLOCATION, Direction.DEBIT, "root", money("0.1"), "a\nb"),
+            "counterparty id",
+        ),
+    ],
+    ids=["a zero-value line with an amount", "a counterparty id with a line break"],
+)
+def test_a_raw_line_the_caller_got_wrong_is_the_callers_error(
+    line: LedgerLine, message: str
+) -> None:
+    gov = _tree()
+    before = len(gov.ledger)
+    with pytest.raises(ValueError, match=message) as raised:
+        gov.ledger._post([line])
+    assert not isinstance(raised.value, LedgerIntegrityError)
+    assert len(gov.ledger) == before
+
+
+def test_a_governor_whose_clock_is_behind_the_chain_dates_its_entries_at_the_chains_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Time in the chain never runs backwards, whatever this governor's clock
+    says: another governor's may be ahead of it."""
+    gov = _tree()
+    newest = gov.audit_trail()[-1].timestamp
+
+    class Behind(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:  # type: ignore[override]
+            return newest - timedelta(minutes=5)
+
+    monkeypatch.setattr("agentgov.core.datetime", Behind)
+    spent = gov.spend("child", money("0.01"))
+    assert spent.timestamp == newest
+    gov.verify_integrity()
+
+
+def test_a_unit_of_work_built_against_an_older_head_is_refused() -> None:
+    """Units of work are built and committed under the ledger's lock. One
+    begun before another committed would fork the chain, and is refused."""
+    gov = _tree()
+    ledger = gov.ledger
+    stale, current = ledger._begin(), ledger._begin()
+    current.post([ROOT_FUNDING])
+    ledger._commit(current)
+    stale.post([ROOT_FUNDING])
+    with pytest.raises(RuntimeError, match="stale ledger head"):
+        ledger._commit(stale)
+    gov.verify_integrity()
+
+
+@pytest.mark.parametrize("stored", [False, True], ids=["in memory", "over sqlite"])
+def test_a_spend_is_refunded_at_most_what_it_spent_across_its_refunds(
+    stored: bool, tmp_path: Path
+) -> None:
+    """Each refund that names the spend counts against it, however many units
+    of work apart: the scope's own bound (two spends) would allow more."""
+    gov = _tree(tmp_path / "ledger.db" if stored else None)
+    first = gov.spend("child", money("0.20"))
+    gov.spend("child", money("0.20"))
+    gov.refund("child", money("0.15"), reverses=first)
+    with pytest.raises(ValueError, match=r"0.05000000 of its 0.20000000 is left"):
+        gov.refund("child", money("0.10"), reverses=first)
+    gov.refund("child", money("0.05"), reverses=first)
+    gov.verify_integrity()
+
+
+def test_a_node_the_caller_holds_stays_current() -> None:
+    gov = _tree()
+    root = gov.node("root")
+    gov.fund("root", money("1"))
+    assert gov.node("root") is root and root.allocated == money("2")
+
+
+def test_a_governor_over_a_store_keeps_its_call_records_there(tmp_path: Path) -> None:
+    """Memory does not grow with the calls made under a key: the store
+    answers for them."""
+    with BudgetManager.open_sqlite(str(tmp_path / "ledger.db")) as gov:
+        gov.open_root("root", money("1"))
+        for n in range(3):
+            gov.spend("root", money("0.01"), idempotency_key=f"call-{n}")
+        assert gov.ledger._keys == {}
+
+
+def _drifted(gov: BudgetManager, drift: str) -> None:
+    """Change what this governor holds in memory, and nothing in the chain."""
+    state = gov.ledger._state
+    if drift == "a scope the chain never created":
+        state.nodes["ghost"] = BudgetNode("ghost", None, 0, money("1"), created_at=_NOW)
+    elif drift == "an allocation":
+        state.nodes["child"].allocated = money("0.9")
+    elif drift == "a scope it forgot":
+        del state.nodes["child"]
+    elif drift == "a breaker":
+        state.tripped["child"] = (_NOW, "forged")
+    elif drift == "the Merkle frontier":
+        state.frontier = ()
+    elif drift == "a scope's lifetime spend":
+        state.spent["child"] = money("9")
+    elif drift == "a balance":
+        state.balances["child"] = money("9")
+    elif drift == "the boundary totals":
+        state.totals = dataclasses.replace(state.totals, funded=money("9"))
+    elif drift == "an open hold":
+        state.holds.clear()
+    else:
+        raise AssertionError(drift)
+
+
+_NOW = datetime.now(UTC)
+
+
+DRIFTS = {
+    "a scope the chain never created": "the chain never created it",
+    "an allocation": "topology disagrees",
+    "a scope it forgot": "created scope.* that are not registered",
+    "a breaker": "breaker state disagrees",
+    "the Merkle frontier": "Merkle frontier disagrees",
+    "a scope's lifetime spend": "lifetime spend or refunds disagree",
+    "a balance": "cached balance",
+    "the boundary totals": "boundary totals disagree",
+    "an open hold": "open holds disagree",
+}
+
+
+@pytest.mark.parametrize(("drift", "message"), DRIFTS.items(), ids=DRIFTS.keys())
+def test_verify_chain_catches_memory_that_drifted_from_the_chain(drift: str, message: str) -> None:
+    gov = _tree()
+    gov.spend("child", money("0.10"))
+    gov.authorize("child", money("0.05"))
+    gov.verify_integrity()
+    _drifted(gov, drift)
+    with pytest.raises(LedgerIntegrityError, match=message):
+        gov.ledger.verify_chain()
+
+
+def test_verify_chain_over_a_store_replays_the_chain_as_it_reads_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It holds a chunk of the chain at a time, never all of it: a broken
+    entry stops it before anything after it is read."""
+    gov = _tree(tmp_path / "ledger.db")
+    for _ in range(3):
+        gov.spend("child", money("0.01"))
+    entries = list(gov.ledger.iter_entries())
+    broken = dataclasses.replace(entries[3], memo="rewritten")
+
+    def reading(*args: object, **kwargs: object) -> Iterator[LedgerEntry]:
+        yield from entries[:3]
+        yield broken
+        raise AssertionError("read past the broken entry")
+
+    monkeypatch.setattr(gov.ledger, "iter_entries", reading)
+    with pytest.raises(LedgerIntegrityError, match="tampered with"):
+        gov.ledger.verify_chain()
+    gov.close()
+
+
+def _forged(
+    lines: list[tuple[EntryType, Direction, str, str, str | None]],
+    *,
+    transactions: Sequence[int] = (),
+    times: Sequence[datetime] = (),
+) -> list[LedgerEntry]:
+    """Entries with valid hashes and links. Every line but a funding shares
+    one transaction, unless ``transactions`` numbers each line's (lines with
+    the same number share one); ``times`` dates each line."""
     entries: list[LedgerEntry] = []
     head, balances = GENESIS_HASH, dict[str, Decimal]()
     txn, now = uuid.uuid4(), datetime.now(UTC)
+    numbered: dict[int, uuid.UUID] = {}
     for sequence, (kind, direction, scope, amount, counterparty) in enumerate(lines, start=1):
         value = money(amount)
         signed = value if direction is Direction.CREDIT else -value
         balances[scope] = balances.get(scope, Decimal(0)) + signed
+        if transactions:
+            transaction_id = numbered.setdefault(transactions[sequence - 1], uuid.uuid4())
+        else:
+            transaction_id = txn if kind is not EntryType.FUNDING else uuid.uuid4()
         fields = dict(
             sequence=sequence,
             entry_id=uuid.uuid4(),
-            transaction_id=txn if kind is not EntryType.FUNDING else uuid.uuid4(),
-            timestamp=now,
+            transaction_id=transaction_id,
+            timestamp=times[sequence - 1] if times else now,
             entry_type=kind,
             direction=direction,
             scope_id=scope,
@@ -162,8 +355,9 @@ def test_a_replay_refuses_a_transfer_that_does_not_balance() -> None:
             (EntryType.ALLOCATION, Direction.CREDIT, "child", "0.50", "root"),
         ]
     )
-    with pytest.raises(LedgerIntegrityError, match="does not balance"):
-        _replay(forged)
+    for finish in (False, True):
+        with pytest.raises(LedgerIntegrityError, match="does not balance"):
+            _replay(forged, finish=finish)
     _replay(
         _forged(
             [
@@ -171,6 +365,36 @@ def test_a_replay_refuses_a_transfer_that_does_not_balance() -> None:
                 (EntryType.ALLOCATION, Direction.DEBIT, "root", "0.10", "child"),
                 (EntryType.ALLOCATION, Direction.CREDIT, "child", "0.10", "root"),
             ]
+        )
+    )
+
+
+def test_a_replay_balances_each_transaction_on_its_own() -> None:
+    """Two transfers that each move money one way, and cancel out: the chain
+    nets to zero, but each transaction must, at its own end."""
+    lines = [
+        (EntryType.FUNDING, Direction.CREDIT, "root", "1", None),
+        (EntryType.ALLOCATION, Direction.DEBIT, "root", "0.10", "child"),
+        (EntryType.ALLOCATION, Direction.CREDIT, "child", "0.10", "root"),
+        (EntryType.RELEASE, Direction.DEBIT, "child", "0.05", "root"),
+        (EntryType.RELEASE, Direction.CREDIT, "root", "0.05", "child"),
+    ]
+    with pytest.raises(LedgerIntegrityError, match="does not balance"):
+        _replay(_forged(lines, transactions=[0, 1, 1, 2, 3]))
+    _replay(_forged(lines, transactions=[0, 1, 1, 2, 2]))  # one release, both sides
+
+
+def test_agov2_history_is_held_to_its_own_rules_not_to_agov3s() -> None:
+    """AGOV2 entries were written before AGOV3's rules: time that runs back
+    (a writer's clock stepped back) is history, not tampering."""
+    now = datetime.now(UTC)
+    _replay(
+        _forged(
+            [
+                (EntryType.FUNDING, Direction.CREDIT, "root", "1", None),
+                (EntryType.SPEND, Direction.DEBIT, "root", "0.10", None),
+            ],
+            times=[now, now - timedelta(seconds=5)],
         )
     )
 
@@ -254,42 +478,6 @@ def test_history_written_before_the_bound_still_opens(tmp_path: Path) -> None:
             reopened.refund("root", money("0.01"))  # new writes are bounded
 
 
-def _batch() -> WriteBatch:
-    return WriteBatch()
-
-
-# -- views stacked on views -------------------------------------------------
-
-
-def test_a_view_on_a_view_merges_into_it_or_is_dropped_without_a_trace() -> None:
-    gov = _tree()
-    state = gov.ledger._state
-    batch = _Overlay(state)
-    pending = gov.ledger._begin()
-    pending._view = _Overlay(batch)
-    pending.post([LedgerLine(EntryType.HOLD, Direction.DEBIT, "child", money("0.1"))])
-    pending.view.merge()  # into the batch, not the state
-    assert batch.balance("child") == money("0.4")
-    assert state.balance("child") == money("0.5")
-    assert batch.holds_open_in("child") == 1
-
-    dropped = gov.ledger._begin()
-    dropped._view = _Overlay(batch)
-    dropped.post([LedgerLine(EntryType.HOLD, Direction.DEBIT, "child", money("0.2"))])
-    assert dropped.view.holds_open_in("child") == 2
-    del dropped  # never merged: the batch is as it was
-    assert batch.holds_open_in("child") == 1
-    assert batch.balance("child") == money("0.4")
-    assert batch.length == state.length + 1
-
-
-def _delegation(parent: str, child: str) -> list[LedgerLine]:
-    return [
-        LedgerLine(EntryType.ALLOCATION, Direction.DEBIT, parent, money("0.01"), child),
-        LedgerLine(EntryType.ALLOCATION, Direction.CREDIT, child, money("0.01"), parent),
-    ]
-
-
 def test_staging_a_scope_copies_none_of_its_children() -> None:
     """A write to a scope with 100,000 children costs what one to a leaf does."""
     gov = _tree()
@@ -297,32 +485,6 @@ def test_staging_a_scope_copies_none_of_its_children() -> None:
     staged = _Overlay(state)._writable("root")
     assert staged is not state.nodes["root"]
     assert staged.child_ids is state.nodes["root"].child_ids
-
-
-def test_delegations_reach_the_parent_only_when_merged_in_order_through_views() -> None:
-    gov = _tree()
-    state = gov.ledger._state
-    batch = _Overlay(state)
-    first = gov.ledger._begin()
-    first._view = _Overlay(batch)
-    first.post(_delegation("root", "a"))
-    first.view.merge()
-    second = gov.ledger._begin()
-    second._view = _Overlay(batch)
-    second.post(_delegation("root", "b"))
-    second.post(_delegation("a", "c"))
-    second.view.merge()
-    dropped = gov.ledger._begin()
-    dropped._view = _Overlay(batch)
-    dropped.post(_delegation("root", "d"))
-    del dropped  # never merged
-    assert state.nodes["root"].child_ids == ["child"], "nothing reaches the state unmerged"
-    batch.merge()
-    assert state.nodes["root"].child_ids == ["child", "a", "b"]
-    assert state.nodes["a"].child_ids == ["c"]
-    assert state.nodes["c"].child_ids == []
-    assert "d" not in state.nodes
-    gov._verify_tree()  # the store never saw these entries; the tree is whole
 
 
 # -- exhaustion counts holds per scope --------------------------------------

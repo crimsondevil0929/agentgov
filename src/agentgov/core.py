@@ -977,17 +977,6 @@ class _ChainState:
     def refunded_of_spend(self, spend_id: uuid.UUID) -> Decimal:
         return self.spend_refunds.get(spend_id, ZERO)
 
-    def finish(self) -> None:
-        """Fold in pre-0.1.2 control events, for a chain with no newer entry.
-
-        :raises LedgerIntegrityError: If one names a scope the chain never
-            created.
-        """
-        if not self.legacy_applied:
-            view = _Overlay(self)
-            view.finish()
-            view.merge()
-
 
 def _hold_key(entry: LedgerEntry) -> _HoldKey:
     return (entry.scope_id, entry.amount)
@@ -1017,9 +1006,6 @@ class _Overlay:
     links, balances, hold pairing, balanced transfers) and the governance
     (who may be funded, delegated to, released between, halted) alike, so
     whatever a write commits a replay accepts.
-
-    A view may sit on another view (``base``): an operation staged on top of
-    a batch merges into the batch, or is dropped without touching it.
 
     The view also records what its entries change in the store's cache
     tables (:meth:`cache_rows`), so the caches a unit of work writes are the
@@ -1064,22 +1050,18 @@ class _Overlay:
 
     def __init__(
         self,
-        base: _ChainState | _Overlay,
+        base: _ChainState,
         *,
         resolve: Callable[[uuid.UUID], LedgerEntry | None] | None = None,
         refunds: Callable[[uuid.UUID, int], Decimal] | None = None,
     ) -> None:
         """:param resolve: Finds a committed entry by its ``entry_id``, for a
-            REVERSAL that names the spend it reverses; inherited from a view
-            this one is staged on.
+            REVERSAL that names the spend it reverses.
         :param refunds: What the refunds naming a spend among the chain's
             first ``n`` entries add up to, for a chain whose store keeps
             history: then the state remembers no spend's refunds, and a view
-            merged into it adds none. Inherited like ``resolve``."""
+            merged into it adds none."""
         self._base = base
-        if isinstance(base, _Overlay):
-            resolve = base._resolve if resolve is None else resolve
-            refunds = base._refunds if refunds is None else refunds
         self._resolve: Callable[[uuid.UUID], LedgerEntry | None] | None = resolve
         self._refunds: Callable[[uuid.UUID, int], Decimal] | None = refunds
         self._start_head: str = base.head
@@ -1168,7 +1150,7 @@ class _Overlay:
         if found is not None:
             return found
         base = self._base
-        if isinstance(base, _Overlay) or self._refunds is None:
+        if self._refunds is None:
             return base.refunded_of_spend(spend_id)
         return self._refunds(spend_id, base.length) if base.length else ZERO
 
@@ -1292,14 +1274,10 @@ class _Overlay:
         """A control event a pre-0.1.2 writer added after this view was built."""
         self.legacy = (*self.legacy, event)
         self._control(event.event_type, event.scope_id, event.timestamp, event.reason)
-        self._events.append(event)
 
     def merge(self) -> None:
         """Fold every verified change into the state below."""
         base = self._base
-        if isinstance(base, _Overlay):
-            base._absorb(self)
-            return
         base.balances.update(self.balances)
         base.totals = self.totals
         base.head = self.head
@@ -1341,39 +1319,6 @@ class _Overlay:
                 base.hold_counts[scope_id] = count
             else:
                 base.hold_counts.pop(scope_id, None)
-
-    def _absorb(self, child: _Overlay) -> None:
-        """Take a view staged on this one as this view's own staged changes."""
-        self.balances.update(child.balances)
-        self.totals = child.totals
-        self.head = child.head
-        self.length = child.length
-        self.saw_v1 = child.saw_v1
-        self.saw_v2 = child.saw_v2
-        self.seal = child.seal
-        self.legacy = child.legacy
-        self.legacy_applied = child.legacy_applied
-        self.saw_v3 = child.saw_v3
-        self.last_timestamp = child.last_timestamp
-        self.last_checkpoint = child.last_checkpoint
-        self.frontier = child.frontier
-        self._spend_refunds.update(child._spend_refunds)
-        for hold_id in child._closed:
-            if self._opened.pop(hold_id, None) is None:
-                self._closed.add(hold_id)
-        self._opened.update(child._opened)
-        self.ambiguous |= child.ambiguous
-        self._nodes.update(child._nodes)
-        for scope_id, added in child._children.items():
-            self._children.setdefault(scope_id, []).extend(added)
-        self._row_scopes |= child._row_scopes
-        self._roots.extend(child._roots)
-        self._tripped.update(child._tripped)
-        self._events.extend(child._events)
-        self._spent.update(child._spent)
-        self._refunded.update(child._refunded)
-        self._counts.update(child._counts)
-        self._txn, self._settleable, self._net = child._txn, child._settleable, child._net
 
     # -- ledger rules -------------------------------------------------------
 
@@ -1759,7 +1704,6 @@ class _Overlay:
         self.legacy_applied = True
         for event in self.legacy:
             self._control(event.event_type, event.scope_id, event.timestamp, event.reason)
-            self._events.append(event)
 
     def _check_seal(self, entry: LedgerEntry) -> None:
         match = _SEAL_MEMO.match(entry.memo)
@@ -2539,7 +2483,6 @@ class _Pending:
         now = datetime.now(UTC)
         if view.last_timestamp is not None and now < view.last_timestamp:
             now = view.last_timestamp
-        transfer_net = ZERO
         running: dict[str, Decimal] = {}
         prev_hash = view.head
         sequence = view.length
@@ -2584,8 +2527,6 @@ class _Pending:
                 signed = amount.copy_negate()
             else:
                 signed = ZERO
-            if line.entry_type in _BALANCED_TYPES:
-                transfer_net = _add(transfer_net, signed)
             current = running.get(line.scope_id, view.balance(line.scope_id))
             balance_after = _add(current, signed)
             if line.entry_type not in _ZERO_VALUE_TYPES:
@@ -2629,9 +2570,6 @@ class _Pending:
                 )
             )
             prev_hash = entry_hash
-
-        if transfer_net != ZERO:
-            raise LedgerIntegrityError(f"transfer transaction does not balance: net {transfer_net}")
 
         # Every rule a replay would enforce, and those only new writes are held
         # to, enforced now by the same engine, before anything is durable: a
@@ -3135,24 +3073,6 @@ class Ledger:
                         format_audit_line(entry),
                         extra={"agentgov_entry": entry.to_audit_record()},
                     )
-
-    def _ingest(self, entries: Sequence[LedgerEntry]) -> None:
-        """Append entries another process wrote, verifying each first.
-
-        All or nothing: a single entry that fails verification leaves this
-        ledger exactly as it was.
-        """
-        with self._lock:
-            view = _Overlay(
-                self._state, resolve=self._resolver_with(entries), refunds=self._refund_lookup()
-            )
-            for entry in entries:
-                view.apply(entry)
-            view.end_transaction()
-            view.merge()
-            self._follow_holds(view)
-            if self._entries is not None:
-                self._entries.extend(entries)
 
     def _refund_lookup(self) -> Callable[[uuid.UUID, int], Decimal] | None:
         """How the refunds of a spend are counted: from the store, when it
