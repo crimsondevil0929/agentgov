@@ -2281,7 +2281,10 @@ def _decode_snapshot(body: bytes) -> _ChainState:
         not isinstance(last, list)
         or len(last) != 2
         or not isinstance(last[0], int)
+        or isinstance(last[0], bool)
+        or last[0] < 1
         or not isinstance(last[1], str)
+        or not _HEX64.match(last[1])
     ):
         raise LedgerIntegrityError("snapshot $.last_checkpoint is not a checkpoint")
     seal = r.raw("seal")

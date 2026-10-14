@@ -132,6 +132,103 @@ def test_a_malformed_snapshot_is_refused(damage: Any) -> None:
         _decode_snapshot(canonical_bytes(document))
 
 
+def _full_snapshot(tmp_path: Path) -> dict[str, Any]:
+    """A snapshot with every part a snapshot holds: a migration seal and the
+    pre-0.1.2 events it folded in, an ambiguous hold key, open holds, trips,
+    refunds and an earlier checkpoint."""
+    from tests.test_core_guarantees import _legacy_database
+
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)
+    with BudgetManager.open_sqlite(path, policy=NEVER) as gov:  # sealed on this open
+        gov.delegate("worker", "sub", money("0.10"))
+        gov.authorize("sub", money("0.01"))
+        spend = gov.spend("worker", money("0.02"))
+        gov.refund("worker", money("0.01"), reverses=spend)
+        gov.checkpoint()
+        gov.anchor("worker", "after the checkpoint")
+        document: dict[str, Any] = json.loads(_encode_snapshot(gov.ledger._state))
+    for part in ("seal", "legacy", "ambiguous", "holds", "tripped", "last_checkpoint"):
+        assert document[part], part
+    return document
+
+
+def _parts(value: Any, path: tuple[Any, ...] = ()) -> Iterator[tuple[tuple[Any, ...], Any]]:
+    yield path, value
+    children = (
+        value.items()
+        if isinstance(value, dict)
+        else enumerate(value)
+        if isinstance(value, list)
+        else ()
+    )
+    for key, child in children:
+        yield from _parts(child, (*path, key))
+
+
+def _of_another_type(value: Any) -> list[Any]:
+    """Values of a JSON type no field holding ``value`` admits."""
+    if isinstance(value, bool):
+        return [1, "true", None, [], {}]
+    if isinstance(value, int):
+        return ["1", True, None, [], {}]
+    if isinstance(value, str):
+        return [1, True, [], {}]
+    if isinstance(value, list):
+        return ["x", 1, None, {}]
+    if isinstance(value, dict):
+        return ["x", 1, None, []]
+    return [1, True, [], {}]  # null: a nullable text, id, entry or checkpoint
+
+
+_KEYED_BY_SCOPE = {"balances", "spent", "refunded", "tripped"}  # any key may be absent
+_NULLABLE = {"seal", "last_checkpoint", "last_timestamp", "counterparty_id", "ref", "entry_id"}
+
+
+def test_every_part_of_a_snapshot_must_have_its_type(tmp_path: Path) -> None:
+    """A checkpoint's digest is taken over whatever its writer stored, so an
+    open from it must refuse a document of the wrong shape, part by part, as
+    malformed: never take it, and never fail some other way."""
+    from agentgov.receipts.canonical import canonical_bytes
+
+    document = _full_snapshot(tmp_path)
+    _decode_snapshot(canonical_bytes(document))
+    wrong: list[str] = []
+
+    def refused(changed: dict[str, Any], what: str) -> None:
+        try:
+            _decode_snapshot(canonical_bytes(changed))
+        except LedgerIntegrityError:
+            return
+        except Exception as exc:  # any other failure is the defect
+            wrong.append(f"{what}: {type(exc).__name__}: {exc}")
+        else:
+            wrong.append(f"{what}: decoded")
+
+    for path, value in _parts(document):
+        if not path:
+            continue
+        *above, last = path
+        nullable = last in _NULLABLE or (len(above) == 2 and above[0] == "nodes" and last == 1)
+        for other in _of_another_type(value):
+            if other is None and nullable:
+                continue
+            changed = json.loads(json.dumps(document))
+            parent = changed
+            for key in above:
+                parent = parent[key]
+            parent[last] = other
+            refused(changed, f"{'.'.join(map(str, path))} = {other!r}")
+        if isinstance(last, str) and (not above or above[-1] not in _KEYED_BY_SCOPE):
+            changed = json.loads(json.dumps(document))
+            parent = changed
+            for key in above:
+                parent = parent[key]
+            del parent[last]
+            refused(changed, f"{'.'.join(map(str, path))} removed")
+    assert not wrong, "\n".join(wrong)
+
+
 # -- writing checkpoints -----------------------------------------------------------
 
 
