@@ -2376,3 +2376,31 @@ def test_a_transaction_that_crosses_a_checkpoint_is_checkpointed_at_its_end(
             txn.anchor("root", "the fourth entry")
             assert _checkpointed(gov) == []
         assert _checkpointed(gov) == [4]
+
+
+def test_a_governor_others_write_beside_catches_up_before_it_asks_for_the_lock(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once its catch-ups find others' entries, a governor reads what they
+    wrote before it asks for the fleet's writer lock: the lock is then held
+    for only what they write while it waits, not for everything since."""
+    with (
+        BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov,
+        BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as other,
+    ):
+        gov.open_root("root", money("10"))
+        other.anchor("root", "another governor writes")
+        gov.anchor("root", "and this one finds it")
+        other.spend("root", money("1"))  # three entries this governor has not seen
+        under_the_lock: list[int] = []
+        read = PostgresStore._begin_reading
+
+        def counted(self: PostgresStore, conn: Any, after: int, control: int) -> Any:
+            head, delta = read(self, conn, after, control)
+            under_the_lock.append(len(delta.entries))
+            return head, delta
+
+        monkeypatch.setattr(PostgresStore, "_begin_reading", counted)
+        gov.anchor("root", "after the spend")
+        assert under_the_lock == [0]
+        assert gov.available("root") == money("9")
