@@ -18,7 +18,7 @@ from typing import Any, LiteralString
 
 import psycopg
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 from psycopg import sql
 
@@ -847,6 +847,7 @@ def test_a_units_writes_read_back_exactly_whatever_their_text(pg_admin_dsn: str)
                 max_size=8,
             )
         )
+        @example(values=["a\\b", "\\'", "it's \\ E'\\x41'", "\\\\"])  # backslashes, always
         def read_back(values: list[object]) -> None:
             for conforming in ("on", "off"):
                 with conn.transaction():  # SET LOCAL: one transaction, behind a pooler too
