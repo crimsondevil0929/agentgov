@@ -454,6 +454,9 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     parser.add_argument("--only", default="", help="run only mutants whose id contains this")
     parser.add_argument("--ids", default="", help="run only the mutants listed in this file")
+    parser.add_argument(
+        "--shard", default="", help="run only every Nth mutant, from the Kth: K/N, 0 <= K < N"
+    )
     parser.add_argument("--list", action="store_true", help="list the mutants and stop")
     parser.add_argument("--out", default="", help="write the JSON report here")
     args = parser.parse_args()
@@ -475,6 +478,11 @@ def main() -> None:
     if args.ids:
         wanted = set(Path(args.ids).read_text(encoding="utf-8").split("\n")) - {""}
         mutants = [m for m in mutants if m.mutant_id in wanted]
+    if args.shard:
+        index, _, count = args.shard.partition("/")
+        if not (index.isdigit() and count.isdigit() and int(index) < int(count)):
+            raise SystemExit(f"--shard takes K/N with 0 <= K < N, not {args.shard!r}")
+        mutants = mutants[int(index) :: int(count)]
     if args.list:
         for mutant in mutants:
             print(f"{mutant.path}:{mutant.line}  {mutant.mutant_id}")

@@ -61,9 +61,17 @@ jobs:
         run: uv run pytest -v tests/test_model.py
 
   mutation:
-    name: mutation pass
+    name: mutation pass (${{ matrix.spec }}, shard ${{ matrix.shard }} of 3)
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each spec under mutation/ names the functions a phase added or
+        # rewrote. A whole spec takes longer than a job may run, so each is
+        # split into three shards; a spec added under mutation/ is added here.
+        spec: [phase2, phase6-ledger, phase6-receipts]
+        shard: [0, 1, 2]
     services:
       postgres:
         image: postgres:16
@@ -89,19 +97,18 @@ jobs:
       - name: Install the project
         run: uv sync --frozen --python 3.12
 
-      # Every spec under mutation/: each names the functions a phase added
-      # or rewrote, and justifies by name every mutant no test can tell
-      # apart from the original.
+      # The spec justifies by name every mutant no test can tell apart from
+      # the original; any other survivor fails the job.
       - name: Mutation pass
         run: |
-          for spec in mutation/*.json; do
-            sed 's/localhost:55433/localhost:5432/' "$spec" > "$RUNNER_TEMP/$(basename "$spec")"
-            uv run python scripts/mutate.py "$RUNNER_TEMP/$(basename "$spec")" --jobs 4 \
-              --out "$RUNNER_TEMP/report-$(basename "$spec")"
-          done
+          sed 's/localhost:55433/localhost:5432/' "mutation/${{ matrix.spec }}.json" \
+            > "$RUNNER_TEMP/spec.json"
+          uv run python scripts/mutate.py "$RUNNER_TEMP/spec.json" --jobs 4 \
+            --shard "${{ matrix.shard }}/3" \
+            --out "$RUNNER_TEMP/report-${{ matrix.spec }}-${{ matrix.shard }}.json"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mutation-reports
+          name: mutation-report-${{ matrix.spec }}-${{ matrix.shard }}
           path: ${{ runner.temp }}/report-*.json

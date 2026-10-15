@@ -71,12 +71,15 @@ that leaves a mutant alive needs a test, or a reason:
 uv run python scripts/mutate.py mutation/phase2.json --jobs 8      # the rule engine
 uv run python scripts/mutate.py mutation/phase6-ledger.json --only BudgetManager.checkpoint
 uv run python scripts/mutate.py mutation/phase6-receipts.json --list
+uv run python scripts/mutate.py mutation/phase2.json --shard 0/3   # a third, as nightly runs it
 ```
 
 A spec's `recheck` names tests that bound time: a mutant they kill under the
 parallel load is run again alone, and counts as killed only if they kill it
-there too. The runner copies `src/` once per worker but reads `tests/` as they
-stand, so do not edit the sources while a pass runs.
+there too. The runner reads the spec and copies `src/` when it starts, but
+reads `tests/` as they stand: do not edit the sources while a pass runs, and
+add only tests that pass on the sources it started from (one they fail kills
+every mutant after it). The nightly job runs each spec in three shards.
 
 ## The soak
 
