@@ -1078,6 +1078,27 @@ def test_a_legacy_key_short_of_rows_is_repaired_one_authorization_per_open_hold(
         assert reopened._open_auths == {}
 
 
+def test_a_legacy_key_with_a_row_too_many_keeps_the_row_naming_the_open_hold(
+    tmp_path: Path,
+) -> None:
+    """Two rows for one open hold: the repair keeps the one naming it, not the
+    one naming the hold a replay took as released."""
+    path = str(tmp_path / "v1.db")
+    _, second = _legacy_twins(path, holds=2, named=[0, 1])
+    conn = sqlite3.connect(path)
+    rows = dict(conn.execute("SELECT entry_id, authorization_id FROM open_authorizations"))
+    conn.close()
+
+    with pytest.raises(LedgerIntegrityError, match=r"1 hold\(s\) .* but 2 authorization\(s\)"):
+        BudgetManager.open_sqlite(path)
+    with BudgetManager.open_sqlite(path, repair=True) as gov:
+        (served,) = gov._open_auths.values()
+        assert (served.authorization_id, served.entry.entry_id) == (
+            uuid.UUID(rows[str(second)]),
+            second,
+        )
+
+
 def test_a_legacy_hold_released_by_name_is_never_served_again(tmp_path: Path) -> None:
     """Where pre-0.1.2 releases leave open which hold of a key is open, one
     released by name is still known released: a row put back for it is the

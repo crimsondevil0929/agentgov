@@ -2143,6 +2143,7 @@ def test_a_ledger_reopened_just_after_a_checkpoint_owes_none(tmp_path: Path) -> 
             gov.anchor("root", f"tick {n}")
         assert _checkpointed(gov) == [4]
     with _sqlite(tmp_path, EVERY_FOUR) as reopened:
+        assert not reopened._checkpoint_owed, "one entry since the checkpoint"
         reopened.anchor("root", "6")
         assert _checkpointed(reopened) == [4], "two entries since the checkpoint"
 
@@ -2467,3 +2468,53 @@ def test_a_reader_reloaded_across_an_upgrade_keeps_following(tmp_path: Path) -> 
         assert reader.refresh() == 2  # the release and the spend
         assert hold not in {a.entry.entry_id for a in reader._open_auths.values()}
         reader.verify_integrity()
+
+
+def test_a_reader_folds_in_each_legacy_control_row_once(tmp_path: Path) -> None:
+    """A pre-0.1.2 writer's trips are rows outside the chain: each refresh
+    reads only those added since the last, so each is folded in once."""
+    from tests.test_core_guarantees import _legacy_database, _V1Writer
+
+    path = str(tmp_path / "v1.db")
+    _legacy_database(path)  # its idle scope halted by a row of its own
+    with BudgetManager.open_sqlite(path, read_only=True) as reader:
+        v1 = _V1Writer(path, fresh=False)
+        v1.control("circuit_tripped", "worker", "halted by a v0.1.1 writer")
+        v1.post((EntryType.SPEND, Direction.DEBIT, "worker", "0.01", None))
+        v1.close()
+        assert reader.refresh() == 1
+        v1 = _V1Writer(path, fresh=False)
+        v1.post((EntryType.SPEND, Direction.DEBIT, "worker", "0.01", None))
+        v1.close()
+        assert reader.refresh() == 1
+        assert [e.scope_id for e in reader.control_events] == ["idle", "worker"]
+
+
+def test_a_governor_given_a_current_ledger_serves_it_without_reading_it_again(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ledger as long as the store's snapshot, and ending in its head, is
+    that snapshot: the governor serves it as it is, empty or not, and replays
+    nothing a second time."""
+    adopted: list[int] = []
+    adopt = Ledger._adopt
+
+    def counted(self: Ledger, entries: Any, *args: Any, **kwargs: Any) -> None:
+        entries = list(entries)
+        adopted.append(len(entries))
+        adopt(self, entries, *args, **kwargs)
+
+    monkeypatch.setattr(Ledger, "_adopt", counted)
+    for written in (False, True):
+        if written:
+            with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as other:
+                other.open_root("org", money("1"))
+        store = PostgresStore(pg_dsn)
+        ledger = Ledger(store=store)
+        adopted.clear()
+        gov = BudgetManager(ledger=ledger, store=store, policy=NEVER)
+        try:
+            assert adopted == [], "nothing read again"
+            assert len(gov.ledger) == (1 if written else 0)
+        finally:
+            gov.close()

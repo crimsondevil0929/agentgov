@@ -180,6 +180,10 @@ def test_a_refund_naming_no_spend_is_deprecated_at_the_callers_line(tmp_path: Pa
 
         async def refund_off_the_loop() -> list[warnings.WarningMessage]:
             manager = agentgov.AsyncBudgetManager(gov)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                named = await manager.refund("root", agentgov.money("0.1"), reverses=spend)
+            assert named.entry_type is agentgov.EntryType.REVERSAL and named.ref == spend.entry_id
             with pytest.warns(DeprecationWarning, match="names no spend") as caught:
                 await manager.refund("root", agentgov.money("0.1"))
             return list(caught)
