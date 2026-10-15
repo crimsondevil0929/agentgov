@@ -322,9 +322,10 @@ def test_checkpointing_needs_a_durable_writable_store(ledger_db: str) -> None:
         BudgetManager().checkpoint()
     with (
         BudgetManager.open_sqlite(ledger_db, read_only=True) as reader,
-        pytest.raises(ReadOnlyLedgerError),
+        pytest.raises(ReadOnlyLedgerError) as refused,
     ):
         reader.checkpoint()
+    assert refused.value.operation == "checkpoint the ledger", "refused up front, by name"
 
 
 def test_an_empty_ledger_has_nothing_to_checkpoint(tmp_path: Path) -> None:
