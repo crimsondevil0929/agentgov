@@ -99,6 +99,27 @@ def test_a_snapshot_round_trips_and_is_canonical() -> None:
     assert len(_snapshot_digest(body)) == 64
 
 
+def test_the_snapshot_of_an_empty_chain_round_trips() -> None:
+    """Sequence 0 and no entry's time: what a chain with nothing in it holds
+    is a snapshot too, and decodes to that state."""
+    body = _encode_snapshot(BudgetManager().ledger._state)
+    decoded = _decode_snapshot(body)
+    assert (decoded.length, decoded.last_timestamp) == (0, None)
+    assert _encode_snapshot(decoded) == body
+
+
+@pytest.mark.parametrize(("field", "value"), [("entry_type", "bogus"), ("direction", "sideways")])
+def test_a_snapshot_entry_of_no_type_or_direction_there_is_is_refused(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    from agentgov.receipts.canonical import canonical_bytes
+
+    document = _full_snapshot(tmp_path)
+    document["holds"][0][field] = value
+    with pytest.raises(LedgerIntegrityError, match=r"holds\[0\] is not an entry"):
+        _decode_snapshot(canonical_bytes(document))
+
+
 def test_a_snapshot_that_is_not_canonical_is_refused() -> None:
     gov = BudgetManager()
     _populate(gov, spends=2)
