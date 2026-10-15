@@ -199,7 +199,7 @@ __all__ = [
     "reconcile",
 ]
 
-__version__ = "1.0.0rc1"
+__version__ = "1.0.0"
 
 
 # Names this package served before 1.0 that now live elsewhere: still served,
