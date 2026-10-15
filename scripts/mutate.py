@@ -457,6 +457,13 @@ def main() -> None:
     parser.add_argument(
         "--shard", default="", help="run only every Nth mutant, from the Kth: K/N, 0 <= K < N"
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=0.0,
+        help="seconds a mutant's tests may run (default: four times an unmutated run); "
+        "raise it on a loaded machine, where a slow survivor would count as a timeout",
+    )
     parser.add_argument("--list", action="store_true", help="list the mutants and stop")
     parser.add_argument("--out", default="", help="write the JSON report here")
     args = parser.parse_args()
@@ -490,7 +497,7 @@ def main() -> None:
         return
 
     baseline = _baseline(tests, env)
-    timeout = max(60.0, baseline * 4)
+    timeout = args.timeout or max(60.0, baseline * 4)
     print(
         f"{len(mutants)} mutants over {len(targets)} functions; the tests take "
         f"{baseline:.1f}s unmutated; {args.jobs} jobs, {timeout:.0f}s timeout",

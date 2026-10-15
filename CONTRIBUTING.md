@@ -72,6 +72,7 @@ uv run python scripts/mutate.py mutation/phase2.json --jobs 8      # the rule en
 uv run python scripts/mutate.py mutation/phase6-ledger.json --only BudgetManager.checkpoint
 uv run python scripts/mutate.py mutation/phase6-receipts.json --list
 uv run python scripts/mutate.py mutation/phase2.json --shard 0/3   # a third, as nightly runs it
+uv run python scripts/mutate.py mutation/phase6-ledger.json --jobs 6 --timeout 900  # a busy machine
 ```
 
 A spec's `recheck` names tests that bound time: a mutant they kill under the
