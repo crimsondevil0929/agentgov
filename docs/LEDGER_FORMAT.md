@@ -195,8 +195,10 @@ At every point, the conservation identity holds:
    not open (never placed, or already released) is refused.
 3. A `spend` that names a hold (`ref`) may only follow, in the same
    transaction, the `hold_void` that released that hold.
-4. An `AGOV1` `hold_void` names no hold: it closes any open hold of the same
-   scope and amount, and one must exist.
+4. An `AGOV1` `hold_void` names no hold: it closes the open hold of the same
+   scope and amount placed first, and one must exist. Within such a key the
+   chain fixes how many holds are open, not which; that the first is the one
+   closed is a convention, which every replay and snapshot follows.
 
 ### 3.5 Governance
 
@@ -355,7 +357,7 @@ it by `repair`), or evidence that is never edited.
 | `entries` | the chain | One row per entry, every field of §1, amounts as text in the entry's own version's rendering (§2). Append-only (PostgreSQL triggers refuse UPDATE, DELETE and TRUNCATE), and an entry is admitted only if it links to the one before it. |
 | `nodes` | cache | One row per scope: parent, depth, allocation, created. |
 | `control_events` | cache | One row per trip or reset; pre-0.1.2 rows have no `entry_id`. |
-| `open_authorizations` | cache | One row per open hold. |
+| `open_authorizations` | cache | One row per open hold. A pre-0.1.2 row may name a hold of a key an `AGOV1` release touched (§3.4) that the chain took as closed; it is served on an open hold of the same scope and amount, and the chain's state is never moved to match it. |
 | `snapshots` | evidence | One row per checkpoint snapshot: `sequence`, `digest`, `body`, `signature`. Never edited. |
 | `audit_marks` | evidence | One row per auditor result: the sequence verified, its head, the state digest there, `verified` or `failed`. Never edited. |
 | `idempotency` | records | One row per idempotency key an operation was given: the request it named and what it returned, committed with its entries. |
