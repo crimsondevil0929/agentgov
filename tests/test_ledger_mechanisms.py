@@ -2518,3 +2518,21 @@ def test_a_governor_given_a_current_ledger_serves_it_without_reading_it_again(
             assert len(gov.ledger) == (1 if written else 0)
         finally:
             gov.close()
+
+
+def test_a_governor_checkpoints_only_what_its_own_writes_made_due(pg_dsn: str) -> None:
+    """Once its checkpoint is written, a governor owes none until its own
+    writes cross the next multiple of checkpoint_every: one that others'
+    writes crossed is theirs to write, however far past it the chain is."""
+    with (
+        BudgetManager.open_postgres(pg_dsn, policy=EVERY_FOUR, auditor=False) as gov,
+        BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as other,
+    ):
+        gov.open_root("root", money("1"))
+        for n in range(3):
+            gov.anchor("root", f"tick {n}")
+        assert _checkpointed(gov) == [4]
+        for n in range(4):
+            other.anchor("root", f"another governor's {n}")  # across 8, and writes no checkpoint
+        gov.anchor("root", "this governor's own, which crosses nothing")
+        assert _checkpointed(gov) == [4]
