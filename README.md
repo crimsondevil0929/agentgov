@@ -952,9 +952,11 @@ a deterministic offline stub, under 64 contending threads and 100 concurrent asy
 tasks: no double-spend under concurrency, conservation of value, an unbroken SHA-256
 chain, the latching breaker. A model-based test (Hypothesis) runs random sequences of
 every operation, with injected write failures and reopens, against a reference model; a
-mutation pass checks that the tests catch changes to the rule engine; the fleet tests race
-64 workers across 8 governors and 8 separate processes; the whole suite runs against
-PostgreSQL 14, 16, 17 and 18, and behind PgBouncer; and
+mutation pass makes 3,755 small changes to the rule engine, checkpoints, the auditor, both
+stores and the receipts code, and a test catches every one that changes what the code does
+(the 185 that change nothing a test can observe are named in `mutation/*.json`, each with
+its reason); the fleet tests race 64 workers across 8 governors and 8 separate processes;
+the whole suite runs against PostgreSQL 14, 16, 17 and 18, and behind PgBouncer; and
 [`scripts/soak.py`](scripts/soak.py) runs a fleet for half an hour while it kills
 governors and cuts their connections, then checks that every operation a worker saw
 succeed is in the ledger exactly once and nothing else is. This is the right harness for these

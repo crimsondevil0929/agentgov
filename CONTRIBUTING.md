@@ -91,7 +91,7 @@ auditor found nothing, and memory and connections stayed bounded:
 
 ```bash
 uv run python scripts/soak.py --ledger postgresql://postgres:agentgov@localhost:5432/postgres --minutes 30
-uv run python scripts/soak.py --ledger sqlite:///tmp/soak.db --minutes 10
+uv run python scripts/soak.py --ledger sqlite:///tmp/soak.db --minutes 10 --governors 1
 ```
 
 ## Linting and type checking
