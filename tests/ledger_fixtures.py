@@ -10,6 +10,8 @@ the ``extend_chain`` trigger.
 from __future__ import annotations
 
 import sqlite3
+import sys
+import time
 from pathlib import Path
 
 from agentgov import BudgetManager, GovernancePolicy, money
@@ -78,6 +80,25 @@ def copy_to_postgres(sqlite_path: str | Path, dsn: str, *, schema: str = "agentg
     finally:
         source.close()
     return copied
+
+
+def open_after_its_holder_died(path: str) -> BudgetManager:
+    """Open the SQLite ledger at ``path`` whose governor's process has died.
+
+    At once, as POSIX releases a dead process's lock with its exit. Windows
+    releases it a moment later, "depending upon available system resources"
+    (``LockFileEx``), so there an open is retried for a few seconds.
+    """
+    from agentgov.exceptions import ConcurrentGovernorError
+
+    deadline = time.monotonic() + (10.0 if sys.platform == "win32" else 0.0)
+    while True:
+        try:
+            return BudgetManager.open_sqlite(path)
+        except ConcurrentGovernorError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 def memory_history(ledger: Ledger) -> list[LedgerEntry]:

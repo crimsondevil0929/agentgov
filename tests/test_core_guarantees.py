@@ -67,7 +67,7 @@ from agentgov.exceptions import (
 from agentgov.interceptor import Interceptor, TokenUsage, pricing_for
 from agentgov.storage import SqliteStore
 from agentgov.streaming import MeteredStream
-from tests.ledger_fixtures import memory_history
+from tests.ledger_fixtures import memory_history, open_after_its_holder_died
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -306,7 +306,7 @@ def test_a_process_killed_inside_capture_restarts_consistent_and_cannot_mint_mon
         child = _crash_capture(path, fail_at)
         assert child.returncode == 3, child.stderr
 
-        with BudgetManager.open_sqlite(path) as gov:
+        with open_after_its_holder_died(path) as gov:
             gov.verify_integrity()
             spends = [e for e in gov.audit_trail() if e.entry_type is EntryType.SPEND]
             assert spends == [], "the capture never committed"

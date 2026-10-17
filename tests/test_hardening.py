@@ -45,6 +45,7 @@ from agentgov.exceptions import (
     StorageError,
 )
 from agentgov.storage import SqliteStore
+from tests.ledger_fixtures import open_after_its_holder_died
 
 
 @pytest.fixture
@@ -167,7 +168,7 @@ def test_a_killed_holder_leaves_no_stale_lock(db_path: str) -> None:
             child.wait(timeout=30)
 
     # No cleanup, no timeout: the next governor simply opens.
-    recovered = BudgetManager.open_sqlite(db_path)
+    recovered = open_after_its_holder_died(db_path)
     try:
         assert recovered.available("root") == money("1.00")
         recovered.verify_integrity()
