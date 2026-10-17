@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -215,7 +216,26 @@ class _DownSigner:
         return self.inner.sign(message)
 
 
-def test_writes_never_wait_on_a_checkpoint_signer_that_is_down(tmp_path: Path) -> None:
+class _StoppedClock:
+    """The time module as ``agentgov.core`` sees it, its monotonic clock stopped."""
+
+    def __init__(self) -> None:
+        self.stopped_at = time.monotonic()
+
+    def monotonic(self) -> float:
+        return self.stopped_at
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+def test_writes_never_wait_on_a_checkpoint_signer_that_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The backoff is timed on that clock: stopped, it cannot run out while the
+    # spends below write, however slow the disk (a Windows runner's can take
+    # them past the first second).
+    monkeypatch.setattr("agentgov.core.time", _StoppedClock())
     signer = _DownSigner()
     policy = GovernancePolicy(max_calls_per_window=0, checkpoint_every=5)
     gov = BudgetManager.open_sqlite(
