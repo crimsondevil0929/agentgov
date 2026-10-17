@@ -489,10 +489,15 @@ class _AdvisoryLock:
 
 
 if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
+    # The byte claimed, far past the holder's identity at the start of the
+    # file: Windows locks are mandatory, and a lock on the identity would keep
+    # every other handle from reading who holds the claim.
+    _CLAIMED_BYTE = 1 << 30
 
     def _lock_exclusive_nonblocking(fd: int) -> None:
         import msvcrt
 
+        os.lseek(fd, _CLAIMED_BYTE, os.SEEK_SET)
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError as exc:
@@ -503,7 +508,7 @@ if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
     def _unlock(fd: int) -> None:
         import msvcrt
 
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _CLAIMED_BYTE, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 else:
