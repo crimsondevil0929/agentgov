@@ -3664,9 +3664,17 @@ class GovernancePolicy:
         in a session of its own, never inside it. ``0`` disables it; a
         deployment with a very large state (many scopes and open holds) can
         raise it, since a snapshot costs time proportional to the state.
-    :ivar trip_on_exhaustion: Trip the breaker when a scope's balance reaches
-        exactly zero with no holds outstanding, so the next call fails fast
-        instead of racing to the same conclusion.
+    :ivar trip_on_exhaustion: Trip the breaker when a settlement leaves a
+        scope's balance at exactly zero with no holds outstanding, so the next
+        call fails fast instead of racing to the same conclusion. The
+        settlements that trip it are :meth:`BudgetManager.capture`, and so
+        :meth:`BudgetManager.spend` (which authorizes and captures in one
+        step), and :meth:`BudgetManager.redeem` of a claim against its open
+        hold. :meth:`BudgetManager.authorize` never does, even for the last of
+        the balance: its hold is outstanding until settled. A claim redeemed
+        with no open hold (it named none, or the hold was voided) books its
+        spend without this trip; only an overdraw trips the breaker there.
+        Moving money out of a scope (``delegate``, ``release``) never trips it.
     :ivar fleet_velocity: Count a scope's authorizations across the fleet:
         the holds placed on it in the chain, by every governor, within
         ``window_seconds`` (by their timestamps), rather than this governor's
@@ -5097,7 +5105,10 @@ class BudgetManager:
         it), a spend on its own; a zero claim becomes a zero-value ``ANCHOR``.
         The spend is booked whatever the scope's state: what it pays for has
         already happened. An overdraw trips the breaker, as a capture's does,
-        and is recorded rather than raised.
+        and is recorded rather than raised. Settling against an open hold at
+        exactly what is left exhausts the scope, as a capture does
+        (:attr:`GovernancePolicy.trip_on_exhaustion`); a claim with no open
+        hold does not.
 
         Idempotent and safe to race: under the writer lock, a claim another
         governor has booked is gone, and booking one twice is refused by the

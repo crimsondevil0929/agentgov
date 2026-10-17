@@ -220,6 +220,29 @@ def test_hitting_the_exact_limit_trips_the_breaker_and_halts(
     gov.verify_integrity()
 
 
+def test_exhaustion_trips_on_the_settlement_not_the_hold_or_money_moved_out(
+    gov: BudgetManager,
+) -> None:
+    """A hold on the last of the balance is outstanding, not spent: the
+    capture that settles it exhausts the scope. Delegating or releasing a
+    scope's last cent spends nothing, and trips nothing."""
+    gov.delegate("root", "worker", money("0.10"))
+    auth = gov.authorize("worker", money("0.10"))
+    assert gov.available("worker") == ZERO
+    assert not gov.is_halted("worker")
+    gov.capture(auth, money("0.10"))
+    assert gov.is_halted("worker")
+
+    gov.delegate("root", "parent", money("0.10"))
+    gov.delegate("parent", "child", money("0.10"))
+    gov.delegate("root", "returner", money("0.10"))
+    gov.release("returner")
+    assert gov.available("parent") == gov.available("returner") == ZERO
+    assert not gov.is_halted("parent")
+    assert not gov.is_halted("returner")
+    gov.verify_integrity()
+
+
 def test_overdrawing_raises_denial_of_wallet_and_moves_no_money(
     gov: BudgetManager,
 ) -> None:

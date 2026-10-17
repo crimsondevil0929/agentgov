@@ -315,6 +315,18 @@ def test_a_claim_that_spends_its_hold_to_zero_exhausts_the_scope(
         reader.verify_integrity()
 
 
+def test_a_claim_with_no_open_hold_that_spends_the_scope_to_zero_does_not_trip(
+    gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    """Exhaustion trips on settling a hold. A claim with none books its
+    spend and leaves the scope running at zero; only an overdraw halts it."""
+    claim = commit_claim(gov, caller, "2.00")
+    (spend,) = gov.redeem(claim)
+    assert spend.balance_after == money("0")
+    assert not gov.is_halted("agent")
+    gov.verify_integrity()
+
+
 def test_governors_racing_to_redeem_book_each_claim_once(
     pg_dsn: str, gov: BudgetManager, caller_role: str
 ) -> None:
