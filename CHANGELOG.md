@@ -122,7 +122,7 @@ lists everything that needs attention.
 
 - `tests/test_model.py` runs every operation against a reference model under
   hostile decimal contexts, injected write failures, reopens and checkpoints.
-- `scripts/mutate.py` makes 3,755 small changes to the rule engine,
+- `scripts/mutate.py` makes 3,762 small changes to the rule engine,
   checkpoints, the auditor, both stores, the write path and the receipts code
   (`mutation/*.json`), and every one of them is caught by a test or justified by
   name as changing nothing a test can observe (185: read-ahead and
