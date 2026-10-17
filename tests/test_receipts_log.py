@@ -381,6 +381,9 @@ def test_a_torn_final_line_is_cut_off(tmp_path: Path, caplog: pytest.LogCaptureF
         (b"one\ntorn", 4),
         (b"\n" + b"x" * 65536, 1),  # the newline is in the second read back from the end
     ],
+    # Short: pytest puts a test's id in an environment variable, which on
+    # Windows holds at most 32,767 characters.
+    ids=["empty", "newline", "torn", "line-then-torn", "newline-a-read-back"],
 )
 def test_the_complete_part_of_a_file_ends_at_its_last_newline(
     tmp_path: Path, data: bytes, length: int

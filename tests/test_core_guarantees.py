@@ -1805,6 +1805,9 @@ def test_a_store_image_is_one_consistent_read(tmp_path: Path) -> None:
     original.close()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows refuses to replace a file another handle has open"
+)
 def test_refresh_is_exposed_on_the_raw_ledger_file_too(tmp_path: Path) -> None:
     """``os.replace`` of the whole file is not something a reader can follow;
     it must keep serving what it verified rather than something it did not."""
