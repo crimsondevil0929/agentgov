@@ -139,10 +139,9 @@ uv run agentgov verify /tmp/agentgov-demo/governor.db
    making. "Fixes a bug" is not enough context to review a change to a
    double-entry ledger.
 6. **CI must pass.** The workflow in `.github/workflows/ci.yml` runs the
-   full lint/type/test/coverage gate on Python 3.11 to 3.14, on Linux and
-   macOS, on free-threaded 3.14t, against PostgreSQL 14, 16, 17 and 18 and
-   behind PgBouncer, plus the demo scripts end to end; Windows is reported,
-   not yet required.
+   full lint/type/test/coverage gate on Python 3.11 to 3.14, on Linux,
+   macOS and Windows, on free-threaded 3.14t, against PostgreSQL 14, 16, 17
+   and 18 and behind PgBouncer, plus the demo scripts end to end.
 
 ## Reporting bugs and requesting features
 

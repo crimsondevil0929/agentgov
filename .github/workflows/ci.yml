@@ -22,21 +22,16 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
         os: [ubuntu-latest]
-        experimental: [false]
         include:
           # The advisory lock, the reaped worker thread, and the subprocess
           # restart tests are all OS-dependent. Cover a second platform on the
           # current Python so a macOS-only or Linux-only regression is caught.
           - python-version: "3.12"
             os: macos-latest
-            experimental: false
-          # Windows takes the advisory lock with msvcrt rather than fcntl. It
-          # reports without failing the build until it has run green once;
-          # then drop `experimental` here.
+          # Windows takes the advisory lock with msvcrt rather than fcntl, and
+          # its clocks are coarser before Python 3.13.
           - python-version: "3.12"
             os: windows-latest
-            experimental: true
-    continue-on-error: ${{ matrix.experimental }}
     defaults:
       run:
         shell: bash
