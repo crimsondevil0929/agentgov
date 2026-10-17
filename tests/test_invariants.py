@@ -225,7 +225,9 @@ def test_the_velocity_window_slides(gov: BudgetManager) -> None:
     for _ in range(2):
         for _ in range(3):
             fast.void(fast.authorize("root", money("0.01")))
-        time.sleep(0.06)
+        # Past the window by more than one tick of a coarse monotonic clock
+        # (15.6 ms on Windows before Python 3.13).
+        time.sleep(0.08)
 
     assert not fast.is_halted("root")
     fast.verify_integrity()
