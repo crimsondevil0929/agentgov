@@ -216,7 +216,9 @@ class _Clock:
 
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -698,14 +700,14 @@ def generate(out: Path) -> None:
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    (out / "README.md").write_text(_README, encoding="utf-8")
+    (out / "README.md").write_text(_README, encoding="utf-8", newline="\n")
     keys = out / "keys"
     keys.mkdir()
-    (keys / "issuer.pub").write_text(issuer.public_key().spec() + "\n")
-    (keys / "issuer.seed").write_text(seed("issuer").hex() + "\n")
-    (keys / "witness.pub").write_text(witness_key.public_key().spec() + "\n")
-    (keys / "witness.seed").write_text(seed("witness").hex() + "\n")
-    (keys / "internal.hmac").write_text(internal.spec() + "\n")
+    (keys / "issuer.pub").write_text(issuer.public_key().spec() + "\n", newline="\n")
+    (keys / "issuer.seed").write_text(seed("issuer").hex() + "\n", newline="\n")
+    (keys / "witness.pub").write_text(witness_key.public_key().spec() + "\n", newline="\n")
+    (keys / "witness.seed").write_text(seed("witness").hex() + "\n", newline="\n")
+    (keys / "internal.hmac").write_text(internal.spec() + "\n", newline="\n")
 
     _write_json(out / "canonical.json", _canonical_vectors())
     _write_json(out / "merkle.json", _merkle_vectors())
@@ -891,9 +893,12 @@ def generate(out: Path) -> None:
     (invalid / "duplicate-key.bundle.json").write_text(
         text.replace('"v": "ARC1-bundle",', '"v": "ARC1-bundle",\n  "v": "ARC1-bundle",', 1),
         encoding="utf-8",
+        newline="\n",
     )
     (invalid / "float-amount.bundle.json").write_text(
-        text.replace('"settled_usd": "0.00549500"', '"settled_usd": 0.005495', 1), encoding="utf-8"
+        text.replace('"settled_usd": "0.00549500"', '"settled_usd": 0.005495', 1),
+        encoding="utf-8",
+        newline="\n",
     )
     unknown = json.loads(json.dumps(good))
     unknown["receipt"]["effect"]["confidence"] = "high"
@@ -915,8 +920,8 @@ def _v12_vectors(
     successor = Ed25519Signer(seed("issuer 2"))
     keys = out / "keys"
     keys.mkdir(parents=True)
-    (keys / "issuer-2.pub").write_text(successor.public_key().spec() + "\n")
-    (keys / "issuer-2.seed").write_text(seed("issuer 2").hex() + "\n")
+    (keys / "issuer-2.pub").write_text(successor.public_key().spec() + "\n", newline="\n")
+    (keys / "issuer-2.seed").write_text(seed("issuer 2").hex() + "\n", newline="\n")
     drafts = [
         replace(draft, receipt_id=_uuid(f"receipt:v12:{n}"))
         for n, (_, draft, _) in enumerate(scenarios[:5])
@@ -1004,8 +1009,8 @@ def _delivery_vectors(
     relay = Ed25519Signer(seed("relay"))
     keys = out / "keys"
     keys.mkdir(parents=True)
-    (keys / "relay.pub").write_text(relay.public_key().spec() + "\n")
-    (keys / "relay.seed").write_text(seed("relay").hex() + "\n")
+    (keys / "relay.pub").write_text(relay.public_key().spec() + "\n", newline="\n")
+    (keys / "relay.seed").write_text(seed("relay").hex() + "\n", newline="\n")
     _write_json(out / "payload.json", _REFUND_PAYLOAD)
 
     payload_hash = hashlib.sha256(canonical_bytes(_REFUND_PAYLOAD)).hexdigest()

@@ -473,8 +473,8 @@ def generate(out: Path) -> None:
     try:
         for name, content in files.items():
             text = json.dumps(content, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
-            (staging / name).write_text(text, encoding="utf-8")
-        (staging / "README.md").write_text(_README, encoding="utf-8")
+            (staging / name).write_text(text, encoding="utf-8", newline="\n")
+        (staging / "README.md").write_text(_README, encoding="utf-8", newline="\n")
         if out.exists():
             shutil.rmtree(out)
         out.mkdir(parents=True)
