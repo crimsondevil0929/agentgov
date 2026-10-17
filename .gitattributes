@@ -1,0 +1,4 @@
+# Text files check out LF everywhere, Windows included: the ARC1 and AGOV
+# vectors, receipt logs and fixtures are compared byte for byte.
+* text=auto eol=lf
+*.db binary
