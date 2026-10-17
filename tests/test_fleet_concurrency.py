@@ -387,7 +387,8 @@ def _die_holding_the_lock(dsn: str, written: Event, die: Event) -> None:
         original(batch)  # written into the transaction, which holds the lock
         written.set()
         die.wait(60)
-        os.kill(os.getpid(), signal.SIGKILL)
+        if sys.platform != "win32":  # Windows has no SIGKILL; the test is skipped there
+            os.kill(os.getpid(), signal.SIGKILL)
 
     store.commit = commit_then_die  # type: ignore[method-assign]
     governor.spend("agent", "1.50")
@@ -424,7 +425,8 @@ def test_a_governor_killed_holding_the_lock_frees_it_and_leaves_nothing(pg_dsn: 
     finally:
         die.set()
         child.join(30)
-    assert child.exitcode == -signal.SIGKILL
+    if sys.platform != "win32":  # as the mark says, in a form mypy reads too
+        assert child.exitcode == -signal.SIGKILL
 
     with BudgetManager.open_postgres(pg_dsn, lock_timeout=10) as survivor:
         assert survivor.ledger.entries() == before, "nothing the dead governor wrote landed"
