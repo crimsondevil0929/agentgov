@@ -402,7 +402,9 @@ class _AdvisoryLock:
     The lock is held by an open file descriptor, which means the kernel
     releases it when the holding process exits — including on ``SIGKILL``.
     A crashed governor therefore leaves a stale *file* but never a stale
-    *lock*, so no timeout heuristic or manual cleanup is needed.
+    *lock*, so no timeout heuristic or manual cleanup is needed. (Windows
+    releases a dead process's lock a moment after it exits, not with the
+    exit: an open in that moment is refused, and the next one succeeds.)
 
     The holder writes its identity into the file so the next process can say
     who is holding it, not merely that someone is.

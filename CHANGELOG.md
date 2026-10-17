@@ -110,6 +110,10 @@ lists everything that needs attention.
   is now served on a hold the chain holds open.
 - A repair of an authorization row that misstated its hold's scope or amount
   deleted the row and then failed; its hold is now given a fresh authorization.
+- On Windows, a governor refused a ledger another process held could not say
+  which: the claim locked the byte the holder's identity is written to, and
+  Windows locks keep every other handle from reading a locked byte. Windows now
+  runs the whole suite in CI.
 
 ### Security
 

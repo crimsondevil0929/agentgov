@@ -687,7 +687,9 @@ A second process, a second gunicorn worker or a second replica, is refused *at o
 with a `ConcurrentGovernorError` naming the PID that holds it, because two writers would
 each cache authoritative balances in memory and diverge. The lock is an open file
 descriptor, so the kernel releases it even on `SIGKILL`: a crashed governor leaves a
-stale file but never a stale lock, and there is no timeout heuristic to get wrong. To
+stale file but never a stale lock, and there is no timeout heuristic to get wrong.
+(Windows releases a dead process's lock a moment after it exits, so an open in that
+moment is refused, and a retry opens.) To
 inspect a ledger another process is governing, open it read-only:
 
 <!-- readme-test: continue -->
