@@ -53,15 +53,51 @@ def canonical_bytes(value: object) -> bytes:
         ARC1 value domain: a float, an integer beyond the safe range, a
         non-string object key, a lone surrogate, or any other type.
     """
-    out: list[str] = []
-    _encode(value, out, "$")
     try:
-        return "".join(out).encode("utf-8")
+        ordered = _ordered(value)
+    except _OutsideDomainError:
+        _encode(value, [], "$")  # raises, naming where
+        raise AssertionError("unreachable") from None  # pragma: no cover
+    # Within the domain, the C encoder writes exactly what _encode would: the
+    # same string escapes, int.__repr__ for integers, keys in the order given.
+    text = json.dumps(ordered, ensure_ascii=False, separators=(",", ":"), check_circular=False)
+    try:
+        return text.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise MalformedReceiptError(
             f"a string is not valid Unicode (lone surrogate at offset {exc.start}); "
             f"canonical JSON is defined over Unicode text only"
         ) from exc
+
+
+class _OutsideDomainError(Exception):
+    """A value :func:`_ordered` cannot pass on; :func:`_encode` says why."""
+
+
+def _ordered(value: object) -> object:
+    """``value`` checked against the domain, every object rebuilt with its keys
+    in UTF-16 order, ready for ``json.dumps``. Raises :class:`_OutsideDomainError`
+    on anything :func:`_encode` would refuse."""
+    # The same tests, in the same order, as _encode.
+    if value is None or value is True or value is False or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        if not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
+            raise _OutsideDomainError
+        return value
+    if isinstance(value, Mapping):
+        keys = list(value)
+        if not all(isinstance(key, str) for key in keys):
+            raise _OutsideDomainError
+        # Code point order is UTF-16 order for ASCII; otherwise compare units.
+        if all(key.isascii() for key in keys):
+            keys.sort()
+        else:
+            keys.sort(key=_utf16_order)
+        return {key: _ordered(value[key]) for key in keys}
+    if isinstance(value, (list, tuple)):
+        return [_ordered(item) for item in value]
+    raise _OutsideDomainError
 
 
 def _encode(value: object, out: list[str], path: str) -> None:

@@ -46,6 +46,7 @@ from agentgov.receipts import (
     verify_consistency,
     verify_inclusion,
 )
+from agentgov.receipts._leaves import complete_length
 from agentgov.receipts.schema import Signature
 
 VECTORS = Path(__file__).resolve().parent.parent / "vectors" / "arc1"
@@ -225,7 +226,7 @@ def test_the_policy_publishes_after_every_n_receipts(tmp_path: Path) -> None:
         LOG_ID,
         LOG_KEY,
         witnesses=[witness],
-        policy=CheckpointPolicy(every_receipts=3, every_seconds=10**9),
+        policy=CheckpointPolicy(every_receipts=3, every_seconds=10**9, background=False),
         clock=Clock(),
     ) as receipt_log:
         for i in range(7):
@@ -240,7 +241,9 @@ def test_the_policy_publishes_when_a_receipt_arrives_late(
     now = [1000.0]
     monkeypatch.setattr("agentgov.receipts.log.time", SimpleNamespace(monotonic=lambda: now[0]))
     with ReceiptLog(
-        LOG_ID, LOG_KEY, policy=CheckpointPolicy(every_receipts=100, every_seconds=60)
+        LOG_ID,
+        LOG_KEY,
+        policy=CheckpointPolicy(every_receipts=100, every_seconds=60, background=False),
     ) as receipt_log:
         receipt_log.issue(draft(0))
         now[0] += 59
@@ -304,7 +307,7 @@ def test_bundle_refuses_a_checkpoint_that_is_not_this_logs(log: ReceiptLog) -> N
 
 def test_a_durable_log_resumes_exactly(tmp_path: Path) -> None:
     path = tmp_path / "receipts.jsonl"
-    policy = CheckpointPolicy(every_receipts=3, every_seconds=10**9)
+    policy = CheckpointPolicy(every_receipts=3, every_seconds=10**9, background=False)
     with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=policy, clock=Clock()) as first:
         issued = [first.issue(draft(i)) for i in range(4)]
         root, checkpoints = first.root(), first.checkpoints()
@@ -369,6 +372,30 @@ def test_a_torn_final_line_is_cut_off(tmp_path: Path, caplog: pytest.LogCaptureF
         assert len(reopened) == 4
 
 
+@pytest.mark.parametrize(
+    ("data", "length"),
+    [
+        (b"", 0),
+        (b"\n", 1),
+        (b"torn", 0),
+        (b"one\ntorn", 4),
+        (b"\n" + b"x" * 65536, 1),  # the newline is in the second read back from the end
+    ],
+    # Short: pytest puts a test's id in an environment variable, which on
+    # Windows holds at most 32,767 characters.
+    ids=["empty", "newline", "torn", "line-then-torn", "newline-a-read-back"],
+)
+def test_the_complete_part_of_a_file_ends_at_its_last_newline(
+    tmp_path: Path, data: bytes, length: int
+) -> None:
+    path = tmp_path / "receipts.jsonl"
+    path.write_bytes(data)
+    assert complete_length(path, repair=False) == length
+    assert path.read_bytes() == data, "without repair the file is left as it is"
+    assert complete_length(path, repair=True) == length
+    assert path.read_bytes() == data[:length]
+
+
 def test_a_failed_write_leaves_no_torn_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -380,7 +407,7 @@ def test_a_failed_write_leaves_no_torn_line(
     def failing_fsync(fd: int) -> None:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr("agentgov.receipts.log.os.fsync", failing_fsync)
+    monkeypatch.setattr("agentgov.receipts._leaves.os.fsync", failing_fsync)
     with pytest.raises(OSError, match="No space"):
         receipt_log.issue(draft(1))
     assert path.read_bytes() == intact and len(receipt_log) == 1
@@ -434,6 +461,19 @@ def test_an_edited_receipt_after_the_last_checkpoint_is_caught_by_its_signature(
         _reopen(path)
 
 
+def test_a_receipt_signed_elsewhere_is_left_to_its_own_key_at_reopen(tmp_path: Path) -> None:
+    """Reopening re-verifies the receipts the log signed since its newest
+    checkpoint. One another party signed and the log appended is not the
+    log's to check: its key is not the log's, and the reopen goes on."""
+    path = tmp_path / "receipts.jsonl"
+    elsewhere = draft(1).with_log_anchor(LOG_ID, 1).sign(ATTACKER)
+    with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=NEVER) as receipt_log:
+        receipt_log.issue(draft(0))
+        receipt_log.append(elsewhere)
+    with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=NEVER) as reopened:
+        assert reopened.receipts()[1] == elsewhere
+
+
 def test_swapped_lines_do_not_reopen(tmp_path: Path) -> None:
     path = _durable_log(tmp_path)
     lines = path.read_bytes().splitlines()
@@ -465,6 +505,27 @@ def test_a_checkpoint_the_log_did_not_sign_does_not_reopen(tmp_path: Path) -> No
     forged = checkpoint.sign(ATTACKER)
     checkpoints.write_bytes(canonical_bytes(forged.to_json()) + b"\n")
     with pytest.raises(ReceiptLogError, match=r"checkpoints line 1: .*key"):
+        _reopen(path)
+
+
+def test_a_forged_older_checkpoint_stops_the_log_at_its_line(tmp_path: Path) -> None:
+    """Reopening checks the newest checkpoint in full and every older one's
+    signature, which costs a signature per many receipts: a forged one is
+    refused at its line, as it was before the log kept an index."""
+    path = tmp_path / "receipts.jsonl"
+    with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=NEVER, clock=Clock()) as receipt_log:
+        for i in range(6):
+            receipt_log.issue(draft(i))
+            if i in (1, 3, 5):
+                receipt_log.checkpoint()
+    checkpoints = tmp_path / "receipts.jsonl.checkpoints"
+    lines = checkpoints.read_bytes().splitlines(keepends=True)
+    assert len(lines) == 3
+    forged = loads_strict(lines[1])
+    forged["sig"]["signature"] = bytes(64).hex()  # the same length: the file's size is unchanged
+    lines[1] = canonical_bytes(forged) + b"\n"
+    checkpoints.write_bytes(b"".join(lines))
+    with pytest.raises(ReceiptLogError, match=r"\.checkpoints line 2: .*signature"):
         _reopen(path)
 
 
@@ -635,7 +696,7 @@ def test_a_failed_automatic_checkpoint_does_not_unissue_the_receipt(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = tmp_path / "receipts.jsonl"
-    every = CheckpointPolicy(every_receipts=1, every_seconds=10**9)
+    every = CheckpointPolicy(every_receipts=1, every_seconds=10**9, background=False)
     with ReceiptLog(LOG_ID, LOG_KEY, path=path, policy=every, clock=Clock()) as rlog:
         blocker = tmp_path / "receipts.jsonl.checkpoints"
         blocker.mkdir()  # the checkpoint cannot be written
@@ -659,7 +720,7 @@ def test_a_refused_automatic_publish_does_not_unissue_the_receipt(
         LOG_ID,
         LOG_KEY,
         witnesses=[stale],
-        policy=CheckpointPolicy(every_receipts=1, every_seconds=10**9),
+        policy=CheckpointPolicy(every_receipts=1, every_seconds=10**9, background=False),
     ) as rlog:
         with caplog.at_level(logging.ERROR, logger="agentgov.receipts"):
             receipt = rlog.issue(draft(0))

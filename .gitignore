@@ -29,6 +29,8 @@ demo/
 *.db.lock
 *.sqlite
 *.sqlite3
+# ...except the ledgers released versions wrote, which the upgrade tests open
+!tests/fixtures/upgrades/*.db
 
 # Python build and bytecode
 __pycache__/
@@ -66,3 +68,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Benchmark fixtures and local results (benchmarks/baseline/ is committed)
+benchmarks/.fixtures/
+benchmarks/results/
+.hypothesis/

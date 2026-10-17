@@ -1,8 +1,10 @@
 # ARC1: verifiable action receipts
 
-**Status:** draft 1.1 (`agentgov.receipts`, from agentgov 0.4.0). Version 1.1
-adds delivery receipts and relay attestations (section 13); every version 1.0
-document, signature, leaf and root is unchanged, and means what it meant.
+**Status:** draft 1.2 (`agentgov.receipts`, from agentgov 1.0). Version 1.2
+adds signature version 2, which signs a digest (section 4.5), and key
+transitions, by which a log outlives its key (section 14). Version 1.1 added
+delivery receipts and relay attestations (section 13). Every version 1.0 and
+1.1 document, signature, leaf and root is unchanged, and means what it meant.
 Every ARC1 document names its version in its `v` field, and every signature
 names its document type in a domain string. A breaking change will get a new
 version. ARC1 documents will never be reinterpreted.
@@ -41,6 +43,7 @@ against them.
 - [11. Test vectors](#11-test-vectors)
 - [12. Security considerations](#12-security-considerations)
 - [13. Delivery receipts (1.1)](#13-delivery-receipts-11)
+- [14. Key transitions (1.2)](#14-key-transitions-12)
 
 ## 1. What a receipt proves
 
@@ -181,10 +184,55 @@ The verifier supplies the key it trusts, and the key decides the algorithm.
 The document never does. A signature verifies only if:
 - `sig.alg` equals the key's algorithm;
 - `sig.key_id` equals the key's id;
-- the signature is valid over the signing input.
+- the signature is valid over the signing input of its version (section 4.1,
+  or 4.5 when `sig.sv` is 2).
 
 A document signed with an HMAC "keyed" with the issuer's *public* Ed25519 key
 therefore fails on the first rule. That is the vector case `alg-confusion`.
+
+A verifier may hold several keys: a keyring, by key id. It checks each
+signature under the key its `key_id` names, if it holds that key; a log's key
+transitions (section 14) further limit each key to its era.
+
+### 4.5 Signature version 2 (1.2)
+
+A key service may limit what it signs. AWS KMS signs at most 4096 bytes, and
+a receipt with a few more effects or checkers than the vectors' is larger.
+A signature of version 2 signs a digest of the document instead:
+
+```
+signing_input_v2 = DOMAIN_V2 || SHA-512(canonical(document with
+                     sig = {"alg": alg, "key_id": key_id, "sv": 2}))
+```
+
+and its `sig` names the version:
+
+```json
+"sig": {"alg": "ed25519", "key_id": "bcc542d53c8c1a1f", "sv": 2, "signature": "<hex>"}
+```
+
+| Document | `DOMAIN_V2` |
+|---|---|
+| receipt | `ARC1/receipt/v2\n` |
+| delivery receipt | `ARC1/delivery/v2\n` |
+| attestation | `ARC1/attestation/v2\n` |
+| checkpoint | `ARC1/checkpoint/v2\n` |
+| cosignature | `ARC1/cosignature/v2\n` |
+| key transition | `ARC1/transition/v2\n` |
+
+- The signed message is at most 84 bytes, whatever the document's size.
+- It is signed with pure Ed25519 (or HMAC-SHA256), never Ed25519ph. An AWS KMS
+  key (`ECC_NIST_EDWARDS25519`) signs it as `ED25519_SHA_512` with
+  `MessageType` `RAW`. Its `ED25519_PH_SHA_512` mode is Ed25519ph, whose
+  signatures do not verify as Ed25519.
+- `sv` is inside the signed header. A version 2 signature presented as version
+  1, or the reverse, does not verify (vector `v12-downgraded`).
+- A `sig` object has either exactly the three members of section 4.1
+  (version 1) or exactly four, with `"sv": 2`. Any other `sv` is malformed
+  (vector `v12-unknown-version`). A 1.0 or 1.1 verifier refuses a version 2
+  signature as an unknown member, rather than misreading it.
+- An issuer signs version 1 unless its signer or its operator asks for
+  version 2. A 1.2 verifier verifies both.
 
 ## 5. The receipt
 
@@ -363,8 +411,8 @@ audit path to the new position (the vector case `leaf-moved`). A log accepts a
 receipt only at the index it names, and accepts each `receipt_id` once.
 
 The reference log stores one canonical receipt per line in a JSON-lines file,
-and its checkpoints in `<file>.checkpoints`, forcing each line to disk before
-acknowledging it. The byte-exact lines are the leaves, so recomputing the log
+its checkpoints in `<file>.checkpoints`, and its key transitions (section 14)
+in `<file>.transitions`, forcing each line to disk before acknowledging it. The byte-exact lines are the leaves, so recomputing the log
 needs nothing but SHA-256. `vectors/arc1/log/` is such a log.
 
 ### 7.2 The tree
@@ -468,6 +516,7 @@ its command line is `agentgov verify-receipt`.
 | # | Check | Passes when | Needs | Fails with |
 |---|---|---|---|---|
 | 1 | ARC1 schema | the bundle, and everything in it, decodes strictly (sections 2, 3, 5, 9) | the bundle | 3 `MALFORMED` (the only check that stops the others) |
+| 1a | key transitions | section 14.2, from the log's key (the issuer's by default); then checks 2 and 3 use the key in force for the receipt's leaf and the checkpoint's size | the log's transitions | 4 `SIGNATURE` |
 | 2 | receipt signature | section 4.4, over the receipt | the issuer's key | 4 `SIGNATURE` |
 | 3 | log inclusion | the checkpoint verifies under the log's key; the receipt's `anchors.log` names the checkpoint's `log_id` and the proof's `leaf_index`; the proof's `tree_size` is the checkpoint's; the audit path leads from the receipt's leaf hash to `root_hash` | a bundle with a checkpoint; the log's key (the issuer's by default) | 5 `INCLUSION` |
 | 4 | witnessed | section 8, for the bundle's checkpoint | the witness's cosignature file and key | 6 `WITNESS` |
@@ -481,8 +530,9 @@ the order. For example, a malformed witness file fails check 4 with
 bad input further down the list.
 
 ```console
-$ agentgov verify-receipt BUNDLE --pubkey KEY
-      [--log-pubkey KEY]                     # when the log signs with its own key
+$ agentgov verify-receipt BUNDLE --pubkey KEY [--pubkey KEY ...]
+      [--log-pubkey KEY ...]                 # when the log signs with its own key
+      [--transitions FILE]                   # the log's key transitions (section 14)
       [--witness FILE --witness-pubkey KEY]  # the witness's cosignatures, and its key
       [--ledger DB]                          # an AgentGov SQLite ledger, opened read-only
       [--rows FILE]                          # an ARC1-rows disclosure
@@ -491,7 +541,8 @@ $ agentgov verify-receipt BUNDLE --pubkey KEY
       [--json]                               # the report as JSON
 ```
 
-A `KEY` is a key spec (section 4.3) or a file holding one. The exit code is 0
+A `KEY` is a key spec (section 4.3) or a file holding one. Repeating a key
+option gives a keyring (section 4.4). The exit code is 0
 when every requested check passes. Otherwise it is the first failure's code
 (3 to 10), or 2 for a usage error or a file that cannot be read. A delivery
 receipt is verified as section 13.5 describes.
@@ -503,7 +554,8 @@ receipt is verified as section 13.5 describes.
 The test suite regenerates it on every run and fails if a byte differs. See
 its [README](../vectors/arc1/README.md) for the layout. `manifest.json` lists
 every command-line case with its expected exit code, which makes it a
-conformance suite for any other verifier.
+conformance suite for any other verifier. `v12/` holds the 1.2 cases: a log
+signed at version 2 throughout, whose key hands it to a successor at size 3.
 
 ## 12. Security considerations
 
@@ -515,7 +567,9 @@ conformance suite for any other verifier.
   key option also accepts the path of a file that holds the key.
 - **Trust comes from the key the verifier supplies.** A `key_id` is a label.
   The verifier never takes the algorithm or the key from the document
-  (section 4.4).
+  (section 4.4). A key transition extends that trust forward, never back.
+- **A key service's limit is not a reason to sign less.** Sign version 2
+  (section 4.5) rather than leaving fields out of a receipt to fit.
 - **Clocks.** `issued_at` is the issuer's claim. A witness cosignature bounds
   it from above: the receipt existed no later than the `witnessed_at` of the
   first cosigned checkpoint that covers it.
@@ -663,3 +717,65 @@ A delivery bundle is verified in this order:
 - **Undelivered requests.** A log records the deliveries its issuer saw. A
   request committed and never delivered has an action receipt and no
   delivery receipt; comparing the two is how it is found.
+
+## 14. Key transitions (1.2)
+
+A log is signed by one key at a time, and outlives each of them. A **key
+transition** (`v: "ARC1-transition"`) is signed by the log's outgoing key and
+hands the log to its incoming key:
+
+| Field | Type |
+|---|---|
+| `v` | `"ARC1-transition"` |
+| `log_id` | *text* |
+| `tree_size` | *int*: the size at which the incoming key takes over |
+| `incoming` | `{alg, key_id, public_key}` |
+| `issued_at` | *instant* |
+| `sig` | object (section 4.1 or 4.5) by the outgoing key, domain `ARC1/transition/v1\n` (`ARC1/transition/v2\n` at version 2) |
+
+`incoming.alg` is `ed25519` or `hmac-sha256`, and `incoming.key_id` is the
+incoming key's id (section 4.3). An Ed25519 key is named by its public key, 64
+*hex* characters in `public_key`, and `key_id` must be that key's id. An HMAC
+key is never published: `public_key` is `null`, and a verifier must already
+hold the secret.
+
+### 14.1 Eras
+
+A transition at size *S* divides the log. Leaves 0 to *S* − 1, and
+checkpoints of size up to *S*, are the outgoing key's. Leaves from *S* on, and
+checkpoints larger than *S*, are the incoming key's. Before the transition,
+the reference log has the outgoing key sign a checkpoint at *S* if it has none
+there, so every leaf of that key's era is under one of its own checkpoints.
+
+### 14.2 Following transitions
+
+A verifier that trusts a key *K* of log *L*, and holds *L*'s transitions
+*T1* … *Tn* in order, follows them:
+
+1. *T1* verifies under *K* (section 4.4).
+2. Each *Tj* is for *L*, at a size no smaller than *T(j−1)*'s, and verifies
+   under the key *T(j−1)* handed the log to.
+3. An HMAC incoming key is one the verifier holds.
+
+The key in force for leaf *i* is then the incoming key of the last *Tj* whose
+`tree_size` ≤ *i*, or *K* if there is none. For a checkpoint of size *n*, it
+is the incoming key of the last *Tj* whose `tree_size` < *n*, or *K*. Every
+signature must be by the key in force for its position. A key outside its era
+signs nothing that counts, even a key the verifier trusts (vector
+`v12-old-key-past-its-era`).
+
+Without transitions, a verifier checks each signature under any key it holds
+(section 4.4): it may simply trust a key and its successor (vector
+`v12-late-both-keys`).
+
+### 14.3 Security considerations
+
+- **A transition delegates forward.** Whoever holds the key in force can hand
+  the log to a key of their choosing, so a transition is no defense against
+  theft of the current key. A witness is: two transitions of one log at one
+  size, or two keys' checkpoints at one size, are a split view.
+- **Rotate while the outgoing key can still sign.** A transition needs the
+  outgoing key's signature. A key that is lost or disabled cannot hand the log
+  over; verifiers must then be given the new key outright, or the log starts
+  again under a new `log_id`.
+

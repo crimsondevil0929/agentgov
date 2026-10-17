@@ -25,18 +25,26 @@ it, and every rate is a :class:`~decimal.Decimal`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, Decimal, localcontext
 from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Any, Final, Generic, Self, TypeVar
 
 from agentgov.cognitive import CognitiveBreaker
-from agentgov.core import QUANTUM, Authorization, BudgetManager, LedgerEntry, money
+from agentgov.core import (
+    _ROUNDING,
+    QUANTUM,
+    Authorization,
+    BudgetManager,
+    LedgerEntry,
+    money,
+)
 
 if TYPE_CHECKING:
     # Imported lazily at call time in stream()/astream(): streaming
@@ -220,13 +228,16 @@ class ModelPricing:
         :param usage: The token counts to price.
         :returns: The cost in USD, quantized to :data:`~agentgov.core.QUANTUM`.
         """
-        raw = (
-            self.input_usd_per_mtok * usage.input_tokens
-            + self.output_usd_per_mtok * usage.output_tokens
-            + self.cache_read_usd_per_mtok * usage.cache_read_input_tokens
-            + self.cache_write_usd_per_mtok * usage.cache_creation_input_tokens
-        ) / _PER_MILLION
-        return raw.quantize(QUANTUM, rounding=ROUND_CEILING)
+        # The ledger's rounding context, never the calling thread's: a host
+        # that lowered its own precision must not change what a call costs.
+        with localcontext(_ROUNDING):
+            raw = (
+                self.input_usd_per_mtok * usage.input_tokens
+                + self.output_usd_per_mtok * usage.output_tokens
+                + self.cache_read_usd_per_mtok * usage.cache_read_input_tokens
+                + self.cache_write_usd_per_mtok * usage.cache_creation_input_tokens
+            ) / _PER_MILLION
+            return raw.quantize(QUANTUM, rounding=ROUND_CEILING)
 
     def estimate(self, input_tokens: int, max_output_tokens: int) -> Decimal:
         """Compute a worst-case pre-flight cost for an authorization hold.
@@ -259,8 +270,8 @@ def _rates(
         model_id=model_id,
         input_usd_per_mtok=inp,
         output_usd_per_mtok=Decimal(output_rate),
-        cache_read_usd_per_mtok=Decimal(cache_read) if cache_read else inp / 10,
-        cache_write_usd_per_mtok=inp * Decimal("1.25"),
+        cache_read_usd_per_mtok=Decimal(cache_read) if cache_read else _ROUNDING.divide(inp, 10),
+        cache_write_usd_per_mtok=_ROUNDING.multiply(inp, Decimal("1.25")),
     )
 
 
@@ -744,7 +755,9 @@ class Interceptor:
         estimate = self._pricing.cost_of(
             TokenUsage(input_tokens=estimate_tokens(text), output_tokens=max_output)
         )
-        buffered = (estimate * self._safety_buffer).quantize(QUANTUM, rounding=ROUND_CEILING)
+        buffered = _ROUNDING.multiply(estimate, self._safety_buffer).quantize(
+            QUANTUM, rounding=ROUND_CEILING, context=_ROUNDING
+        )
         # Never reserve less than the static ceiling would have: the payload
         # heuristic is allowed to raise a hold, not to quietly weaken one.
         return max(buffered, self.hold_amount)
@@ -887,9 +900,15 @@ class Interceptor:
     ) -> MeteredCall[R]:
         """Await ``fn`` under budget enforcement and settle its exact cost.
 
-        The async counterpart of :meth:`invoke`. The governor's mutex is
-        never held across the ``await``, so concurrent tasks contend only for
-        the microseconds each ledger write takes.
+        The async counterpart of :meth:`invoke`. The hold and its settlement
+        are durable ledger writes (an fsync, or database round trips and a
+        lock wait), so both run on a worker thread, never on the event loop:
+        other coroutines keep running while they do. The governor's mutex is
+        never held across the ``await`` of ``fn``.
+
+        A task cancelled while the hold is being placed lets the write finish,
+        then releases the hold, then raises the cancellation; one cancelled
+        during ``fn`` releases the hold, as any exception from ``fn`` does.
 
         :param fn: The awaitable model or tool call to make.
         :param args: Positional arguments forwarded to ``fn``.
@@ -897,15 +916,24 @@ class Interceptor:
         :returns: The response together with its usage, settled cost, and
             ledger entry.
         """
+        from agentgov._aio import off_loop, off_loop_or_undo
+
         self._observe_cognitive(fn, args, kwargs)
         hold = self.size_hold(args, kwargs)
         guard = SpendGuard(self._manager, self._scope_id, hold)
-        with guard:
+        await off_loop_or_undo(
+            guard.__enter__, lambda _: guard.__exit__(asyncio.CancelledError, None, None)
+        )
+        try:
             started = time.perf_counter()
             response = await fn(*args, **kwargs)
             latency = time.perf_counter() - started
             usage, cost, applied = self._price(response)
             guard.settle(cost)
+        except BaseException as exc:
+            await off_loop(guard.__exit__, type(exc), exc, exc.__traceback__)
+            raise
+        await off_loop(guard.__exit__, None, None, None)
         self._record_cognitive_result(response)
         return self._result(response, usage, cost, hold, guard, latency, applied)
 

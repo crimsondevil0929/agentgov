@@ -38,8 +38,8 @@ from agentgov.exceptions import (
 from agentgov.receipts._lines import read_complete_lines
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
 from agentgov.receipts.merkle import verify_consistency
-from agentgov.receipts.schema import Checkpoint, Cosignature
-from agentgov.receipts.signing import Signer, Verifier
+from agentgov.receipts.schema import Checkpoint, Cosignature, _signature_version
+from agentgov.receipts.signing import Keyring, Signer, Verifier, verifier_of
 
 __all__ = ["FileWitness", "Witness", "find_cosignature", "load_cosignatures"]
 
@@ -72,18 +72,33 @@ class FileWitness:
     """A witness that keeps its cosignatures in an append-only file.
 
     :param path: The cosignature file. Existing cosignatures are loaded and
-        verified against ``signer`` first, so the witness resumes where it
-        left off and cannot be tricked by an edited file.
+        verified against ``signer``'s public key first (never by calling the
+        signer), so the witness resumes where it left off and cannot be
+        tricked by an edited file.
     :param signer: The witness's own key.
     :param witness_id: The witness's name.
-    :param logs: The logs this witness will cosign for, and each log's
-        verification key. A checkpoint from any other log is refused.
+    :param logs: The logs this witness will cosign for, and each log's key,
+        or a keyring of its keys: a log whose key was rotated signs its later
+        checkpoints with the new key. A checkpoint from any other log, or
+        signed by a key not held for its log, is refused.
     :param clock: Source of ``witnessed_at``; the current UTC time by default.
     :param fsync: Force every cosignature to stable storage before returning.
+    :param signature_version: 2 signs digests (ARC1 1.2); the signer's own
+        ``signature_version``, or 1, by default.
     :raises WitnessError: If the existing file does not verify.
     """
 
-    __slots__ = ("_clock", "_fsync", "_latest", "_lock", "_logs", "_path", "_signer", "_witness_id")
+    __slots__ = (
+        "_clock",
+        "_fsync",
+        "_latest",
+        "_lock",
+        "_logs",
+        "_path",
+        "_signer",
+        "_version",
+        "_witness_id",
+    )
 
     def __init__(
         self,
@@ -91,14 +106,16 @@ class FileWitness:
         signer: Signer,
         *,
         witness_id: str,
-        logs: Mapping[str, Verifier],
+        logs: Mapping[str, Verifier | Keyring],
         clock: Callable[[], datetime] | None = None,
         fsync: bool = True,
+        signature_version: int | None = None,
     ) -> None:
         self._path = Path(path)
         self._signer = signer
+        self._version = _signature_version(signer, signature_version)
         self._witness_id = witness_id
-        self._logs = dict(logs)
+        self._logs = {log_id: Keyring.of(keys) for log_id, keys in logs.items()}
         self._clock = clock if clock is not None else (lambda: datetime.now(UTC))
         self._fsync = fsync
         self._lock = threading.Lock()
@@ -108,9 +125,10 @@ class FileWitness:
             # torn tail left by a crash mid-append must be truncated now, or
             # the next append would concatenate onto it and corrupt the line
             # that follows.
+            own = verifier_of(signer)
             for cosignature in load_cosignatures(self._path, repair=True):
                 try:
-                    cosignature.verify(signer)
+                    cosignature.verify(own)
                 except ReceiptSignatureError as exc:
                     raise WitnessError(
                         f"{self._path} holds a cosignature this witness did not make: {exc}"
@@ -143,11 +161,11 @@ class FileWitness:
 
     def cosign(self, checkpoint: Checkpoint, proof: Sequence[bytes]) -> Cosignature:
         with self._lock:
-            key = self._logs.get(checkpoint.log_id)
-            if key is None:
+            keys = self._logs.get(checkpoint.log_id)
+            if keys is None:
                 raise WitnessError(f"this witness does not follow log {checkpoint.log_id!r}")
             try:
-                checkpoint.verify(key)
+                checkpoint.verify(keys)
             except ReceiptSignatureError as exc:
                 raise WitnessError(
                     f"refusing a checkpoint not signed by log {checkpoint.log_id!r}: {exc}"
@@ -186,7 +204,7 @@ class FileWitness:
                 tree_size=checkpoint.tree_size,
                 root_hash=checkpoint.root_hash,
                 witnessed_at=self._clock(),
-            ).sign(self._signer)
+            ).sign(self._signer, version=self._version)
             self._append(cosignature)
             self._latest[checkpoint.log_id] = cosignature
             return cosignature
@@ -242,12 +260,15 @@ def load_cosignatures(path: str | Path, *, repair: bool = False) -> tuple[Cosign
 
 
 def find_cosignature(
-    checkpoint: Checkpoint, cosignatures: Sequence[Cosignature], witness_key: Verifier
+    checkpoint: Checkpoint,
+    cosignatures: Sequence[Cosignature],
+    witness_key: Verifier | Keyring,
 ) -> Cosignature:
     """The witness's cosignature of exactly this checkpoint.
 
-    Only cosignatures that verify under ``witness_key`` count; anything else
-    in the file is ignored, so a forged line cannot vouch for a checkpoint.
+    Only cosignatures that verify under ``witness_key`` (or under a key of a
+    keyring of the witness's keys) count; anything else in the file is
+    ignored, so a forged line cannot vouch for a checkpoint.
 
     :raises WitnessError: If the witness never cosigned this checkpoint, or
         cosigned a *different* root at the same size, which proves the log
@@ -277,8 +298,13 @@ def find_cosignature(
             f"the log showed two different histories"
         )
     if match is None:
+        named = (
+            "keys " + ", ".join(sorted(k.key_id for k in witness_key))
+            if isinstance(witness_key, Keyring)
+            else f"key {witness_key.key_id}"
+        )
         raise WitnessError(
-            f"no cosignature from witness key {witness_key.key_id} for log "
+            f"no cosignature from witness {named} for log "
             f"{checkpoint.log_id!r} at size {checkpoint.tree_size}: the checkpoint was never "
             f"witnessed"
         )

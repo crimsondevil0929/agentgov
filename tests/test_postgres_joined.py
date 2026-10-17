@@ -34,7 +34,12 @@ from agentgov.core import (
     WriteBatch,
     money,
 )
-from agentgov.exceptions import LedgerConflictError, StorageError, UnknownScopeError
+from agentgov.exceptions import (
+    LedgerConflictError,
+    LedgerIntegrityError,
+    StorageError,
+    UnknownScopeError,
+)
 from agentgov.postgres import PostgresStore
 
 pytestmark = pytest.mark.usefixtures("pg_dsn")
@@ -46,7 +51,7 @@ PASSWORD = "caller"  # noqa: S105 - a throwaway role in a throwaway database
 def caller_role(pg_admin_dsn: str, pg_dsn: str) -> Iterator[str]:
     """A login role granted joined settlement, and nothing else on the ledger."""
     role = f"caller_{uuid.uuid4().hex[:10]}"
-    with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
+    with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as conn:
         conn.execute(
             sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(PASSWORD)
@@ -61,16 +66,18 @@ def caller_role(pg_admin_dsn: str, pg_dsn: str) -> Iterator[str]:
             store.grant_join(role)
         yield role
     finally:
-        with psycopg.connect(pg_dsn, autocommit=True) as conn:
+        with psycopg.connect(pg_dsn, autocommit=True, prepare_threshold=None) as conn:
             conn.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
-        with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
+        with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as conn:
             conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
 
 
 def open_caller(pg_dsn: str, role: str) -> psycopg.Connection[Any]:
     """The caller's connection, with a REPEATABLE READ transaction open whose
     snapshot is already taken, as an escrow stage's is."""
-    conn = psycopg.connect(make_conninfo(pg_dsn, user=role, password=PASSWORD), autocommit=True)
+    conn = psycopg.connect(
+        make_conninfo(pg_dsn, user=role, password=PASSWORD), autocommit=True, prepare_threshold=None
+    )
     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
     conn.execute("SELECT 1")
     return conn
@@ -279,6 +286,47 @@ def test_a_zero_claim_books_a_zero_value_anchor(
     assert gov.available("agent") == money("2.00")
 
 
+def test_a_zero_claim_on_a_hold_releases_it_and_spends_nothing(
+    gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    hold = gov.authorize("agent", "0.40")
+    claim = commit_claim(gov, caller, "0", hold=hold)
+    (release,) = gov.redeem(claim)
+    assert release.entry_type is EntryType.HOLD_VOID and release.ref == hold.entry.entry_id
+    assert gov.audit_trail("agent")[-1] == release, "no spend after it"
+    assert gov.available("agent") == money("2.00")
+    gov.verify_integrity()
+
+
+def test_a_claim_that_spends_its_hold_to_zero_exhausts_the_scope(
+    pg_dsn: str, gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    """Zero is not an overdraw: a claim that settles the scope's last hold at
+    exactly what is left exhausts it, as a capture does."""
+    hold = gov.authorize("agent", "2.00")
+    claim = commit_claim(gov, caller, "2.00", hold=hold)
+    (spend,) = gov.redeem(claim)
+    assert spend.balance_after == money("0")
+    trip = gov.audit_trail("agent")[-1]
+    assert trip.entry_type is EntryType.CIRCUIT_TRIPPED
+    assert trip.memo == "spend envelope exhausted"
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
+        assert reader.is_halted("agent")
+        reader.verify_integrity()
+
+
+def test_a_claim_with_no_open_hold_that_spends_the_scope_to_zero_does_not_trip(
+    gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    """Exhaustion trips on settling a hold. A claim with none books its
+    spend and leaves the scope running at zero; only an overdraw halts it."""
+    claim = commit_claim(gov, caller, "2.00")
+    (spend,) = gov.redeem(claim)
+    assert spend.balance_after == money("0")
+    assert not gov.is_halted("agent")
+    gov.verify_integrity()
+
+
 def test_governors_racing_to_redeem_book_each_claim_once(
     pg_dsn: str, gov: BudgetManager, caller_role: str
 ) -> None:
@@ -314,9 +362,10 @@ def test_governors_racing_to_redeem_book_each_claim_once(
 def test_the_store_refuses_to_book_a_claim_that_is_not_pending(gov: BudgetManager) -> None:
     store = gov.store
     assert isinstance(store, PostgresStore)
-    with store.writer() as session:
-        with pytest.raises(Exception, match="booked once"):
-            store.commit(WriteBatch(redeemed=[uuid.uuid4()]))
+    with pytest.raises(StorageError, match="none of it was committed"):
+        with store.writer() as session:
+            with pytest.raises(Exception, match="booked once"):
+                store.commit(WriteBatch(redeemed=[uuid.uuid4()]))
     assert not session.committed
 
 
@@ -379,7 +428,7 @@ def test_a_token_is_good_for_its_own_transaction_only(
 def test_only_the_named_roles_may_call_the_claim_function(pg_admin_dsn: str, pg_dsn: str) -> None:
     PostgresStore(pg_dsn).close()
     role = f"stranger_{uuid.uuid4().hex[:10]}"
-    with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
+    with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as conn:
         conn.execute(
             sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sql.Identifier(role), sql.Literal(PASSWORD)
@@ -388,7 +437,7 @@ def test_only_the_named_roles_may_call_the_claim_function(pg_admin_dsn: str, pg_
     try:
         dsn = make_conninfo(pg_dsn, user=role, password=PASSWORD)
         with (
-            psycopg.connect(dsn, autocommit=True) as conn,
+            psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as conn,
             pytest.raises(psycopg.errors.InsufficientPrivilege),
         ):
             conn.execute(
@@ -396,7 +445,7 @@ def test_only_the_named_roles_may_call_the_claim_function(pg_admin_dsn: str, pg_
                 (b"\x00" * 32,),
             )
     finally:
-        with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
+        with psycopg.connect(pg_admin_dsn, autocommit=True, prepare_threshold=None) as conn:
             conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
 
 
@@ -431,6 +480,15 @@ def test_the_chain_is_not_written_inside_a_joined_transaction(
             store.rebuild_caches(nodes=(), control_events=(), authorizations=())
         caller.execute("ROLLBACK")
     gov.anchor("agent", "digest")  # and outside, as ever
+
+
+def test_a_governor_joins_no_transaction_inside_its_own(
+    gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    with gov.transaction():
+        with pytest.raises(RuntimeError, match="inside its own mutation"), gov.joined(caller):
+            pytest.fail("the block must not run")  # pragma: no cover
+    caller.execute("ROLLBACK")
 
 
 def test_a_claim_must_be_well_formed(gov: BudgetManager, caller: psycopg.Connection[Any]) -> None:
@@ -474,3 +532,59 @@ def test_only_a_postgres_governor_holds_claims(
         assert store is not None
         with pytest.raises(StorageError, match="holds no settlement claims"):
             store.commit(WriteBatch(redeemed=[uuid.uuid4()]))
+
+
+def test_a_redemption_that_overdraws_halts_the_scope_for_good(
+    pg_dsn: str, gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    """A claim is a committed fact, booked whatever it costs; one that takes
+    the scope below zero trips its breaker, in the redemption's own writes."""
+    hold = gov.authorize("agent", "0.40")
+    with gov.joined(caller) as txn:
+        claim = txn.claim("agent", "2.50", memo="over the scope", hold=hold)
+        caller.execute("COMMIT")
+    gov.redeem(claim)
+    assert gov.is_halted("agent")
+    with BudgetManager.open_postgres(pg_dsn) as reopened:  # its control row was written too
+        assert reopened.is_halted("agent")
+        reopened.verify_integrity()
+
+
+def test_a_redemption_follows_what_its_unit_of_work_wrote_before_it(
+    pg_dsn: str, gov: BudgetManager, caller: psycopg.Connection[Any]
+) -> None:
+    hold = gov.authorize("agent", "0.40")
+    with gov.joined(caller) as txn:
+        claim = txn.claim("agent", "0.25", memo="settles", hold=hold)
+        caller.execute("COMMIT")
+    with gov.transaction() as unit:
+        unit.anchor("agent", "before the redemption")
+        (spend,) = gov.redeem(claim)
+    memos = [e.memo for e in gov.audit_trail("agent")]
+    assert memos[-3] == "before the redemption" and memos[-1] == spend.memo == "settles"
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
+        reader.verify_integrity()
+
+
+def test_a_claim_booked_meanwhile_by_another_governor_is_not_booked_again(
+    pg_dsn: str,
+    gov: BudgetManager,
+    caller: psycopg.Connection[Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Between reading the pending claims and deleting the one it books, a
+    governor can lose the claim to another: then the claim's delete finds
+    nothing, and nothing the redemption wrote commits."""
+    hold = gov.authorize("agent", "0.40")
+    with gov.joined(caller) as txn:
+        claim = txn.claim("agent", "0.25", memo="settles", hold=hold)
+        caller.execute("COMMIT")
+    with BudgetManager.open_postgres(pg_dsn) as other:
+        (booked,) = other.redeem(claim)
+    monkeypatch.setattr(PostgresStore, "pending_claims", lambda self: (claim,))  # read too early
+    with pytest.raises(LedgerIntegrityError, match="only 0 were still pending"):
+        gov.redeem(claim)
+    monkeypatch.undo()
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
+        reader.verify_integrity()
+        assert [s.entry_hash for s in spends(pg_dsn)] == [booked.entry_hash], "booked once"

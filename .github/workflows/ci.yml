@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         os: [ubuntu-latest]
         include:
           # The advisory lock, the reaped worker thread, and the subprocess
@@ -28,6 +28,13 @@ jobs:
           # current Python so a macOS-only or Linux-only regression is caught.
           - python-version: "3.12"
             os: macos-latest
+          # Windows takes the advisory lock with msvcrt rather than fcntl, and
+          # its clocks are coarser before Python 3.13.
+          - python-version: "3.12"
+            os: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -83,14 +90,65 @@ jobs:
             --pubkey keys/issuer.pub || code=$?
           test "$code" -eq 4
 
+  # Free-threaded CPython: no GIL to hide a race between a governor's
+  # threads. psycopg-binary publishes no free-threaded wheels, so this job
+  # installs the locked test dependencies with the pure-Python driver over
+  # the runner's libpq, and runs the PostgreSQL tests too.
+  free-threaded:
+    name: test on free-threaded Python 3.14t
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentgov_admin
+          POSTGRES_PASSWORD: agentgov
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentgov_admin"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      AGENTGOV_TEST_POSTGRES_DSN: postgresql://agentgov_admin:agentgov@localhost:5432/postgres
+      AGENTGOV_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the project and its locked test dependencies on 3.14t
+        run: |
+          uv python install 3.14t
+          uv venv --python 3.14t
+          uv export --frozen --no-hashes --no-emit-project --only-group dev \
+            --format requirements-txt | grep -v '^psycopg-binary' > requirements-ft.txt
+          uv pip install -r requirements-ft.txt -e .
+
+      - name: Nothing imported turns the GIL back on
+        run: |
+          .venv/bin/python -c "
+          import sys, agentgov, agentgov.postgres, agentgov.receipts, hypothesis, psycopg, pytest
+          from cryptography.hazmat.primitives.asymmetric import ed25519
+          assert not sys._is_gil_enabled(), 'an import enabled the GIL'
+          "
+
+      - name: Tests, PostgreSQL required
+        run: .venv/bin/python -m pytest -q
+
   postgres:
     name: test against PostgreSQL ${{ matrix.postgres }} (py3.12)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # 14 is the oldest the shared ledger is written for; 16 is current.
-        postgres: ["14", "16"]
+        # 14 is the oldest the shared ledger is written for; 18 is current.
+        postgres: ["14", "16", "17", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -131,6 +189,139 @@ jobs:
       # Every module, postgres.py included (97% measured).
       - name: Enforce coverage floor
         run: uv run coverage report --fail-under=95
+
+  # The same suite again, every PostgreSQL test through PgBouncer in
+  # transaction mode: a small pool, so clients share server connections and
+  # anything a store left on its session would reach another client, and no
+  # tracking of prepared statements (tests/pgbouncer/pgbouncer.ini).
+  pgbouncer:
+    name: test behind PgBouncer (transaction mode, py3.12)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentgov_admin
+          POSTGRES_PASSWORD: agentgov
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentgov_admin"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      AGENTGOV_TEST_POSTGRES_DSN: postgresql://agentgov_admin:agentgov@localhost:6432/postgres
+      AGENTGOV_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install the project
+        run: uv sync --frozen --python 3.12
+
+      # PgBouncer 1.26.0, pinned by digest, on the service's network, where
+      # the server is `postgres`.
+      - name: Start PgBouncer in front of PostgreSQL
+        run: |
+          mkdir -p "$RUNNER_TEMP/pgbouncer"
+          sed 's/@HOST@/postgres/; s/@PORT@/5432/' tests/pgbouncer/pgbouncer.ini \
+            > "$RUNNER_TEMP/pgbouncer/pgbouncer.ini"
+          cp tests/pgbouncer/userlist.txt "$RUNNER_TEMP/pgbouncer/"
+          docker run -d --name pgbouncer --network "${{ job.services.postgres.network }}" \
+            -p 6432:6432 -v "$RUNNER_TEMP/pgbouncer:/etc/pgbouncer:ro" \
+            edoburu/pgbouncer@sha256:9c78945868a6a142c7fc40ccd843bbe5a606df163c7ffce4de70e0d628d696a2
+          for _ in $(seq 30); do
+            pg_isready -h localhost -p 6432 -U agentgov_admin && break
+            sleep 1
+          done
+
+      - name: Tests, every PostgreSQL test through PgBouncer
+        run: uv run pytest -q
+
+  # Interlock is agentgov's main downstream consumer. Its whole suite runs
+  # against this branch, PostgreSQL and PgBouncer included, exactly as
+  # Interlock's own CI runs it: a change here that breaks Interlock fails
+  # here, before it is released. The tests docs/MIGRATING_TO_1.0.md tells
+  # Interlock to change run changed (scripts/downstream/), until Interlock's
+  # own tests make the change.
+  downstream:
+    name: Interlock's suite against this branch
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: interlock_admin
+          POSTGRES_PASSWORD: interlock
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U interlock_admin"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      INTERLOCK_TEST_POSTGRES_DSN: postgresql://interlock_admin:interlock@localhost:5432/postgres
+      INTERLOCK_REQUIRE_POSTGRES: "1"
+      INTERLOCK_TEST_PGBOUNCER: localhost:6432
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: crimsondevil0929/interlock
+          path: interlock
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Start PgBouncer in front of PostgreSQL
+        run: |
+          mkdir -p "$RUNNER_TEMP/pgbouncer"
+          sed 's/@HOST@/postgres/; s/@PORT@/5432/' interlock/tests/pgbouncer/pgbouncer.ini \
+            > "$RUNNER_TEMP/pgbouncer/pgbouncer.ini"
+          cp interlock/tests/pgbouncer/userlist.txt "$RUNNER_TEMP/pgbouncer/"
+          docker run -d --name pgbouncer --network "${{ job.services.postgres.network }}" \
+            -p 6432:6432 -v "$RUNNER_TEMP/pgbouncer:/etc/pgbouncer:ro" \
+            edoburu/pgbouncer@sha256:9c78945868a6a142c7fc40ccd843bbe5a606df163c7ffce4de70e0d628d696a2
+
+      - name: Interlock's suite, with this agentgov installed in place of the release
+        run: WORKDIR="$RUNNER_TEMP/downstream" scripts/downstream_interlock.sh interlock -q
+
+  benchmarks:
+    name: benchmarks (short run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the project
+        run: uv sync --frozen --python 3.12
+
+      # Short versions of benchmarks/, so a change that breaks a benchmark
+      # is caught here. The gates on the numbers themselves are tests
+      # (tests/test_scale.py), not this job.
+      - name: Run each benchmark briefly
+        run: |
+          uv run python benchmarks/bench_open.py --sizes 3000 --repeat 1
+          uv run python benchmarks/bench_throughput.py --backend sqlite --callers 4 --seconds 2
+          uv run python benchmarks/bench_receipts.py --count 16 --latency-ms 20
 
   build:
     name: build (wheel + sdist)

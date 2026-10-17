@@ -387,7 +387,8 @@ def _die_holding_the_lock(dsn: str, written: Event, die: Event) -> None:
         original(batch)  # written into the transaction, which holds the lock
         written.set()
         die.wait(60)
-        os.kill(os.getpid(), signal.SIGKILL)
+        if sys.platform != "win32":  # Windows has no SIGKILL; the test is skipped there
+            os.kill(os.getpid(), signal.SIGKILL)
 
     store.commit = commit_then_die  # type: ignore[method-assign]
     governor.spend("agent", "1.50")
@@ -409,20 +410,23 @@ def test_a_governor_killed_holding_the_lock_frees_it_and_leaves_nothing(pg_dsn: 
     child.start()
     try:
         assert written.wait(60)
-        with (
-            BudgetManager.open_postgres(pg_dsn, read_only=True) as reader,
-            pytest.raises(StorageError, match="waiting for the writer lock"),
-        ):
+        with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
             store = PostgresStore(pg_dsn, lock_timeout=0.3)
             try:
-                BudgetManager(store=store)  # opening a writer needs the lock too
+                # Opening needs no lock: the committed ledger is served at once,
+                # without what the frozen governor wrote and never committed.
+                writer = BudgetManager(store=store)
+                assert writer.ledger.entries() == before
+                with pytest.raises(StorageError, match="waiting for the writer lock"):
+                    writer.spend("agent", "0.01")  # writing does need it
             finally:
                 store.close()
         assert reader.ledger.entries() == before
     finally:
         die.set()
         child.join(30)
-    assert child.exitcode == -signal.SIGKILL
+    if sys.platform != "win32":  # as the mark says, in a form mypy reads too
+        assert child.exitcode == -signal.SIGKILL
 
     with BudgetManager.open_postgres(pg_dsn, lock_timeout=10) as survivor:
         assert survivor.ledger.entries() == before, "nothing the dead governor wrote landed"

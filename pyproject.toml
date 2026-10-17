@@ -1,6 +1,6 @@
 [project]
 name = "interlock-agentgov"
-version = "0.4.0"
+version = "1.0.0"
 description = "Runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,13 +18,15 @@ keywords = [
     "governance",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Security",
     "Typing :: Typed",
@@ -43,6 +45,14 @@ sign = [
 # extra: the core package, and the SQLite store, keep zero runtime
 # dependencies.
 postgres = ["psycopg[binary]>=3.2"]
+# The AWS KMS signer (agentgov.receipts.kms_aws): an Ed25519 key that never
+# leaves the key service. botocore passes enum values through unchecked, so
+# any boto3 with KMS Sign serves; ED25519_SHA_512 itself is on AWS's side.
+kms-aws = ["boto3>=1.35"]
+# Metrics through OpenTelemetry (agentgov.otel): the API only, whose
+# synchronous gauge arrived in 1.23; the SDK and exporters are the
+# application's.
+otel = ["opentelemetry-api>=1.27"]
 
 [project.scripts]
 agentgov = "agentgov.cli:main"
@@ -72,6 +82,10 @@ dev = [
     # The PostgreSQL store's integration tests. The runtime dependency is the
     # `postgres` extra; this puts the driver in every dev environment.
     "psycopg[binary]>=3.2",
+    # Property and model-based tests: "whatever the governor accepts, a
+    # replay reproduces" is a property over every sequence of operations, not
+    # a list of examples (tests/test_model.py).
+    "hypothesis>=6.100",
 ]
 
 [tool.pytest.ini_options]
@@ -109,14 +123,18 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 show_error_codes = true
 
-# Explicitly tell the build system where the module is, 
-# overriding the PyPI package name auto-discovery.
-[tool.uv_build]
-packages = ["src/agentgov"]
+# boto3 is the kms-aws extra's, imported only when an AwsKmsSigner is built
+# without a client of its own.
+[[tool.mypy.overrides]]
+module = ["boto3", "boto3.*"]
+ignore_missing_imports = true
 
+# opentelemetry is the otel extra's, imported only when no meter is given.
+[[tool.mypy.overrides]]
+module = ["opentelemetry", "opentelemetry.*"]
+ignore_missing_imports = true
+
+# The distribution is interlock-agentgov and the package agentgov, so the
+# wheel names its package rather than deriving it from the project name.
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentgov"]
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["agentgov*"]

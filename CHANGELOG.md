@@ -6,6 +6,140 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
+## [1.0.0] - 2026-10-17
+
+The first stable release: the API frozen for 1.x, the ledger format specified,
+and a governor whose open, memory and write path no longer grow with history.
+Ledgers from every earlier release upgrade in place on the first writable open;
+0.x cannot open an upgraded ledger. [docs/MIGRATING_TO_1.0.md](docs/MIGRATING_TO_1.0.md)
+lists everything that needs attention.
+
+### Added
+
+- **Checkpoints.** Every `GovernancePolicy.checkpoint_every` entries (10,000) a
+  governor stores a canonical snapshot of the chain state and commits it into the
+  chain with a zero-value `CHECKPOINT` entry. A governor opens from the newest
+  checkpoint (`verify="checkpoint"`, the default) and replays only the entries
+  after it; `verify="full"` replays from genesis. A 1,000,000-entry ledger opens in
+  under 500 ms on SQLite and PostgreSQL (`tests/test_scale.py`, nightly).
+- **The auditor** (`agentgov.audit`, `agentgov audit [--follow]`): replays the chain
+  from genesis off the hot path, checks every checkpoint's snapshot, and records
+  marks in the ledger; a failure stops every writer.
+- **Signed checkpoints** (`CheckpointSigning`): a checkpoint statement signed by the
+  ledger's key, checked at every open, from the checkpoint or by a replay from
+  genesis; `required=True` refuses an unsigned one. `agentgov verify` and
+  `agentgov audit` take `--checkpoint-key` and `--require-signed`.
+  **Witnesses** cosign checkpoints (`publish_checkpoint()`), so a rewritten,
+  forked or cut-back ledger cannot be witnessed.
+- **`transaction()`**: reads that are current and mutations that commit as one,
+  atomically across a fleet; a block that raises writes nothing.
+  **`try_authorize()`**: a hold if the scope can pay, `None` otherwise.
+- **Idempotency keys** on `authorize`, `try_authorize`, `capture`, `void`, `spend`,
+  `refund`, `fund` and `delegate`: a retry returns what committed, on any governor,
+  after a restart or a lost commit. `IdempotencyConflictError`.
+- **`AsyncBudgetManager`**: every operation as a coroutine, off the event loop.
+- **`authorization(id)`**, and `fresh=True` on `available()`, `subtree_available()`
+  and `is_halted()`.
+- **History from the store:** `entry()`, `entries()`, `find_entries()`,
+  `iter_audit_trail()`.
+- **`agentgov.open(url)`** for `memory:`, `sqlite:///...` and `postgresql://...`; every
+  CLI command takes the same URLs, and `audit`, `checkpoint` and `export --from-seq`
+  are new.
+- **`LedgerRollbackError`**: a ledger cut back by a failover, told from one
+  rewritten. `GovernancePolicy(fleet_velocity=True)`: one runaway-loop window for a
+  fleet.
+- **Metrics** (`metrics=`, `agentgov.metrics`) and `agentgov.otel.OpenTelemetryMetrics`
+  (the `otel` extra).
+- **Signing:** `RemoteSigner` and `HttpRemoteSigner` in `agentgov.receipts.signing`;
+  `AwsKmsSigner` (the `kms-aws` extra); keyrings; ARC1 1.2: signature version 2
+  (digest-then-sign) and key transitions (`ReceiptLog.rotate()`).
+- **`PostgresStore.writer_lock_held()`**, a probe of the writer lock that writes
+  nothing.
+- **`docs/LEDGER_FORMAT.md`** specifies entries (`AGOV1` to `AGOV3`), replay,
+  checkpoints and the storage layouts, with conformance vectors in `vectors/agov/`.
+  `docs/API.md`, `docs/OPERATIONS.md`, `docs/MIGRATING_TO_1.0.md`.
+
+### Changed
+
+- **AGOV3 entries:** RFC 8785 canonical JSON, fixed-point amounts, monotonic time,
+  bounded text. Older entries verify under their own rules.
+- **SQLite schema 3 and PostgreSQL layout `pg2`**, upgraded in place from every
+  earlier layout on the first writable open; a read-only open never upgrades.
+- **Opening takes no writer lock** (0.4 stalled every writer of a fleet for the
+  whole open).
+- **One rule engine** for writes, catch-up, refresh and replay: whatever a write
+  commits, a replay accepts.
+- **Group commit:** concurrent callers of one governor share units of work, on
+  PostgreSQL in two round trips. One governor with eight callers: 425 to 2,126
+  operations a second; eight governors: 188 to 1,684 (`benchmarks/README.md`).
+- **A failed commit** fails every mutation it carried, and the governor re-reads the
+  ledger at once.
+- **Refunds are bounded** by what was spent, and may name the spend they reverse
+  (`reverses=`).
+- **Receipts:** issuance is pipelined (16 callers with a 50 ms signer: 18 to 246
+  receipts a second), checkpoints publish in the background, and a log reopens
+  from an index without reading the receipts its checkpoints cover (100,000
+  receipts: 24 s to 25 ms), checking every checkpoint's signature.
+- **PostgreSQL behind PgBouncer** in transaction mode: no session state, nothing
+  prepared by default (`prepare_threshold`). Tested on PostgreSQL 14 to 18.
+- **Balances use the ledger's own decimal context**, never the caller's.
+- **Audit lines escape free text** (CWE-117).
+- The public API is `agentgov.__all__`, and the store interface `agentgov.spi`.
+
+### Deprecated (removed in 2.0)
+
+- The store types at `agentgov`'s top level (use `agentgov.spi`),
+  `AgentThrashingException`, `DenialOfWalletException`, `LedgerLine`,
+  `Ledger.lock`, and `refund()` without `reverses=`.
+
+### Removed
+
+- `Ledger.post()`, which could commit what a later open refused.
+
+### Fixed
+
+- A store's connection could be used by several threads at once: history reads
+  and checkpoint writes raced the governor's own transactions.
+- A host's decimal context could write a balance no replay reproduced; a raw post
+  could write what replay refused; a refund could exceed what was spent; a memo
+  could forge an audit line.
+- `ainvoke()` and async streams wrote on the event loop.
+- On a database written by v0.1.0 or v0.1.1, an open moved which of a scope's
+  identical holds it held open to match the authorization rows, as no replay
+  does: releasing the moved hold wrote an entry the next open refused. Each row
+  is now served on a hold the chain holds open.
+- A repair of an authorization row that misstated its hold's scope or amount
+  deleted the row and then failed; its hold is now given a fresh authorization.
+- On Windows, a governor refused a ledger another process held could not say
+  which: the claim locked the byte the holder's identity is written to, and
+  Windows locks keep every other handle from reading a locked byte. Windows now
+  runs the whole suite in CI.
+
+### Security
+
+- `SECURITY.md` states who can change the ledger, what detects each change, and
+  what a checkpoint key and a witness add.
+- Releases are published by trusted publishing, with PEP 740 attestations, build
+  provenance and an SBOM.
+
+### Verification
+
+- `tests/test_model.py` runs every operation against a reference model under
+  hostile decimal contexts, injected write failures, reopens and checkpoints.
+- `scripts/mutate.py` makes 3,762 small changes to the rule engine,
+  checkpoints, the auditor, both stores, the write path and the receipts code
+  (`mutation/*.json`), and every one of them is caught by a test or justified by
+  name as changing nothing a test can observe (185: read-ahead and
+  caching that save a query, guards behind other guards, unreachable branches,
+  message text). A mutant that hangs the tests counts as caught. Besides the
+  tests it called for, the pass found code nothing reached, now removed, and
+  four defects: a snapshot's record of the previous checkpoint was taken on its
+  word, the two authorization-row fixes above, and the deprecation of a refund
+  that names no spend, which was raised on agentgov's own lines, where no
+  default filter shows it.
+- `scripts/soak.py` runs a fleet under SIGKILLs and cut connections and checks
+  every operation exactly once. Interlock's whole suite runs against every change.
+
 ## [0.4.0] - 2026-10-04.
 
 ### Added

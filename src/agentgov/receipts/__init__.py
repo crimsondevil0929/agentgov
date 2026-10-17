@@ -31,6 +31,7 @@ against.
 from __future__ import annotations
 
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
+from agentgov.receipts.kms_aws import AwsKmsSigner
 from agentgov.receipts.log import CheckpointPolicy, ReceiptLog
 from agentgov.receipts.merkle import MerkleTree, verify_consistency, verify_inclusion
 from agentgov.receipts.rows import RowCommitment, commit_rows, verify_disclosure
@@ -56,6 +57,8 @@ from agentgov.receipts.schema import (
     EffectSummary,
     InclusionProof,
     Intent,
+    KeySchedule,
+    KeyTransition,
     LogAnchor,
     Outcome,
     OutcomeStatus,
@@ -66,12 +69,18 @@ from agentgov.receipts.schema import (
     document_from_json,
 )
 from agentgov.receipts.signing import (
+    AsyncSigner,
     Ed25519PublicKey,
     Ed25519Signer,
     HmacKey,
+    HttpRemoteSigner,
+    Keyring,
+    RemoteSigner,
     Signer,
     Verifier,
+    as_async,
     parse_key,
+    verifier_of,
 )
 from agentgov.receipts.verify import Check, Failure, VerificationReport, verify_bundle
 from agentgov.receipts.witness import FileWitness, Witness, find_cosignature, load_cosignatures
@@ -80,9 +89,11 @@ __all__ = [
     "ActionBinding",
     "ActionReceipt",
     "Anchors",
+    "AsyncSigner",
     "Attestation",
     "AttestedOutcome",
     "Authority",
+    "AwsKmsSigner",
     "Capability",
     "ChainAnchor",
     "Check",
@@ -103,14 +114,19 @@ __all__ = [
     "Failure",
     "FileWitness",
     "HmacKey",
+    "HttpRemoteSigner",
     "InclusionProof",
     "Intent",
+    "KeySchedule",
+    "KeyTransition",
+    "Keyring",
     "LogAnchor",
     "MerkleTree",
     "Outcome",
     "OutcomeStatus",
     "ReceiptBundle",
     "ReceiptLog",
+    "RemoteSigner",
     "RowChange",
     "RowCommitment",
     "RowDisclosure",
@@ -119,6 +135,7 @@ __all__ = [
     "VerificationReport",
     "Verifier",
     "Witness",
+    "as_async",
     "canonical_bytes",
     "commit_rows",
     "document_from_json",
@@ -126,6 +143,7 @@ __all__ = [
     "load_cosignatures",
     "loads_strict",
     "parse_key",
+    "verifier_of",
     "verify_bundle",
     "verify_consistency",
     "verify_disclosure",

@@ -1,0 +1,1 @@
+{"balances": {"orchestrator": "11.70000000", "researcher": "2.09000000", "writer": "0.60000000"}, "entries": 22, "halted": ["writer"], "head": "a571ccdb6430a376a42c67c2bd918cbd288ce8cd8b895a97a8c2b24898d233ea", "open_holds": 1, "version": "0.1.2"}

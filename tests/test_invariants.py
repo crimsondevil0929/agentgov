@@ -24,6 +24,7 @@ from agentgov.core import (
     money,
 )
 from agentgov.exceptions import LedgerIntegrityError
+from tests.ledger_fixtures import memory_history
 
 ZERO = Decimal("0")
 
@@ -82,7 +83,7 @@ def test_resetting_a_healthy_scope_is_a_no_op(gov: BudgetManager) -> None:
 
 def test_a_renumbered_entry_is_caught(gov: BudgetManager) -> None:
     ledger = gov.ledger
-    ledger._entries[1] = dataclasses.replace(ledger._entries[1], sequence=99)
+    memory_history(ledger)[1] = dataclasses.replace(memory_history(ledger)[1], sequence=99)
     with pytest.raises(LedgerIntegrityError, match="sequence gap"):
         gov.verify_integrity()
 
@@ -95,7 +96,9 @@ def test_a_forged_head_hash_is_caught(gov: BudgetManager) -> None:
 
 def test_forged_boundary_totals_are_caught(gov: BudgetManager) -> None:
     gov.ledger._totals = dataclasses.replace(gov.ledger._totals, funded=money("99.00"))
-    with pytest.raises(LedgerIntegrityError, match="boundary totals disagree"):
+    with pytest.raises(
+        LedgerIntegrityError, match=r"boundary totals disagree|conservation violated"
+    ):
         gov.verify_integrity()
 
 
@@ -143,11 +146,69 @@ def test_an_inconsistent_depth_is_caught(gov: BudgetManager) -> None:
         gov.verify_integrity()
 
 
+def test_a_vanished_ancestor_is_caught_from_a_scope_listed_before_it(gov: BudgetManager) -> None:
+    """A walk to a root that meets an unregistered ancestor reports it, even
+    when the scope below is checked first (a snapshot lists scopes in any
+    order), rather than failing with a KeyError."""
+    gov.delegate("child", "grandchild", money("0.10"))
+    gov.node("child").parent_id = "vanished"
+    nodes = gov._nodes
+    reordered = {"grandchild": nodes["grandchild"]} | nodes
+    nodes.clear()
+    nodes.update(reordered)
+    with pytest.raises(LedgerIntegrityError, match="ancestor 'vanished' is not registered"):
+        gov.verify_integrity()
+
+
+def test_a_wide_tree_is_checked_in_time_proportional_to_its_size() -> None:
+    """Each child's listing is a set lookup, and walks to a root stop where
+    an earlier walk ended: no check scans a parent's children per child."""
+    gov = BudgetManager(policy=GovernancePolicy(max_calls_per_window=0))
+    gov.open_root("root", money("1000"))
+    for i in range(2_000):
+        gov.delegate("root", f"s-{i}", money("0.01"))
+
+    class Counting(list[str]):
+        scans = 0
+
+        def __contains__(self, item: object) -> bool:
+            Counting.scans += 1
+            return super().__contains__(item)
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            Counting.scans += 1
+            return super().__iter__()
+
+    root = gov.node("root")
+    root.child_ids = Counting(root.child_ids)
+    gov.verify_integrity()
+    assert Counting.scans <= 3, f"the root's children were scanned {Counting.scans} times"
+
+
 def test_a_delegation_cycle_is_caught(gov: BudgetManager) -> None:
     root, child = gov.node("root"), gov.node("child")
     root.parent_id = "child"
     root.depth = child.depth + 1
     child.child_ids.append("root")
+
+    with pytest.raises(LedgerIntegrityError, match="delegation cycle detected"):
+        gov.verify_integrity()
+
+
+def test_a_delegation_cycle_above_a_scope_is_caught(gov: BudgetManager) -> None:
+    """The cycle need not run through the scope a walk starts from: one walk
+    up from a scope under it finds it all the same, and ends."""
+    gov.delegate("root", "a", money("0.20"))
+    gov.delegate("a", "b", money("0.10"))
+    gov.delegate("b", "x", money("0.05"))
+    nodes = gov.ledger._state.nodes
+    a, b, x = nodes["a"], nodes["b"], nodes["x"]
+    a.parent_id = "b"  # a and b: each the other's parent
+    b.child_ids = ["a"]
+    x.parent_id = "a"  # x, under them
+    a.child_ids = ["b", "x"]
+    x.depth = a.depth + 1
+    gov.ledger._state.nodes = {k: nodes[k] for k in ("root", "child", "x", "a", "b")}
 
     with pytest.raises(LedgerIntegrityError, match="delegation cycle detected"):
         gov.verify_integrity()
@@ -164,7 +225,9 @@ def test_the_velocity_window_slides(gov: BudgetManager) -> None:
     for _ in range(2):
         for _ in range(3):
             fast.void(fast.authorize("root", money("0.01")))
-        time.sleep(0.06)
+        # Past the window by more than one tick of a coarse monotonic clock
+        # (15.6 ms on Windows before Python 3.13).
+        time.sleep(0.08)
 
     assert not fast.is_halted("root")
     fast.verify_integrity()
@@ -191,7 +254,7 @@ def test_two_managers_sharing_a_ledger_share_one_mutex() -> None:
 
 def test_raw_ledger_lines_still_validate(gov: BudgetManager) -> None:
     with pytest.raises(ValueError, match="may not be a"):
-        gov.ledger.post([LedgerLine(EntryType.HOLD, Direction.CREDIT, "child", money("0.01"))])
+        gov.ledger._post([LedgerLine(EntryType.HOLD, Direction.CREDIT, "child", money("0.01"))])
     gov.verify_integrity()
 
 
@@ -213,6 +276,25 @@ def test_manager_exposes_chain_and_conservation_checks(gov: BudgetManager) -> No
     gov.verify_integrity()
 
 
+def test_verify_integrity_names_a_conservation_violation(gov: BudgetManager) -> None:
+    """Before a replay could only say a balance differs, the identity says
+    money was made: the defect, by name."""
+    gov.ledger._balances["root"] = money("9999.00")
+    with pytest.raises(LedgerIntegrityError, match="conservation violated"):
+        gov.verify_integrity()
+
+
+def test_verify_integrity_catches_an_open_hold_no_authorization_serves(
+    gov: BudgetManager,
+) -> None:
+    """A replay rebuilds the chain's holds, not the authorizations served on
+    them: that every open hold has exactly one is a check of its own."""
+    auth = gov.authorize("child", money("0.10"))
+    del gov.ledger._open_auths[auth.authorization_id]
+    with pytest.raises(LedgerIntegrityError, match="open authorizations disagree"):
+        gov.verify_integrity()
+
+
 def test_manager_conservation_check_catches_a_tampered_ledger(gov: BudgetManager) -> None:
     """A pass-through that never fails is not a check."""
     gov.open_root("orchestrator", money("5.00"))
@@ -230,7 +312,7 @@ def test_manager_chain_check_catches_a_tampered_ledger(gov: BudgetManager) -> No
     gov.open_root("orchestrator", money("5.00"))
     gov.delegate("orchestrator", "researcher", money("1.00"))
     ledger = gov.ledger
-    ledger._entries[1] = dataclasses.replace(ledger._entries[1], memo="edited")
+    memory_history(ledger)[1] = dataclasses.replace(memory_history(ledger)[1], memo="edited")
 
     with pytest.raises(LedgerIntegrityError):
         gov.verify_chain()

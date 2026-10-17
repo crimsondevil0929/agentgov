@@ -18,7 +18,7 @@ ledger, with a circuit breaker that halts a runaway branch before settlement, no
 A second, *cognitive* breaker attacks the root cause: it detects the agent looping without
 making progress and halts it for a fraction of a cent, long before the envelope is touched.
 The ledger, topology, and any in-flight authorization survive a process crash, backed by
-SQLite via the standard library.
+SQLite via the standard library, or by PostgreSQL for a fleet of governors on many hosts.
 
 Zero runtime dependencies. Pure standard library (`decimal`, `hashlib`, `threading`,
 `sqlite3`, `asyncio`-compatible). `mypy --strict` clean.
@@ -673,19 +673,23 @@ refused with a message saying which rows disagree. `agentgov repair governor.db`
 `open_sqlite(path, repair=True)`) rebuilds those tables from the chain. No money moves,
 and `BudgetManager.repairs` lists what was rebuilt.
 
-**Upgrading from v0.1.0 or v0.1.1.** A database written by either is upgraded in place
-the first time v0.1.2 opens it for writing: its schema gains the columns v0.1.2 needs,
-and a migration seal, a zero-value entry carrying a digest of the old breaker events,
-commits those events into the chain. Opened read-only, it is served as it is. Entries
-keep the audit version they were written with (`AGOV1` or `AGOV2`), and each verifies
-under its own rules.
+**Upgrading from an earlier release.** A ledger written by any release since 0.1.0 is
+upgraded in place the first time 1.0 opens it for writing (SQLite schema 3, PostgreSQL
+layout `pg2`); opened read-only, it is served as it is. Entries keep the audit version
+they were written with (`AGOV1` or `AGOV2`) and each verifies under its own rules; new
+entries are `AGOV3` ([docs/LEDGER_FORMAT.md](docs/LEDGER_FORMAT.md)). A ledger from before
+0.1.2 also gains a migration seal, a zero-value entry carrying a digest of its old breaker
+events, which commits those events into the chain. 0.x cannot open an upgraded ledger,
+so back it up first: [docs/MIGRATING_TO_1.0.md](docs/MIGRATING_TO_1.0.md).
 
 **One writer, enforced.** A governor takes an exclusive advisory lock on its database.
 A second process, a second gunicorn worker or a second replica, is refused *at open*
 with a `ConcurrentGovernorError` naming the PID that holds it, because two writers would
 each cache authoritative balances in memory and diverge. The lock is an open file
 descriptor, so the kernel releases it even on `SIGKILL`: a crashed governor leaves a
-stale file but never a stale lock, and there is no timeout heuristic to get wrong. To
+stale file but never a stale lock, and there is no timeout heuristic to get wrong.
+(Windows releases a dead process's lock a moment after it exits, so an open in that
+moment is refused, and a retry opens.) To
 inspect a ledger another process is governing, open it read-only:
 
 <!-- readme-test: continue -->
@@ -772,25 +776,32 @@ and races them: writes get refused, and the ledger still balances to the cent.
   or not at all.
 - A governor that reads an entry that does not verify stops writing. Every later write
   raises `LedgerIntegrityError`; reads keep serving what it last verified.
+- A ledger cut back under a governor, to exactly the chain it verified (a failover to a
+  replica that had not received the last commits), raises `LedgerRollbackError`, and the
+  governor stops writing as above. [docs/OPERATIONS.md](docs/OPERATIONS.md) has the
+  runbook, and recommends synchronous replication.
 
 **What to know before relying on it.**
 
-- **Reads are as of this governor's last write.** `available()`, `is_halted()` and the
-  rest are served from memory; call `refresh()` first when the answer must be current.
-  Writes always catch up first.
-- **The runaway-loop velocity window is per governor**, not fleet-wide: eight governors
-  with a 1000/s limit admit up to 8000/s between them.
-- **One global chain serializes every write in the fleet, and it is slower than
-  SQLite.** Measured on one laptop against PostgreSQL 16 in Docker, `spend()` ran at
-  about 500 a second from one governor and about 180 a second in total with eight
-  contending, against about 4,500 a second for a single SQLite governor on the same
-  machine. Each write is a dozen round trips, and must first read what the others wrote.
+- **Reads are as of this governor's last write**, unless asked otherwise.
+  `available()`, `is_halted()` and the rest are served from memory; pass `fresh=True`
+  to catch up first, or read inside `transaction()`, where reads are current and the
+  check and the act it decides are one atomic step across the fleet.
+- **The runaway-loop velocity window is per governor** by default: eight governors with
+  a 1000/s limit admit up to 8000/s between them.
+  `GovernancePolicy(fleet_velocity=True)` counts the holds of every governor instead.
+- **One global chain serializes every write in the fleet.** Concurrent callers of one
+  governor share units of work (one lock, one catch-up, one commit), and a unit costs
+  two round trips. Measured on one laptop against PostgreSQL 16 in Docker, eight callers
+  ran about 2,100 operations a second through one governor, five times 0.4.0, and eight
+  governors with eight callers each about 1,700 a second in total, nine times 0.4.0, at
+  a p99 latency near 105 ms ([Known limitations](#known-limitations) has the table).
   That is the price of one authoritative balance; a chain per root scope is how it would
-  scale out.
-- **Tested on PostgreSQL 14 and 16, connected directly.** Not yet tested behind a
-  connection pooler.
-- **The CLI does not read PostgreSQL yet.** Use `open_postgres(..., read_only=True)` and
-  `verify_integrity()` for an audit.
+  scale out further.
+- **Tested on PostgreSQL 14, 16, 17 and 18,** connected directly and, the whole suite,
+  behind PgBouncer in transaction mode ([docs/OPERATIONS.md](docs/OPERATIONS.md)).
+- **The CLI reads PostgreSQL by URL**: `agentgov verify 'postgresql://...?schema=agentgov'`,
+  and `inspect`, `audit`, `export`, `checkpoint` and `repair` the same way.
 
 [`tests/test_postgres_store.py`](tests/test_postgres_store.py) pins the store's contract:
 install, restart, tamper evidence, least privilege, and every failure above.
@@ -857,56 +868,64 @@ See [`tests/test_postgres_joined.py`](tests/test_postgres_joined.py).
   [interlock](https://github.com/crimsondevil0929/interlock) binds its record of
   database writes to this ledger.
 
-## Known limitations & v0.1 scope
+## Known limitations
 
 Every claim on this page is measured, and the boundaries of what was measured matter as
 much as the numbers. This section states them plainly rather than leaving them to be
 discovered in production.
 
-### SQLite is single-writer by design: one process, one host
+### One chain serializes every write
 
-`BudgetManager.open_sqlite()` takes an exclusive advisory lock on the database. **One
-process governs one SQLite ledger.** A second process is refused at open with
+A ledger is one hash chain, so every write takes one lock in turn: a SQLite governor's
+own, or on PostgreSQL the fleet's. Concurrent callers of one governor share units of work
+(one lock, one catch-up, one commit), which is most of what 1.0 gained. Measured on one
+laptop (Apple Silicon, 10 cores, PostgreSQL 16 in Docker), `authorize()` and `capture()`
+in a loop, 10-second runs, the median of three, each interleaved with 0.4.0 on the same
+machine ([benchmarks](benchmarks/README.md#throughput)):
+
+| Configuration | 0.4.0 | 1.0 |
+|---|---:|---:|
+| SQLite, one caller | 5,907 a second, p99 0.7 ms | 4,208 a second, p99 1.7 ms |
+| SQLite, eight callers | 5,850 a second, p99 9.7 ms | 5,428 a second, p99 11.9 ms |
+| PostgreSQL, one governor with eight callers | 425 a second, p99 66 ms | 2,126 a second, p99 9 ms |
+| PostgreSQL, eight governors with eight callers each | 188 a second, p99 1,944 ms | 1,684 a second, p99 105 ms |
+
+Absolute rates move with whatever else the machine is doing; the ratios move less.
+SQLite pays for 1.0 with one caller: AGOV3's canonical hashing, the rule engine's checks
+and the history indexes cost about 70 µs an operation, and callers that arrive together
+share one commit, which nearly closes the gap at eight.
+
+That is the price of one authoritative balance, and two limits follow from it:
+
+- **Latency rises with callers.** In a closed loop each caller waits for the others' work,
+  so mean latency is at least callers / throughput: 64 callers at 1,700 operations a second
+  wait 38 ms on average. The 1.0 target of a 25 ms p99 for eight governors with eight
+  callers each was not met.
+- **A fleet's throughput is one chain's.** A chain per root scope, so that unrelated
+  envelopes stop contending for one lock, is planned for 1.1 if measurements call for it.
+  Until then, a fleet that needs more splits its budgets across ledgers.
+
+**SQLite is one process, by design.** `BudgetManager.open_sqlite()` takes an exclusive
+advisory lock on the database, and a second process is refused at open with
 `ConcurrentGovernorError` naming the holding PID; it is not silently allowed to diverge.
-For a fleet, see [A ledger shared by a fleet](#a-ledger-shared-by-a-fleet-postgresql).
-
-Measured throughput on that single writer, all of it behind one global mutex:
-
-| Configuration | Mean per governed call | p99 | Sustained ceiling |
-|---|---|---|---|
-| In-memory ledger | 0.062 ms | n/a | ~16,000 calls/sec |
-| SQLite, `synchronous=FULL` | 0.613 ms | 3.448 ms | ~1,600 calls/sec |
-
-**This is a deliberate trade, not an oversight.** The alternative, shipping a
-coordination service, would mean infrastructure to deploy, a network hop in the hot
-path, and a dependency tree, all before anyone could evaluate whether the governor is
-worth having. `pip install agentgov` with zero runtime dependencies and a local file is
-what makes the thing adoptable in an afternoon. The cost of that choice is that
-AgentGov v0.1 governs *a process*, not a fleet.
-
-**The fleet path is PostgreSQL, behind an extra.** `agentgov.storage.SharedStore`
-extends the `PersistenceStore` seam to a ledger several governors write, and
-`agentgov.postgres.PostgresStore` implements it: the database is the serialization
-point, so N processes across N hosts share one authoritative view of every balance,
-without a bespoke consensus cluster. It did need more than a new store: a governor over
-a shared ledger has to catch up with the others, under their shared lock, before every
-check, which is what `BudgetManager` now does when its store is shared. The ledger's
-rules, the budget DAG and the breaker are unchanged. SQLite stays the default, so the
-zero-dependency install is unaffected, and so does its throughput: the shared ledger is
-several times slower (see the measurements in that section).
+`pip install agentgov` with zero runtime dependencies and a local file is what makes the
+governor adoptable in an afternoon; a fleet opts into PostgreSQL
+([A ledger shared by a fleet](#a-ledger-shared-by-a-fleet-postgresql)).
 
 ### A guardrail inside a process, not a sandbox around it
 
 AgentGov enforces at the call site, in your process. Anything that can `import agentgov`
-can also call the provider SDK directly and spend unmetered. The hash chain is
-**tamper-evident, not tamper-resistant**. `verify_chain()` will prove a file was edited,
-but nothing stops a process with write access from editing it. The chain is keyless and
-there is no external witness yet, so someone who can compute SHA-256 can rewrite the
-whole chain consistently, or cut entries off its tail, and it will still verify. Only a
-copy of the head held somewhere else can show that. The [reconciliation engine](#reconciling-the-invoice) is the backstop for
-out-of-band spend, and it is *detection after the fact*, not prevention. Treat AgentGov
-as a budget guardrail against runaway and accident, the failure mode that actually burns
-money today. It is not a security boundary against a hostile agent.
+can also call the provider SDK directly and spend unmetered. The ledger is
+**tamper-evident, not tamper-resistant**: verification proves an edit happened, and
+nothing stops a writer with access to the database from making one. Signed checkpoints
+make rewriting checkpointed history take a key as well as the database, and witnesses
+catch a ledger cut back, forked or replaced, but only once they are configured, and the
+entries after the newest checkpoint are only hash-chained. [SECURITY.md](SECURITY.md)
+states what each layer detects, and what none of them does. The
+[reconciliation engine](#reconciling-the-invoice) is the backstop for out-of-band spend,
+and it is *detection after the fact*, not prevention. Treat AgentGov as a budget
+guardrail against runaway and accident, the failure mode that actually burns money today.
+It is not a security boundary against a hostile agent.
 
 ### Published rates are a snapshot
 
@@ -933,9 +952,18 @@ These are different claims and this project keeps them separate.
 **Proven deterministically.** The accounting invariants are verified against `DummyLLM`,
 a deterministic offline stub, under 64 contending threads and 100 concurrent asyncio
 tasks: no double-spend under concurrency, conservation of value, an unbroken SHA-256
-chain, the latching breaker. This is the right harness for these properties: a governor
-that is only *probably* correct under load is not correct, and a nondeterministic backend
-cannot prove a race is absent.
+chain, the latching breaker. A model-based test (Hypothesis) runs random sequences of
+every operation, with injected write failures and reopens, against a reference model; a
+mutation pass makes 3,762 small changes to the rule engine, checkpoints, the auditor, both
+stores and the receipts code, and a test catches every one that changes what the code does
+(the 185 that change nothing a test can observe are named in `mutation/*.json`, each with
+its reason); the fleet tests race 64 workers across 8 governors and 8 separate processes;
+the whole suite runs against PostgreSQL 14, 16, 17 and 18, and behind PgBouncer; and
+[`scripts/soak.py`](scripts/soak.py) runs a fleet for half an hour while it kills
+governors and cuts their connections, then checks that every operation a worker saw
+succeed is in the ledger exactly once and nothing else is. This is the right harness for these
+properties: a governor that is only *probably* correct under load is not correct, and a
+nondeterministic backend cannot prove a race is absent.
 
 **Proven against the live API.** Correct accounting says nothing about whether the
 metering layer reads a *real* provider response. That gap is closed by
@@ -944,21 +972,36 @@ governed workloads across four Anthropic model tiers through the official `anthr
 SDK, re-prices every settled call independently from the published rates, and writes every
 raw API payload to disk as evidence. See [Live API metering](#live-api-metering) below.
 
-## Roadmap: Phase 2
+### Not in 1.0
 
-Phase 1 is a correct, single-process governor: one ledger, one mutex, durable to a local
-SQLite file, with financial and cognitive breakers on the same actuator. Beyond that:
+- **A server.** AgentGov is a library; the database is the point of coordination.
+- **Holds that expire on their own.** Voiding a hold asserts its call will never settle,
+  which AgentGov cannot know: `void_stale()` is an operator's decision.
+- **Units other than USD.**
+- **Deleting history.** Nothing is pruned, and on PostgreSQL the triggers refuse deletion.
 
+## Roadmap
+
+1.0 governs a process or a fleet: one ledger per budget, verified at every open from a
+checkpoint, audited from genesis, with signed checkpoints and witnesses for those who
+cannot trust whoever writes the database. Beyond it:
+
+- **A chain per root scope (1.1, if measured necessary).** Unrelated envelopes would stop
+  contending for one lock, for a fleet's throughput beyond one chain's and latency that
+  does not grow with the fleet.
+- **Key eras for checkpoint keys.** A governor trusts a checkpoint key at any sequence;
+  ARC1 receipt logs already hand a log from key to key at a size, and checkpoints should
+  too, so a retired or compromised key signs nothing that counts after it.
+- **Inclusion proofs for ledger entries**, from the Merkle frontier every checkpoint
+  already carries, and **public witness networks** (C2SP `tlog-witness`).
+- **More key services:** Google Cloud KMS and PKCS#11 beside AWS KMS, and ECDSA P-256 for
+  hardware that has no Ed25519.
 - **State recovery after a trip.** A halt protects the budget and leaves the task
   unfinished, and a human then has to notice, diagnose and restart it. The design brief
   covers cryptographic state checkpointing over a Merkle prefix tree, an append-only
   intervention ladder ordered by prompt-cache invalidation cost, and a budgeted stopping
   rule over the breaker's own novelty signal. See
   [`ARCHITECTURE.md`, Part B](ARCHITECTURE.md#part-b-the-what-then-protocol-v02-state-recovery-roadmap).
-- **Scaling the shared ledger out.** A fleet can now share one ledger through PostgreSQL
-  (see [A ledger shared by a fleet](#a-ledger-shared-by-a-fleet-postgresql)), but one
-  global chain serializes every write. Next: fewer round trips per catch-up, then a chain
-  per root scope, so unrelated envelopes stop contending for one lock.
 - **x402 / AP2 settlement integration.** Use AgentGov's authorize/capture holds as the
   enforcement point those protocols gesture at but don't enforce at runtime, settling
   real sub-cent agent transactions through a payment rail instead of a simulated ledger.
@@ -982,9 +1025,15 @@ uv run python examples/persistence_demo.py
 ```
 
 Every gate above runs in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on
-Python 3.11 and 3.12, on Linux and macOS, with a 95% coverage floor and a build that
-fails on packaging warnings. Both example scripts are executed end to end so a broken
-demo cannot merge.
+Python 3.11 to 3.14 on Linux, on macOS, on free-threaded 3.14t, and on Windows; against
+PostgreSQL 14, 16, 17 and 18, and behind PgBouncer; with a 95%
+coverage floor and a build that fails on packaging warnings. Interlock's whole suite runs
+against every change. Both example scripts are executed end to end so a broken demo
+cannot merge. Nightly ([`.github/workflows/nightly.yml`](.github/workflows/nightly.yml)):
+the absolute scale gates, a deep model-based run, and the mutation pass. Releases are
+published from CI by trusted publishing, every file with a PEP 740 attestation and build
+provenance, and an SBOM of the extras' dependencies
+([`.github/workflows/release.yml`](.github/workflows/release.yml)).
 
 [`docs/DEMO_RUNBOOK.md`](docs/DEMO_RUNBOOK.md) walks the four commands end to
 end (adopt, halt a runaway, read the chain, catch unmetered spend); start with

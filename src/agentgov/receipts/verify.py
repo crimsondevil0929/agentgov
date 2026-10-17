@@ -24,6 +24,9 @@ A delivery receipt (ARC1 v1.1) is checked for its schema, the log's
 signature, its relay's attestation, inclusion and witness, and, given the
 action receipt's bundle, the binding between the two.
 
+Given a log's key transitions (ARC1 1.2), each signature is checked under
+the key in force for its position, followed from the key the caller trusts.
+
 (``2`` is reserved for usage errors, as with every ``argparse`` program.)
 """
 
@@ -47,15 +50,18 @@ from agentgov.receipts.merkle import verify_inclusion
 from agentgov.receipts.rows import verify_disclosure
 from agentgov.receipts.schema import (
     ActionReceipt,
+    Checkpoint,
     Cosignature,
     DeliveryReceipt,
+    KeySchedule,
+    KeyTransition,
     LogDocument,
     ReceiptBundle,
     RowDisclosure,
     instant,
     money_text,
 )
-from agentgov.receipts.signing import Verifier
+from agentgov.receipts.signing import Keyring, Verifier
 from agentgov.receipts.witness import find_cosignature
 
 if TYPE_CHECKING:
@@ -130,24 +136,27 @@ class VerificationReport:
 def verify_bundle(
     bundle: ReceiptBundle | str | bytes,
     *,
-    issuer_key: Verifier,
-    log_key: Verifier | None = None,
+    issuer_key: Verifier | Keyring,
+    log_key: Verifier | Keyring | None = None,
     cosignatures: Sequence[Cosignature] | None = None,
-    witness_key: Verifier | None = None,
+    witness_key: Verifier | Keyring | None = None,
     ledger: BudgetManager | None = None,
     rows: RowDisclosure | None = None,
     relay_keys: Iterable[Verifier] | None = None,
     action: ReceiptBundle | str | bytes | None = None,
+    transitions: Sequence[KeyTransition] | None = None,
 ) -> VerificationReport:
     """Verify a receipt bundle against the keys and records the caller trusts.
 
     :param bundle: A decoded bundle, or its JSON text.
-    :param issuer_key: The key that must have signed the receipt.
-    :param log_key: The key that must have signed the log checkpoint;
-        ``issuer_key`` by default.
+    :param issuer_key: The key that must have signed the receipt, or a
+        keyring of the keys that may have (a key and its successor).
+    :param log_key: The key, or keyring, that must have signed the log
+        checkpoint; ``issuer_key`` by default.
     :param cosignatures: A witness's published cosignatures. With
         ``witness_key``, the bundle's checkpoint must be among them.
-    :param witness_key: The witness's key; required with ``cosignatures``.
+    :param witness_key: The witness's key, or keyring; required with
+        ``cosignatures``.
     :param ledger: An AgentGov ledger the receipt's agentgov anchor and cost
         must agree with.
     :param rows: Disclosed rows that must be in the receipt's row commitment.
@@ -155,6 +164,9 @@ def verify_bundle(
         must have signed its attestation.
     :param action: For a delivery receipt: the bundle of the action receipt it
         follows from, which it must bind.
+    :param transitions: The log's key transitions (ARC1 1.2). The first must
+        be signed by ``log_key`` (or ``issuer_key``); then the receipt and the
+        checkpoint must each be signed by the key in force for its position.
     """
     checks: list[Check] = []
     if isinstance(bundle, (str, bytes)):
@@ -165,9 +177,10 @@ def verify_bundle(
                 (Check("ARC1 schema", "fail", str(exc), Failure.MALFORMED),), None
             )
     receipt = bundle.receipt
+    keys, followed = _keys(bundle, issuer_key, log_key, transitions)
     if isinstance(receipt, DeliveryReceipt):
         return _verify_delivery(
-            bundle, receipt, issuer_key, log_key, cosignatures, witness_key, relay_keys, action
+            bundle, receipt, keys, followed, cosignatures, witness_key, relay_keys, action
         )
     checks.append(
         Check(
@@ -177,21 +190,75 @@ def verify_bundle(
             f"{receipt.body()['issued_at']} by {receipt.issuer})",
         )
     )
-    checks.append(_check_signature(receipt, issuer_key))
-    checks.append(_check_inclusion(bundle, log_key or issuer_key))
+    if followed is not None:
+        checks.append(followed)
+    checks.append(_check_signature(receipt, keys.receipt(receipt)))
+    checks.append(_check_inclusion(bundle, keys))
     checks.append(_check_witness(bundle, cosignatures, witness_key))
     checks.append(_check_ledger(receipt, ledger))
     checks.append(_check_rows(receipt, rows))
     return VerificationReport(tuple(checks), receipt)
 
 
+class _Keys:
+    """The key each document of a bundle is checked under: the caller's, or,
+    given the log's transitions, the one in force for its position."""
+
+    def __init__(
+        self,
+        issuer: Verifier | Keyring,
+        log: Verifier | Keyring | None,
+        schedule: KeySchedule | None,
+    ) -> None:
+        self.issuer, self.log, self.schedule = issuer, log, schedule
+
+    def receipt(self, receipt: LogDocument) -> Verifier | Keyring:
+        anchor = receipt.anchors.log
+        if self.schedule is not None and anchor is not None:
+            if anchor.log_id == self.schedule.log_id:
+                return self.schedule.for_leaf(anchor.leaf_index)
+        return self.issuer
+
+    def checkpoint(self, checkpoint: Checkpoint) -> Verifier | Keyring:
+        if self.schedule is not None and checkpoint.log_id == self.schedule.log_id:
+            return self.schedule.for_checkpoint(checkpoint.tree_size)
+        return self.log if self.log is not None else self.issuer
+
+
+def _keys(
+    bundle: ReceiptBundle,
+    issuer_key: Verifier | Keyring,
+    log_key: Verifier | Keyring | None,
+    transitions: Sequence[KeyTransition] | None,
+) -> tuple[_Keys, Check | None]:
+    """The keys to check under, and the check of the transitions, if any."""
+    if not transitions:
+        return _Keys(issuer_key, log_key, None), None
+    name = "key transitions"
+    anchor = bundle.receipt.anchors.log
+    log_id = bundle.checkpoint.log_id if bundle.checkpoint is not None else None
+    log_id = log_id or (anchor.log_id if anchor is not None else transitions[0].log_id)
+    trusted = Keyring.of(log_key if log_key is not None else issuer_key)
+    try:
+        schedule = KeySchedule(log_id, trusted, transitions)
+    except (MalformedReceiptError, ReceiptSignatureError) as exc:
+        return _Keys(issuer_key, log_key, None), Check(name, "fail", str(exc), Failure.SIGNATURE)
+    first = schedule.for_leaf(0).key_id
+    return _Keys(issuer_key, log_key, schedule), Check(
+        name,
+        "pass",
+        f"{len(transitions)} transition(s) of log {log_id!r} from key {first} to key "
+        f"{schedule.current.key_id} (since size {schedule.boundary})",
+    )
+
+
 def _verify_delivery(
     bundle: ReceiptBundle,
     receipt: DeliveryReceipt,
-    issuer_key: Verifier,
-    log_key: Verifier | None,
+    keys: _Keys,
+    followed: Check | None,
     cosignatures: Sequence[Cosignature] | None,
-    witness_key: Verifier | None,
+    witness_key: Verifier | Keyring | None,
     relay_keys: Iterable[Verifier] | None,
     action: ReceiptBundle | str | bytes | None,
 ) -> VerificationReport:
@@ -205,11 +272,12 @@ def _verify_delivery(
             f"(attempt {delivery.attempt}, {status}, delivered "
             f"{instant(delivery.delivered_at)}; issued by {receipt.issuer})",
         ),
-        _check_signature(receipt, issuer_key),
+        *([followed] if followed is not None else []),
+        _check_signature(receipt, keys.receipt(receipt)),
         _check_attestation(receipt, relay_keys),
-        _check_inclusion(bundle, log_key or issuer_key),
+        _check_inclusion(bundle, keys),
         _check_witness(bundle, cosignatures, witness_key),
-        _check_binding(bundle, receipt, action, issuer_key, log_key),
+        _check_binding(bundle, receipt, action, keys),
     ]
     return VerificationReport(tuple(checks), receipt)
 
@@ -244,8 +312,7 @@ def _check_binding(
     bundle: ReceiptBundle,
     receipt: DeliveryReceipt,
     action: ReceiptBundle | str | bytes | None,
-    issuer_key: Verifier,
-    log_key: Verifier | None,
+    keys: _Keys,
 ) -> Check:
     name = "action binding"
     if action is None:
@@ -261,11 +328,11 @@ def _check_binding(
     problem = receipt.action.problem(committed)
     if problem is not None:
         return Check(name, "fail", f"the delivery does not bind: {problem}", Failure.BINDING)
-    signed = _check_signature(committed, issuer_key)
+    signed = _check_signature(committed, keys.receipt(committed))
     if signed.status == "fail":
         return Check(name, "fail", f"the action receipt: {signed.detail}", Failure.BINDING)
     if action.checkpoint is not None:
-        included = _check_inclusion(action, log_key or issuer_key)
+        included = _check_inclusion(action, keys)
         if included.status == "fail":
             return Check(name, "fail", f"the action receipt: {included.detail}", Failure.BINDING)
     if (
@@ -290,21 +357,33 @@ def _check_binding(
     )
 
 
-def _check_signature(receipt: LogDocument, key: Verifier) -> Check:
+def _used(keys: Verifier | Keyring, key_id: str) -> Verifier:
+    """The key that verified a signature naming ``key_id``."""
+    if isinstance(keys, Keyring):
+        found = keys.get(key_id)
+        if found is None:  # pragma: no cover - only called once it verified
+            raise AssertionError(key_id)
+        return found
+    return keys
+
+
+def _check_signature(receipt: LogDocument, key: Verifier | Keyring) -> Check:
     try:
         receipt.verify(key)
     except ReceiptSignatureError as exc:
         return Check("receipt signature", "fail", str(exc), Failure.SIGNATURE)
-    return Check("receipt signature", "pass", f"{key.alg}, key {key.key_id}")
+    assert receipt.signature is not None  # it verified
+    used = _used(key, receipt.signature.key_id)
+    return Check("receipt signature", "pass", f"{used.alg}, key {used.key_id}")
 
 
-def _check_inclusion(bundle: ReceiptBundle, log_key: Verifier) -> Check:
+def _check_inclusion(bundle: ReceiptBundle, keys: _Keys) -> Check:
     name = "log inclusion"
     checkpoint, proof = bundle.checkpoint, bundle.inclusion
     if checkpoint is None or proof is None:
         return Check(name, "skip", "the bundle carries no checkpoint")
     try:
-        checkpoint.verify(log_key)
+        checkpoint.verify(keys.checkpoint(checkpoint))
     except ReceiptSignatureError as exc:
         return Check(name, "fail", str(exc), Failure.INCLUSION)
     anchor = bundle.receipt.anchors.log
@@ -350,7 +429,9 @@ def _check_inclusion(bundle: ReceiptBundle, log_key: Verifier) -> Check:
 
 
 def _check_witness(
-    bundle: ReceiptBundle, cosignatures: Sequence[Cosignature] | None, key: Verifier | None
+    bundle: ReceiptBundle,
+    cosignatures: Sequence[Cosignature] | None,
+    key: Verifier | Keyring | None,
 ) -> Check:
     name = "witnessed"
     if cosignatures is None:
@@ -365,10 +446,13 @@ def _check_witness(
         cosignature = find_cosignature(bundle.checkpoint, cosignatures, key)
     except WitnessError as exc:
         return Check(name, "fail", str(exc), Failure.WITNESS)
+    assert cosignature.signature is not None  # it verified
+    used = _used(key, cosignature.signature.key_id)
     return Check(
         name,
         "pass",
-        f"by {cosignature.witness_id!r} (key {key.key_id}) at {cosignature.body()['witnessed_at']}",
+        f"by {cosignature.witness_id!r} (key {used.key_id}) at "
+        f"{cosignature.body()['witnessed_at']}",
     )
 
 

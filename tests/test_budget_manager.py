@@ -6,12 +6,12 @@ from decimal import Decimal
 
 import pytest
 
+import agentgov
 from agentgov.core import BudgetManager, Direction, EntryType, GovernancePolicy, money
 from agentgov.exceptions import (
     BudgetExceededError,
     CircuitOpenError,
     DenialOfWalletError,
-    DenialOfWalletException,
     DoubleSpendError,
     DuplicateScopeError,
     RunawayLoopDetectedError,
@@ -220,6 +220,29 @@ def test_hitting_the_exact_limit_trips_the_breaker_and_halts(
     gov.verify_integrity()
 
 
+def test_exhaustion_trips_on_the_settlement_not_the_hold_or_money_moved_out(
+    gov: BudgetManager,
+) -> None:
+    """A hold on the last of the balance is outstanding, not spent: the
+    capture that settles it exhausts the scope. Delegating or releasing a
+    scope's last cent spends nothing, and trips nothing."""
+    gov.delegate("root", "worker", money("0.10"))
+    auth = gov.authorize("worker", money("0.10"))
+    assert gov.available("worker") == ZERO
+    assert not gov.is_halted("worker")
+    gov.capture(auth, money("0.10"))
+    assert gov.is_halted("worker")
+
+    gov.delegate("root", "parent", money("0.10"))
+    gov.delegate("parent", "child", money("0.10"))
+    gov.delegate("root", "returner", money("0.10"))
+    gov.release("returner")
+    assert gov.available("parent") == gov.available("returner") == ZERO
+    assert not gov.is_halted("parent")
+    assert not gov.is_halted("returner")
+    gov.verify_integrity()
+
+
 def test_overdrawing_raises_denial_of_wallet_and_moves_no_money(
     gov: BudgetManager,
 ) -> None:
@@ -243,8 +266,12 @@ def test_overdrawing_raises_denial_of_wallet_and_moves_no_money(
     gov.verify_integrity()
 
 
-def test_denial_of_wallet_exception_alias_is_the_same_class() -> None:
+def test_denial_of_wallet_exception_alias_is_the_same_class_and_deprecated() -> None:
+    with pytest.warns(DeprecationWarning, match="removed in 2.0: catch DenialOfWalletError"):
+        from agentgov.exceptions import DenialOfWalletException
     assert DenialOfWalletException is DenialOfWalletError
+    with pytest.warns(DeprecationWarning, match="removed in 2.0"):
+        assert agentgov.DenialOfWalletException is DenialOfWalletError
     assert issubclass(DenialOfWalletError, BudgetExceededError)
 
 
@@ -372,5 +399,5 @@ def test_audit_logging_emits_one_record_per_entry(
     records = [r for r in caplog.records if r.name == "agentgov.audit"]
     # allocation (2 legs) + hold + hold_void + spend
     assert len(records) == 5
-    assert all(r.message.startswith("AGOV2|") for r in records)
+    assert all(r.message.startswith("AGOV3|") for r in records)
     assert all(hasattr(r, "agentgov_entry") for r in records)

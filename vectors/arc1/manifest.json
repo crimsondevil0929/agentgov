@@ -350,6 +350,120 @@
         "keys/issuer.pub"
       ],
       "description": "a delivery that claims a place before the action it follows from"
+    },
+    {
+      "name": "v12-sealed",
+      "exit": 0,
+      "args": [
+        "v12/valid/sealed.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v12/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "signature version 2: a receipt under the outgoing key's last checkpoint, checked with that key alone"
+    },
+    {
+      "name": "v12-early",
+      "exit": 0,
+      "args": [
+        "v12/valid/early.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v12/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+        "--transitions",
+        "v12/log/receipts.jsonl.transitions"
+      ],
+      "description": "a receipt of the outgoing key's era, under the incoming key's checkpoint, followed from the outgoing key"
+    },
+    {
+      "name": "v12-late",
+      "exit": 0,
+      "args": [
+        "v12/valid/late.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v12/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+        "--transitions",
+        "v12/log/receipts.jsonl.transitions"
+      ],
+      "description": "a receipt of the incoming key, followed from the outgoing key"
+    },
+    {
+      "name": "v12-late-both-keys",
+      "exit": 0,
+      "args": [
+        "v12/valid/late.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--pubkey",
+        "v12/keys/issuer-2.pub"
+      ],
+      "description": "the same receipt, with both keys trusted outright"
+    },
+    {
+      "name": "v12-late-unfollowed",
+      "exit": 4,
+      "args": [
+        "v12/valid/late.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "the incoming key's receipt, without the transition that names its key"
+    },
+    {
+      "name": "v12-forged-transition",
+      "exit": 4,
+      "args": [
+        "v12/valid/late.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--transitions",
+        "v12/invalid/forged.transitions"
+      ],
+      "description": "a transition to another key, signed by it, claiming the issuer's key id"
+    },
+    {
+      "name": "v12-downgraded",
+      "exit": 4,
+      "args": [
+        "v12/invalid/downgraded.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--transitions",
+        "v12/log/receipts.jsonl.transitions"
+      ],
+      "description": "a version 2 signature presented as version 1"
+    },
+    {
+      "name": "v12-unknown-version",
+      "exit": 3,
+      "args": [
+        "v12/invalid/unknown-version.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "a signature version that does not exist"
+    },
+    {
+      "name": "v12-old-key-past-its-era",
+      "exit": 5,
+      "args": [
+        "v12/invalid/old-key-past-its-era.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--transitions",
+        "v12/log/receipts.jsonl.transitions"
+      ],
+      "description": "the outgoing key signs a checkpoint past the size it handed over"
     }
   ]
 }

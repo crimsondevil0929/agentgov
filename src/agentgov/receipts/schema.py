@@ -16,11 +16,20 @@ control characters.
 The signed bytes of a document are its canonical encoding with ``sig``
 reduced to ``{"alg", "key_id"}``, prefixed by the document type's domain
 string. The signature therefore covers which key and algorithm are claimed,
-and a signature over one kind of document never verifies as another.
+and a signature over one kind of document never verifies as another. A
+version 2 signature (ARC1 1.2) covers the domain and the SHA-512 of that
+encoding instead, with ``"sv": 2`` in the header, so the signed message is
+under 100 bytes whatever the document's size: a key service that limits the
+messages it signs (AWS KMS: 4096 bytes) signs any receipt.
+
+A :class:`KeyTransition` (ARC1 1.2) is signed by a log's outgoing key and
+names its incoming key, so a log outlives its key; a :class:`KeySchedule`
+follows them from a key the verifier trusts.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -37,7 +46,15 @@ from agentgov.receipts.canonical import (
     loads_strict,
 )
 from agentgov.receipts.merkle import leaf_hash
-from agentgov.receipts.signing import ALG_ED25519, ALG_HMAC_SHA256, Signer, Verifier
+from agentgov.receipts.signing import (
+    ALG_ED25519,
+    ALG_HMAC_SHA256,
+    AsyncSigner,
+    Ed25519PublicKey,
+    Keyring,
+    Signer,
+    Verifier,
+)
 
 __all__ = [
     "ActionBinding",
@@ -62,6 +79,8 @@ __all__ = [
     "EffectSummary",
     "InclusionProof",
     "Intent",
+    "KeySchedule",
+    "KeyTransition",
     "LogAnchor",
     "LogDocument",
     "Outcome",
@@ -87,6 +106,20 @@ DELIVERY_DOMAIN = b"ARC1/delivery/v1\n"
 ATTESTATION_DOMAIN = b"ARC1/attestation/v1\n"
 CHECKPOINT_DOMAIN = b"ARC1/checkpoint/v1\n"
 COSIGNATURE_DOMAIN = b"ARC1/cosignature/v1\n"
+TRANSITION_VERSION = "ARC1-transition"
+TRANSITION_DOMAIN = b"ARC1/transition/v1\n"
+
+SIGNATURE_VERSIONS = (1, 2)
+"""Version 1 signs the domain and the canonical document (ARC1 1.0, 1.1);
+version 2 (ARC1 1.2) signs the version 2 domain and the document's SHA-512."""
+_DOMAIN_V2 = {
+    RECEIPT_DOMAIN: b"ARC1/receipt/v2\n",
+    DELIVERY_DOMAIN: b"ARC1/delivery/v2\n",
+    ATTESTATION_DOMAIN: b"ARC1/attestation/v2\n",
+    CHECKPOINT_DOMAIN: b"ARC1/checkpoint/v2\n",
+    COSIGNATURE_DOMAIN: b"ARC1/cosignature/v2\n",
+    TRANSITION_DOMAIN: b"ARC1/transition/v2\n",
+}
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _KEY_ID = re.compile(r"[0-9a-f]{16}")
@@ -191,6 +224,9 @@ class _Fields:
     def raw(self, key: str) -> Any:
         return self._value[key]
 
+    def has(self, key: str) -> bool:
+        return key in self._value
+
     def path(self, key: str) -> str:
         return f"{self._path}.{key}"
 
@@ -277,9 +313,16 @@ class Signature:
     alg: str
     key_id: str
     value: bytes
+    version: int = 1
+    """1: over the domain and the canonical document; 2 (ARC1 1.2): over the
+    version 2 domain and the document's SHA-512, and written ``"sv": 2``."""
 
     def to_json(self) -> dict[str, Any]:
-        return {"alg": self.alg, "key_id": self.key_id, "signature": self.value.hex()}
+        sig: dict[str, Any] = {"alg": self.alg, "key_id": self.key_id}
+        if self.version != 1:
+            sig["sv"] = self.version
+        sig["signature"] = self.value.hex()
+        return sig
 
     @classmethod
     def from_json(cls, fields: _Fields) -> Signature:
@@ -298,24 +341,73 @@ class Signature:
                 f"{fields.path('signature')} is {len(value)} bytes; an {alg} signature "
                 f"is {_SIGNATURE_BYTES[alg]}"
             )
-        return cls(alg=alg, key_id=key_id, value=value)
+        version = 1
+        if fields.has("sv"):
+            version = fields.raw("sv")
+            if type(version) is not int or version != 2:
+                raise MalformedReceiptError(
+                    f"{fields.path('sv')} must be 2: a version 1 signature has no sv"
+                )
+        return cls(alg=alg, key_id=key_id, value=value, version=version)
 
 
 _SIG_FIELDS = ("alg", "key_id", "signature")
+_SIG_FIELDS_V2 = ("alg", "key_id", "sv", "signature")
 
 
-def _signing_input(domain: bytes, body: Mapping[str, Any], alg: str, key_id: str) -> bytes:
-    return domain + canonical_bytes({**body, "sig": {"alg": alg, "key_id": key_id}})
+def _sig_fields(value: object) -> tuple[str, ...]:
+    """A version 2 signature names its version; a version 1 signature has
+    exactly the three members it always had."""
+    return _SIG_FIELDS_V2 if isinstance(value, dict) and "sv" in value else _SIG_FIELDS
+
+
+def _signing_input(
+    domain: bytes, body: Mapping[str, Any], alg: str, key_id: str, version: int = 1
+) -> bytes:
+    if version == 1:
+        return domain + canonical_bytes({**body, "sig": {"alg": alg, "key_id": key_id}})
+    if version != 2:
+        raise ValueError(f"signature version {version!r} is not 1 or 2")
+    header = {"alg": alg, "key_id": key_id, "sv": 2}
+    return _domain_v2(domain) + hashlib.sha512(canonical_bytes({**body, "sig": header})).digest()
+
+
+def _domain_v2(domain: bytes) -> bytes:
+    """A document type's version 2 domain: its version 1 domain, ``v2`` for ``v1``."""
+    found = _DOMAIN_V2.get(domain)
+    if found is not None:
+        return found
+    if not domain.endswith(b"/v1\n"):
+        raise ValueError(f"{domain!r} is not a version 1 domain")
+    return domain[: -len(b"v1\n")] + b"v2\n"
+
+
+def _signature_version(signer: object, version: int | None) -> int:
+    """The version to sign with: the one asked for, or else the signer's own
+    (a key service that limits message size prefers 2), or else 1."""
+    chosen = version if version is not None else getattr(signer, "signature_version", 1)
+    if chosen not in SIGNATURE_VERSIONS:
+        raise ValueError(f"signature version {chosen!r} is not 1 or 2")
+    return int(chosen)
 
 
 def _check_signature(
     what: str,
     signature: Signature | None,
-    verifier: Verifier,
-    payload: Callable[[str, str], bytes],
+    verifier: Verifier | Keyring,
+    payload: Callable[[str, str, int], bytes],
 ) -> None:
     if signature is None:
         raise ReceiptSignatureError(f"the {what} is not signed")
+    if isinstance(verifier, Keyring):
+        key = verifier.get(signature.key_id)
+        if key is None:
+            held = ", ".join(sorted(k.key_id for k in verifier)) or "none"
+            raise ReceiptSignatureError(
+                f"the {what} was signed by key {signature.key_id}, which is not among the "
+                f"keys given ({held})"
+            )
+        verifier = key
     if signature.alg != verifier.alg:
         raise ReceiptSignatureError(
             f"the {what} claims an {signature.alg} signature but the key given is "
@@ -326,7 +418,9 @@ def _check_signature(
             f"the {what} was signed by key {signature.key_id}, not by the key given "
             f"({verifier.key_id})"
         )
-    if not verifier.verify(payload(signature.alg, signature.key_id), signature.value):
+    if not verifier.verify(
+        payload(signature.alg, signature.key_id, signature.version), signature.value
+    ):
         raise ReceiptSignatureError(
             f"the {what}'s {signature.alg} signature does not verify under key "
             f"{verifier.key_id}: it was altered after signing, or was never signed by that key"
@@ -822,18 +916,27 @@ class ActionReceipt:
         """RFC 9162 leaf hash of :meth:`canonical`."""
         return leaf_hash(self.canonical())
 
-    def signing_input(self, alg: str, key_id: str) -> bytes:
-        return _signing_input(RECEIPT_DOMAIN, self.body(), alg, key_id)
+    def signing_input(self, alg: str, key_id: str, version: int = 1) -> bytes:
+        return _signing_input(RECEIPT_DOMAIN, self.body(), alg, key_id, version)
 
     # -- signing ----------------------------------------------------------
 
-    def sign(self, signer: Signer) -> ActionReceipt:
-        """A copy signed by ``signer``."""
-        value = signer.sign(self.signing_input(signer.alg, signer.key_id))
-        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
+    async def sign_async(self, signer: AsyncSigner, *, version: int | None = None) -> ActionReceipt:
+        """:meth:`sign`, awaiting the signer."""
+        version = _signature_version(signer, version)
+        message = self.signing_input(signer.alg, signer.key_id, version)
+        value = await signer.sign_async(message)
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value, version))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this."""
+    def sign(self, signer: Signer, *, version: int | None = None) -> ActionReceipt:
+        """A copy signed by ``signer``."""
+        version = _signature_version(signer, version)
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id, version))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value, version))
+
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("receipt", self.signature, verifier, self.signing_input)
 
     def with_log_anchor(self, log_id: str, leaf_index: int) -> ActionReceipt:
@@ -851,7 +954,7 @@ class ActionReceipt:
         """
         f = _Fields(value, path, _RECEIPT_FIELDS)
         f.version(RECEIPT_VERSION)
-        sig = f.optional_child("sig", _SIG_FIELDS)
+        sig = f.optional_child("sig", _sig_fields(f.raw("sig")))
         return cls(
             receipt_id=f.uuid("receipt_id"),
             issued_at=f.instant("issued_at"),
@@ -1025,22 +1128,24 @@ class Attestation:
     def to_json(self) -> dict[str, Any]:
         return {**self.body(), "sig": self.signature.to_json() if self.signature else None}
 
-    def signing_input(self, alg: str, key_id: str) -> bytes:
-        return _signing_input(ATTESTATION_DOMAIN, self.body(), alg, key_id)
+    def signing_input(self, alg: str, key_id: str, version: int = 1) -> bytes:
+        return _signing_input(ATTESTATION_DOMAIN, self.body(), alg, key_id, version)
 
-    def sign(self, signer: Signer) -> Attestation:
-        value = signer.sign(self.signing_input(signer.alg, signer.key_id))
-        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
+    def sign(self, signer: Signer, *, version: int | None = None) -> Attestation:
+        version = _signature_version(signer, version)
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id, version))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value, version))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this."""
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("attestation", self.signature, verifier, self.signing_input)
 
     @classmethod
     def from_json(cls, value: object, path: str = "attestation") -> Attestation:
         f = _Fields(value, path, ("v", "request", "outcome", "sig"))
         f.version(ATTESTATION_VERSION)
-        sig = f.optional_child("sig", _SIG_FIELDS)
+        sig = f.optional_child("sig", _sig_fields(f.raw("sig")))
         return cls(
             request=DeliveredRequest.from_json(f.child("request", _REQUEST_FIELDS)),
             outcome=AttestedOutcome.from_json(f.child("outcome", _OUTCOME_FIELDS)),
@@ -1253,17 +1358,28 @@ class DeliveryReceipt:
     def leaf_hash(self) -> bytes:
         return leaf_hash(self.canonical())
 
-    def signing_input(self, alg: str, key_id: str) -> bytes:
-        return _signing_input(DELIVERY_DOMAIN, self.body(), alg, key_id)
+    def signing_input(self, alg: str, key_id: str, version: int = 1) -> bytes:
+        return _signing_input(DELIVERY_DOMAIN, self.body(), alg, key_id, version)
 
     # -- signing ----------------------------------------------------------
 
-    def sign(self, signer: Signer) -> DeliveryReceipt:
-        value = signer.sign(self.signing_input(signer.alg, signer.key_id))
-        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
+    async def sign_async(
+        self, signer: AsyncSigner, *, version: int | None = None
+    ) -> DeliveryReceipt:
+        """:meth:`sign`, awaiting the signer."""
+        version = _signature_version(signer, version)
+        message = self.signing_input(signer.alg, signer.key_id, version)
+        value = await signer.sign_async(message)
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value, version))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this."""
+    def sign(self, signer: Signer, *, version: int | None = None) -> DeliveryReceipt:
+        version = _signature_version(signer, version)
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id, version))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value, version))
+
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless ``verifier``'s key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("delivery receipt", self.signature, verifier, self.signing_input)
 
     def with_log_anchor(self, log_id: str, leaf_index: int) -> DeliveryReceipt:
@@ -1281,7 +1397,7 @@ class DeliveryReceipt:
         """
         f = _Fields(value, path, _DELIVERY_FIELDS)
         f.version(DELIVERY_VERSION)
-        sig = f.optional_child("sig", _SIG_FIELDS)
+        sig = f.optional_child("sig", _sig_fields(f.raw("sig")))
         return cls(
             receipt_id=f.uuid("receipt_id"),
             issued_at=f.instant("issued_at"),
@@ -1304,7 +1420,9 @@ class DeliveryReceipt:
                     ),
                 )
             ),
-            attestation=Signature.from_json(f.child("attestation", _SIG_FIELDS)),
+            attestation=Signature.from_json(
+                f.child("attestation", _sig_fields(f.raw("attestation")))
+            ),
             anchors=Anchors.from_json(f.child("anchors", ("agentgov", "escrow", "log"))),
             signature=Signature.from_json(sig) if sig else None,
         )
@@ -1357,22 +1475,24 @@ class Checkpoint:
     def to_json(self) -> dict[str, Any]:
         return {**self.body(), "sig": self.signature.to_json() if self.signature else None}
 
-    def signing_input(self, alg: str, key_id: str) -> bytes:
-        return _signing_input(CHECKPOINT_DOMAIN, self.body(), alg, key_id)
+    def signing_input(self, alg: str, key_id: str, version: int = 1) -> bytes:
+        return _signing_input(CHECKPOINT_DOMAIN, self.body(), alg, key_id, version)
 
-    def sign(self, signer: Signer) -> Checkpoint:
-        value = signer.sign(self.signing_input(signer.alg, signer.key_id))
-        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
+    def sign(self, signer: Signer, *, version: int | None = None) -> Checkpoint:
+        version = _signature_version(signer, version)
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id, version))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value, version))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless the log's key signed this."""
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless the log's key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("checkpoint", self.signature, verifier, self.signing_input)
 
     @classmethod
     def from_json(cls, value: object, path: str = "checkpoint") -> Checkpoint:
         f = _Fields(value, path, ("v", "log_id", "tree_size", "root_hash", "issued_at", "sig"))
         f.version(CHECKPOINT_VERSION)
-        sig = f.optional_child("sig", _SIG_FIELDS)
+        sig = f.optional_child("sig", _sig_fields(f.raw("sig")))
         return cls(
             log_id=f.text("log_id"),
             tree_size=f.integer("tree_size"),
@@ -1407,15 +1527,17 @@ class Cosignature:
     def to_json(self) -> dict[str, Any]:
         return {**self.body(), "sig": self.signature.to_json() if self.signature else None}
 
-    def signing_input(self, alg: str, key_id: str) -> bytes:
-        return _signing_input(COSIGNATURE_DOMAIN, self.body(), alg, key_id)
+    def signing_input(self, alg: str, key_id: str, version: int = 1) -> bytes:
+        return _signing_input(COSIGNATURE_DOMAIN, self.body(), alg, key_id, version)
 
-    def sign(self, signer: Signer) -> Cosignature:
-        value = signer.sign(self.signing_input(signer.alg, signer.key_id))
-        return replace(self, signature=Signature(signer.alg, signer.key_id, value))
+    def sign(self, signer: Signer, *, version: int | None = None) -> Cosignature:
+        version = _signature_version(signer, version)
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id, version))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value, version))
 
-    def verify(self, verifier: Verifier) -> None:
-        """:raises ReceiptSignatureError: Unless the witness's key signed this."""
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless the witness's key signed this
+        (given a keyring, the key the signature names, if the keyring holds it)."""
         _check_signature("cosignature", self.signature, verifier, self.signing_input)
 
     @classmethod
@@ -1426,7 +1548,7 @@ class Cosignature:
             ("v", "witness_id", "log_id", "tree_size", "root_hash", "witnessed_at", "sig"),
         )
         f.version(COSIGNATURE_VERSION)
-        sig = f.optional_child("sig", _SIG_FIELDS)
+        sig = f.optional_child("sig", _sig_fields(f.raw("sig")))
         return cls(
             witness_id=f.text("witness_id"),
             log_id=f.text("log_id"),
@@ -1435,6 +1557,227 @@ class Cosignature:
             witnessed_at=f.instant("witnessed_at"),
             signature=Signature.from_json(sig) if sig else None,
         )
+
+
+# --------------------------------------------------------------------------
+# Key transitions (ARC1 1.2): a log outlives its key
+# --------------------------------------------------------------------------
+
+_TRANSITION_FIELDS = ("v", "log_id", "tree_size", "incoming", "issued_at", "sig")
+_INCOMING_FIELDS = ("alg", "key_id", "public_key")
+
+
+@dataclass(frozen=True)
+class KeyTransition:
+    """A log's outgoing key handing the log to its incoming key.
+
+    Signed by the outgoing key, it names the incoming key and the tree size
+    ``tree_size`` at which the hand-over happens: the leaves from index
+    ``tree_size`` on, and every checkpoint larger than ``tree_size``, are the
+    incoming key's to sign; the outgoing key keeps the leaves before and the
+    checkpoints up to that size. An Ed25519 incoming key is named with its
+    public key, so a verifier who trusts only the outgoing key learns the
+    incoming one from the transition; an HMAC key is named by id alone, and a
+    verifier must already hold it.
+    """
+
+    log_id: str
+    tree_size: int
+    incoming_alg: str
+    incoming_key_id: str
+    incoming_public_key: str | None
+    issued_at: datetime
+    signature: Signature | None = None
+
+    @classmethod
+    def of(
+        cls, log_id: str, tree_size: int, incoming: Verifier, issued_at: datetime
+    ) -> KeyTransition:
+        """An unsigned transition to ``incoming`` at ``tree_size``."""
+        raw = getattr(incoming, "raw", None)
+        public = raw.hex() if incoming.alg == ALG_ED25519 and isinstance(raw, bytes) else None
+        if incoming.alg == ALG_ED25519 and public is None:
+            raise ValueError("an Ed25519 incoming key is named by its public key")
+        return cls(
+            log_id=_check_text(log_id, "log_id"),
+            tree_size=_check_int(tree_size, "tree_size"),
+            incoming_alg=incoming.alg,
+            incoming_key_id=incoming.key_id,
+            incoming_public_key=public,
+            issued_at=issued_at,
+        )
+
+    def body(self) -> dict[str, Any]:
+        return {
+            "v": TRANSITION_VERSION,
+            "log_id": self.log_id,
+            "tree_size": self.tree_size,
+            "incoming": {
+                "alg": self.incoming_alg,
+                "key_id": self.incoming_key_id,
+                "public_key": self.incoming_public_key,
+            },
+            "issued_at": instant(self.issued_at),
+        }
+
+    def to_json(self) -> dict[str, Any]:
+        return {**self.body(), "sig": self.signature.to_json() if self.signature else None}
+
+    def signing_input(self, alg: str, key_id: str, version: int = 1) -> bytes:
+        return _signing_input(TRANSITION_DOMAIN, self.body(), alg, key_id, version)
+
+    def sign(self, signer: Signer, *, version: int | None = None) -> KeyTransition:
+        """Signed by the outgoing key."""
+        version = _signature_version(signer, version)
+        value = signer.sign(self.signing_input(signer.alg, signer.key_id, version))
+        return replace(self, signature=Signature(signer.alg, signer.key_id, value, version))
+
+    def verify(self, verifier: Verifier | Keyring) -> None:
+        """:raises ReceiptSignatureError: Unless the outgoing key signed this."""
+        _check_signature("key transition", self.signature, verifier, self.signing_input)
+
+    def incoming(self, trusted: Keyring | None = None) -> Verifier | None:
+        """The incoming key: from its public key, or for an HMAC key, the one
+        ``trusted`` holds under its id."""
+        if self.incoming_public_key is not None:
+            return Ed25519PublicKey(bytes.fromhex(self.incoming_public_key))
+        return trusted.get(self.incoming_key_id) if trusted is not None else None
+
+    @classmethod
+    def from_json(cls, value: object, path: str = "transition") -> KeyTransition:
+        f = _Fields(value, path, _TRANSITION_FIELDS)
+        f.version(TRANSITION_VERSION)
+        incoming = f.child("incoming", _INCOMING_FIELDS)
+        alg = incoming.raw("alg")
+        if alg not in _SIGNATURE_BYTES:
+            raise MalformedReceiptError(
+                f"{incoming.path('alg')} must be {ALG_ED25519!r} or {ALG_HMAC_SHA256!r}"
+            )
+        key_id = incoming.pattern("key_id", _KEY_ID, "16 lowercase hex characters")
+        public = incoming.raw("public_key")
+        if alg == ALG_ED25519:
+            public = incoming.hex64("public_key")
+            if Ed25519PublicKey(bytes.fromhex(public)).key_id != key_id:
+                raise MalformedReceiptError(
+                    f"{incoming.path('key_id')} is not the id of the public key it names"
+                )
+        elif public is not None:
+            raise MalformedReceiptError(
+                f"{incoming.path('public_key')} must be null: an HMAC key is never published"
+            )
+        sig = f.optional_child("sig", _sig_fields(f.raw("sig")))
+        return cls(
+            log_id=f.text("log_id"),
+            tree_size=f.integer("tree_size"),
+            incoming_alg=alg,
+            incoming_key_id=key_id,
+            incoming_public_key=public,
+            issued_at=f.instant("issued_at"),
+            signature=Signature.from_json(sig) if sig else None,
+        )
+
+    @classmethod
+    def loads(cls, text: str | bytes) -> KeyTransition:
+        return cls.from_json(loads_strict(text))
+
+
+class KeySchedule:
+    """Which key signs which part of a log: the key a verifier trusts, then
+    each key a verified transition hands the log to.
+
+    :param log_id: The log the transitions must be for.
+    :param trusted: The keys the verifier trusts. The first transition must
+        be signed by one of them; an HMAC incoming key must be one of them.
+    :param transitions: The log's transitions, in order. Each is signed by
+        the key the one before handed the log to, at a size no smaller.
+    :raises ReceiptSignatureError: If a transition is not signed by the key
+        in force before it, or hands the log to a key the verifier cannot use.
+    :raises MalformedReceiptError: If a transition is for another log, or
+        goes back in size.
+    """
+
+    __slots__ = ("_eras", "_log_id", "_transitions")
+
+    def __init__(self, log_id: str, trusted: Keyring, transitions: Sequence[KeyTransition]) -> None:
+        if not transitions:
+            raise ValueError("a key schedule follows at least one transition")
+        self._log_id = log_id
+        self._transitions = tuple(transitions)
+        first = transitions[0]
+        if first.signature is None:
+            raise ReceiptSignatureError(f"the first key transition of log {log_id!r} is not signed")
+        current = trusted.get(first.signature.key_id)
+        if current is None:
+            raise ReceiptSignatureError(
+                f"the first key transition of log {log_id!r} is signed by key "
+                f"{first.signature.key_id}, which is not among the keys trusted"
+            )
+        eras: list[tuple[int, Verifier]] = [(0, current)]
+        size = 0
+        for number, transition in enumerate(transitions, start=1):
+            if transition.log_id != log_id:
+                raise MalformedReceiptError(
+                    f"key transition {number} is for log {transition.log_id!r}, not {log_id!r}"
+                )
+            if transition.tree_size < size:
+                raise MalformedReceiptError(
+                    f"key transition {number} hands the log over at size "
+                    f"{transition.tree_size}, before the size {size} of the one before it"
+                )
+            try:
+                transition.verify(current)
+            except ReceiptSignatureError as exc:
+                raise ReceiptSignatureError(
+                    f"key transition {number} of log {log_id!r} is not signed by the key in "
+                    f"force before it ({current.key_id}): {exc}"
+                ) from exc
+            incoming = transition.incoming(trusted)
+            if incoming is None:
+                raise ReceiptSignatureError(
+                    f"key transition {number} hands log {log_id!r} to HMAC key "
+                    f"{transition.incoming_key_id}, which is not among the keys trusted"
+                )
+            size, current = transition.tree_size, incoming
+            eras.append((size, current))
+        self._eras = tuple(eras)
+
+    @property
+    def log_id(self) -> str:
+        return self._log_id
+
+    @property
+    def transitions(self) -> tuple[KeyTransition, ...]:
+        return self._transitions
+
+    @property
+    def current(self) -> Verifier:
+        """The key that signs the log's next leaves and checkpoints."""
+        return self._eras[-1][1]
+
+    @property
+    def boundary(self) -> int:
+        """The size at which the current key took the log over."""
+        return self._eras[-1][0]
+
+    def for_leaf(self, index: int) -> Verifier:
+        """The key that signs the leaf at ``index``."""
+        key = self._eras[0][1]
+        for size, era_key in self._eras[1:]:
+            if index >= size:
+                key = era_key
+        return key
+
+    def for_checkpoint(self, tree_size: int) -> Verifier:
+        """The key that signs a checkpoint of ``tree_size`` leaves."""
+        key = self._eras[0][1]
+        for size, era_key in self._eras[1:]:
+            if tree_size > size:
+                key = era_key
+        return key
+
+    def keyring(self) -> Keyring:
+        """Every key of the schedule."""
+        return Keyring(key for _, key in self._eras)
 
 
 # --------------------------------------------------------------------------

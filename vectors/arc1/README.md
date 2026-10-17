@@ -32,6 +32,8 @@ format is specified in [`docs/RECEIPTS.md`](../../docs/RECEIPTS.md).
 - `valid/`: bundles and row disclosures that verify.
 - `invalid/`: each one broken in exactly one way.
 - `delivery/`: ARC1 v1.1 delivery receipts, in a log of their own (below).
+- `v12/`: ARC1 1.2, signature version 2 and a key transition, in a log of
+  their own (below).
 - `manifest.json`: every command-line case, and the exit code it must produce.
 
 ## The receipts
@@ -69,6 +71,25 @@ capability for one tenant:
 claims the relay's id, a payload hash the relay never attested, a binding to
 another receipt, a status edited after signing, and a delivery placed before
 the action it follows from.
+
+## Signature version 2 and a key transition (ARC1 1.2)
+
+`v12/` is a third log, `arc1-vectors-v12`, of five receipts, every signature
+in it version 2 (`"sv": 2`: the domain and the SHA-512 of the canonical
+document are signed). Receipts 0 to 2 are signed by the issuer key. The
+issuer then signs a checkpoint at size 3 and the transition in
+`log/receipts.jsonl.transitions`, handing the log at size 3 to its successor
+(`keys/issuer-2.pub`), which signs receipts 3 and 4 and the checkpoint at
+size 5. The witness cosigns both checkpoints.
+
+- `valid/sealed.bundle.json`: receipt 1 under the checkpoint at 3, the
+  issuer's: it verifies with the issuer's key alone.
+- `valid/early.bundle.json` and `valid/late.bundle.json`: receipts 1 and 4
+  under the checkpoint at 5, the successor's. They verify from the issuer's
+  key by following the transition, or with both keys trusted outright.
+- `invalid/`: a transition forged in the issuer's name, a version 2
+  signature presented as version 1, a signature version that does not exist,
+  and a checkpoint the issuer signed past the size it handed over.
 
 ## Running the cases
 

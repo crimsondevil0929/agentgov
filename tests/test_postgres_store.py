@@ -18,6 +18,8 @@ from typing import Any, LiteralString
 
 import psycopg
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 from psycopg import sql
 
 from agentgov.core import (
@@ -47,7 +49,16 @@ ADVISORY = GovernancePolicy(trip_on_overdraft=False, trip_on_exhaustion=False)
 
 def admin(dsn: str) -> psycopg.Connection[tuple[Any, ...]]:
     """An autocommit connection as the database's owner."""
-    return psycopg.connect(dsn, autocommit=True)
+    return psycopg.connect(dsn, autocommit=True, prepare_threshold=None)
+
+
+def server_pid(conn: psycopg.Connection[Any]) -> int:
+    """The server backend serving ``conn`` now: inside a transaction, the one
+    serving it, directly or behind a pooler, whose own pid
+    (``conn.info.backend_pid``) is not a server's."""
+    row = conn.execute("SELECT pg_backend_pid()").fetchone()
+    assert row is not None
+    return int(row[0])
 
 
 def seeded(dsn: str, **kwargs: Any) -> BudgetManager:
@@ -80,7 +91,7 @@ def test_the_store_is_a_shared_store_and_sqlite_is_not(pg_dsn: str) -> None:
     try:
         assert isinstance(store, SharedStore)
         assert store.schema == "agentgov"
-        assert store.schema_version == "pg1"
+        assert store.schema_version == "pg2"
     finally:
         store.close()
     single = SqliteStore(":memory:")
@@ -109,6 +120,28 @@ def test_a_fresh_database_starts_empty_and_installs_its_schema(pg_dsn: str) -> N
         "open_authorizations",
         "join_key",
         "claims",
+        "snapshots",
+        "audit_marks",
+        "idempotency",
+    }
+    with admin(pg_dsn) as conn:
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE schemaname = 'agentgov' AND tablename = 'entries'"
+            )
+        }
+    # By scope and by type, never by transaction_id or ref: their random
+    # values would cost every commit an index page under the writer lock.
+    # Only refunds are indexed by the spend they name, which few writes are.
+    assert indexes == {
+        "entries_pkey",
+        "entries_entry_id_key",
+        "entries_by_scope",
+        "entries_by_type_memo",
+        "entries_checkpoints",
+        "entries_reversals",
     }
 
 
@@ -319,7 +352,7 @@ def test_a_write_outside_a_writer_session_is_refused(pg_dsn: str, gov: BudgetMan
     try:
         ledger = Ledger(store=store)
         with pytest.raises(StorageError, match="outside a writer session"):
-            ledger.post([LedgerLine(EntryType.FUNDING, Direction.CREDIT, "rogue", money("1"))])
+            ledger._post([LedgerLine(EntryType.FUNDING, Direction.CREDIT, "rogue", money("1"))])
         with pytest.raises(StorageError, match="outside a writer session"):
             store.rebuild_caches(nodes=(), control_events=(), authorizations=())
         assert len(ledger) == len(gov.ledger), "nothing reached memory either"
@@ -341,25 +374,37 @@ def test_writer_sessions_nest_and_only_the_outermost_commits(pg_dsn: str) -> Non
 
 def test_a_failure_the_store_did_not_see_still_rolls_the_session_back(pg_dsn: str) -> None:
     """PostgreSQL answers COMMIT in an aborted transaction with ROLLBACK, not an
-    error; the session must not report that as committed."""
+    error; the session must not report that as committed, and says so as it
+    ends, whoever caught the error inside it."""
     store = PostgresStore(pg_dsn)
     try:
-        with store.writer() as session:
-            with suppress(psycopg.Error):
-                store._conn.execute("SELECT 1 / 0")
+        with pytest.raises(StorageError, match="none of it was committed"):
+            with store.writer() as session:
+                with suppress(psycopg.Error):
+                    store._conn.execute("SELECT 1 / 0")
         assert not session.committed
     finally:
         store.close()
 
 
 def test_a_write_the_database_refuses_fails_the_whole_session(pg_dsn: str) -> None:
+    """Writes go to the database with the COMMIT, so a refused one fails the
+    session as it ends; a read inside the session sends them first, and
+    learns of the refusal there."""
     store = PostgresStore(pg_dsn)
     try:
-        with store.writer() as session:
-            with pytest.raises(LedgerIntegrityError, match="durably append"):
+        with pytest.raises(LedgerIntegrityError, match="durably append 1 entry"):
+            with store.writer() as session:
                 store.commit(WriteBatch(entries=[_forged_first_entry()]))
-            with pytest.raises(StorageError, match="earlier write in this session failed"):
+        assert session.wrote and not session.committed
+        assert store.head() == (0, GENESIS_HASH)
+        with pytest.raises(StorageError, match="none of it was committed"):
+            with store.writer() as session:
                 store.commit(WriteBatch(entries=[_forged_first_entry()]))
+                with pytest.raises(LedgerIntegrityError, match="durably append 1 entry"):
+                    store.find_entries(scope_id="org")
+                with pytest.raises(StorageError, match="earlier write in this session failed"):
+                    store.commit(WriteBatch(entries=[_forged_first_entry()]))
         assert session.wrote and not session.committed
         assert store.head() == (0, GENESIS_HASH)
     finally:
@@ -426,9 +471,13 @@ def test_a_read_only_view_refuses_history_rewritten_under_it(
 # --------------------------------------------------------------------------
 
 
-def test_a_role_with_only_dml_grants_can_run_a_governor(pg_admin_dsn: str, pg_dsn: str) -> None:
+def test_a_role_with_only_dml_grants_can_run_a_governor(
+    pg_admin_dsn: str, pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Install once as the owner; run the fleet as a role that cannot alter the
-    schema, lift the triggers, or edit history."""
+    schema, lift the triggers, or edit history. One that looked before another
+    governor upgraded the schema looks again under the writer lock, and finds
+    nothing left to do: it runs no DDL it could not run."""
     from psycopg.conninfo import make_conninfo
 
     seeded(pg_dsn).close()
@@ -445,6 +494,9 @@ def test_a_role_with_only_dml_grants_can_run_a_governor(pg_admin_dsn: str, pg_ds
             "GRANT SELECT, INSERT, UPDATE, DELETE ON agentgov.nodes TO {r}",
             "GRANT SELECT, INSERT ON agentgov.control_events TO {r}",
             "GRANT SELECT, INSERT, DELETE ON agentgov.open_authorizations TO {r}",
+            "GRANT SELECT, INSERT ON agentgov.snapshots TO {r}",
+            "GRANT SELECT, INSERT ON agentgov.audit_marks TO {r}",
+            "GRANT SELECT, INSERT ON agentgov.idempotency TO {r}",
         )
         with admin(pg_dsn) as conn:
             for grant in grants:
@@ -457,6 +509,18 @@ def test_a_role_with_only_dml_grants_can_run_a_governor(pg_admin_dsn: str, pg_ds
             assert isinstance(store, PostgresStore)
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 store._conn.execute("ALTER TABLE agentgov.entries DISABLE TRIGGER append_only")
+        looked: list[str | None] = []
+        installed = PostgresStore._installed_version
+
+        def stale_at_first(self: PostgresStore) -> str | None:
+            found = installed(self)
+            looked.append(found)
+            return "pg1" if len(looked) == 1 else found
+
+        with monkeypatch.context() as patch:
+            patch.setattr(PostgresStore, "_installed_version", stale_at_first)
+            BudgetManager.open_postgres(dsn).close()
+        assert looked[:2] == ["pg2", "pg2"], "looked again under the writer lock"
     finally:
         with admin(pg_dsn) as conn:
             conn.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
@@ -479,7 +543,8 @@ def test_a_governor_with_a_stale_view_is_refused_not_forked_and_recovers(
     pg_dsn: str, gov: BudgetManager, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Skip the catch-up and write on an old head: the database refuses the
-    entry, the session rolls back, and the next write re-reads the ledger."""
+    entry, the session rolls back, and the governor re-reads the ledger at
+    once, so nothing that never committed is served."""
     with BudgetManager.open_postgres(pg_dsn) as other:
         other.spend("agent", "0.50")
         committed = other.ledger.entries()
@@ -488,8 +553,9 @@ def test_a_governor_with_a_stale_view_is_refused_not_forked_and_recovers(
         patch.setattr(BudgetManager, "_follow", lambda self, store: None)
         with pytest.raises(LedgerIntegrityError, match="extend the committed head"):
             gov.spend("agent", "0.10")
-    assert gov._dirty, "a session that wrote and did not commit leaves memory suspect"
+    assert not gov._dirty, "re-read at once: memory is the ledger's again"
     assert _store(gov).load_entries() == committed, "the refused entries never landed"
+    assert gov.ledger.head_hash == committed[-1].entry_hash
 
     gov.spend("agent", "0.10")  # re-reads, then writes on the real head
     with BudgetManager.open_postgres(pg_dsn, read_only=True) as audit:
@@ -506,23 +572,25 @@ def test_a_connection_lost_before_commit_rolls_back_and_is_re_read(
 ) -> None:
     """The server ends the session after the writes and before COMMIT: the
     caller is told the write did not commit, and it did not; the governor,
-    whose memory already held it, re-reads before acting again."""
+    whose memory already held it, re-reads at once."""
     store = _store(gov)
     original = store.commit
 
     def write_then_lose_the_connection(batch: WriteBatch) -> None:
         original(batch)
+        serving = server_pid(store._conn)  # inside the session's transaction
         with admin(pg_dsn) as conn:
-            conn.execute("SELECT pg_terminate_backend(%s)", (store._conn.info.backend_pid,))
+            conn.execute("SELECT pg_terminate_backend(%s)", (serving,))
 
     with monkeypatch.context() as patch:
         patch.setattr(store, "commit", write_then_lose_the_connection)
         with pytest.raises(StorageError, match="did not commit"):
             gov.authorize("agent", "0.30")
-    assert gov._dirty
-    assert gov.available("agent") == money("1.70"), "memory ran ahead of the database"
+    assert not gov._dirty
+    assert gov.available("agent") == money("2.00"), "the phantom hold is gone"
+    assert gov.stale_authorizations(0) == ()
 
-    gov.spend("agent", "0.10")  # reconnects, re-reads, and the phantom hold is gone
+    gov.spend("agent", "0.10")
     assert gov.available("agent") == money("1.90")
     assert gov.stale_authorizations(0) == ()
     gov.verify_integrity()
@@ -544,9 +612,9 @@ def test_a_commit_whose_outcome_is_lost_is_re_read_not_retried(
         patch.setattr(PostgresStore, "_end", commit_then_lose_the_answer)
         with pytest.raises(StorageError, match="connection lost"):
             gov.spend("agent", "0.25")
-    assert gov._dirty
+    assert not gov._dirty, "re-read in full at once"
 
-    assert gov.refresh() == 0  # re-read in full; nothing new beyond what it held
+    assert gov.refresh() == 0  # nothing new beyond what it re-read
     assert not gov._dirty
     assert gov.available("agent") == money("1.75")
     spends = [e for e in gov.audit_trail("agent") if e.entry_type is EntryType.SPEND]
@@ -596,12 +664,49 @@ def test_a_lock_wait_that_times_out_is_a_storage_error_and_changes_nothing(
         assert waiter.available("agent") == money("1.80")
 
 
+def test_whether_a_writer_holds_the_lock_is_probed_without_writing(
+    pg_dsn: str, gov: BudgetManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening is no probe of the writer lock: a governor opens from a snapshot
+    while another holds it. writer_lock_held() asks without writing."""
+    probe = PostgresStore(pg_dsn, read_only=True)
+    try:
+        assert probe.writer_lock_held(0.1) is False
+        holding, release = threading.Event(), threading.Event()
+        store = _store(gov)
+        original = store.commit
+
+        def hold_the_lock(batch: WriteBatch) -> None:
+            original(batch)
+            holding.set()
+            release.wait(10)
+
+        monkeypatch.setattr(store, "commit", hold_the_lock)
+        holder = threading.Thread(target=gov.spend, args=("agent", "0.10"))
+        holder.start()
+        assert holding.wait(10)
+        assert probe.writer_lock_held(0.2) is True
+        started = time.monotonic()
+        BudgetManager.open_postgres(pg_dsn, lock_timeout=0.2).close()  # never waits
+        assert time.monotonic() - started < 5
+        release.set()
+        holder.join()
+        assert probe.writer_lock_held(0.1) is False
+        assert _store(gov).head() == (len(gov.ledger), gov.ledger.head_hash), "nothing else wrote"
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            probe.writer_lock_held(0)
+    finally:
+        probe.close()
+    with _store(gov).writer(), pytest.raises(StorageError, match="inside a session"):
+        _store(gov).writer_lock_held()
+
+
 def test_a_governor_that_hangs_holding_the_lock_is_cut_off_by_the_server(
     pg_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A stalled lock holder cannot stall the fleet: after ``idle_timeout`` the
     server ends its session, rolls its writes back, and frees the lock. The
-    stalled governor learns at its commit and re-reads before acting again."""
+    stalled governor learns at its commit and re-reads at once."""
     seeded(pg_dsn).close()
     hung = BudgetManager.open_postgres(pg_dsn, idle_timeout=0.5)
     stalled = threading.Event()
@@ -629,7 +734,8 @@ def test_a_governor_that_hangs_holding_the_lock_is_cut_off_by_the_server(
             healthy.spend("agent", "0.20")  # waits out the stalled holder, then writes
         thread.join()
         assert len(outcome) == 1 and isinstance(outcome[0], StorageError)
-        assert hung._dirty
+        assert not hung._dirty
+        assert hung.available("agent") == money("1.80"), "re-read: the healthy 0.20, not the 0.40"
 
         monkeypatch.undo()
         hung.spend("agent", "0.30")  # reconnects, re-reads, writes on the real head
@@ -642,11 +748,19 @@ def test_a_governor_that_hangs_holding_the_lock_is_cut_off_by_the_server(
 def test_a_connection_the_server_ended_between_writes_is_reopened(
     pg_dsn: str, gov: BudgetManager
 ) -> None:
-    pid = _store(gov)._conn.info.backend_pid
-    with admin(pg_dsn) as conn:
-        conn.execute("SELECT pg_terminate_backend(%s)", (pid,))
+    """Directly connected, the store reconnects; behind a pooler, which
+    replaces the server connection itself, it never notices. Either way the
+    next write goes through."""
+    conn = _store(gov)._conn
+    pid = server_pid(conn)
+    direct = conn.info.backend_pid == pid
+    with admin(pg_dsn) as other, suppress(psycopg.errors.AdminShutdown):
+        # Behind a pooler this may be served by that very server connection,
+        # and end itself: the backend is gone either way.
+        other.execute("SELECT pg_terminate_backend(%s)", (pid,))
     gov.spend("agent", "0.10")
-    assert _store(gov)._conn.info.backend_pid != pid
+    if direct:
+        assert _store(gov)._conn.info.backend_pid != pid
     assert gov.available("agent") == money("1.90")
 
 
@@ -703,8 +817,8 @@ def test_a_capture_after_another_governor_voided_the_hold_is_a_double_spend(
 
 
 def test_money_round_trips_exactly(pg_dsn: str, gov: BudgetManager) -> None:
-    """Text columns, not numeric: a zero-value entry's amount comes back as
-    the ``0`` it was hashed with, not ``0E-8``."""
+    """Text columns, not numeric: every amount comes back exactly as it was
+    hashed. AGOV3 writes fixed-point text: ``0.00000000``, ``0.00000001``."""
     gov.anchor("agent", "digest")
     gov.spend("agent", Decimal("0.00000001"))
     with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
@@ -712,4 +826,130 @@ def test_money_round_trips_exactly(pg_dsn: str, gov: BudgetManager) -> None:
         # which are what the hashes cover.
         loaded = [e.to_audit_record() for e in reader.ledger.entries()]
         assert loaded == [e.to_audit_record() for e in gov.ledger.entries()]
-        assert any(r["amount"] == "0" for r in loaded)
+        assert any(r["amount"] == "0.00000000" for r in loaded)
+        assert any(r["amount"] == "0.00000001" for r in loaded)
+
+
+def test_a_units_writes_read_back_exactly_whatever_their_text(pg_admin_dsn: str) -> None:
+    """A unit of work's writes are sent as literals, with its COMMIT: every
+    text reads back exactly, quotes and backslashes included, whether the
+    server treats backslashes in plain literals as escapes or not."""
+    from agentgov.postgres import _literal
+
+    texts = st.text(alphabet=st.characters(codec="utf-8", exclude_characters="\x00"), max_size=40)
+    with admin(pg_admin_dsn) as conn:
+
+        @settings(max_examples=150, deadline=None)
+        @given(
+            values=st.lists(
+                texts | st.uuids() | st.integers(-(2**63), 2**63 - 1) | st.none(),
+                min_size=1,
+                max_size=8,
+            )
+        )
+        @example(values=["a\\b", "\\'", "it's \\ E'\\x41'", "\\\\"])  # backslashes, always
+        def read_back(values: list[object]) -> None:
+            for conforming in ("on", "off"):
+                with conn.transaction():  # SET LOCAL: one transaction, behind a pooler too
+                    conn.execute(f"SET LOCAL standard_conforming_strings = {conforming}")
+                    row = conn.execute(
+                        "SELECT " + ", ".join(_literal(v) for v in values)
+                    ).fetchone()
+                assert row is not None and list(row) == values
+
+        read_back()
+    with pytest.raises(StorageError, match=r"NUL"):
+        _literal("a\x00b")
+    for unsupported in (True, 1.5, b"x"):
+        with pytest.raises(TypeError):
+            _literal(unsupported)
+
+
+def test_text_with_quotes_and_backslashes_round_trips_through_a_governor(
+    pg_dsn: str, gov: BudgetManager
+) -> None:
+    memo = "it's \\ a 'quoted' \\' memo \\\\ E'\\x41' ''"
+    gov.delegate("org", "o'brien\\", "1.00", memo=memo)
+    gov.anchor("o'brien\\", memo)
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as reader:
+        assert reader.available("o'brien\\") == money("1.00")
+        assert [e.memo for e in reader.ledger.entries()][-3:] == [memo] * 3
+        reader.verify_integrity()
+
+
+def test_the_tail_is_read_by_its_index_on_a_ledger_never_analyzed(
+    pg_dsn: str, gov: BudgetManager
+) -> None:
+    """A new ledger has no statistics until autovacuum analyzes it, and the
+    planner's default guess for ``sequence >= n`` is a third of the table:
+    a full scan and a sort, under the writer lock. The reads after a
+    sequence are planned as the primary key's index scan regardless."""
+    with admin(pg_dsn) as conn:
+        conn.execute("ALTER TABLE agentgov.entries SET (autovacuum_enabled = false)")
+        while len(gov.ledger) < 300:
+            gov.spend("agent", "0.001", memo="x" * 40)
+        store = gov.store
+        assert isinstance(store, PostgresStore)
+        for name in ("begin", "read"):
+            parts = store._templates(store._conn)[name].split("; ")
+            settings_ = [part for part in parts if part.startswith("SET LOCAL enable_")]
+            (tail,) = [part for part in parts if part.startswith("SELECT sequence")]
+            query = "EXPLAIN " + tail.replace("<AFTER>", str(len(gov.ledger) - 10))
+            with conn.transaction():
+                unhinted = "\n".join(str(row[0]) for row in conn.execute(query).fetchall())
+                for setting in settings_:
+                    conn.execute(setting)
+                plan = "\n".join(str(row[0]) for row in conn.execute(query).fetchall())
+            assert "Seq Scan" in unhinted, "the hazard: without the settings, a full scan"
+            assert plan.startswith("Index Scan using entries_pkey"), plan
+            assert "Sort" not in plan
+
+
+def test_a_store_keeps_no_state_on_its_session_for_a_pooler_to_misplace(pg_dsn: str) -> None:
+    """Behind PgBouncer in transaction mode, a session setting lands on
+    whichever server connection served it, and stays there for the next
+    client. So the store sets nothing on its session: each transaction sets
+    its own lock wait and idle bound, a read declares itself read-only, and
+    no statement is prepared unless asked for."""
+    for read_only in (False, True):
+        if not read_only:
+            seeded(pg_dsn).close()
+        store = PostgresStore(pg_dsn, read_only=read_only)
+        try:
+            conn = store._conn
+            assert conn.prepare_threshold is None
+            settings = conn.execute(
+                "SELECT current_setting('idle_in_transaction_session_timeout'), "
+                "current_setting('default_transaction_read_only')"
+            ).fetchone()
+            assert settings == ("0", "off"), "nothing set on the session"
+            with store._reading():
+                row = conn.execute(
+                    "SELECT current_setting('transaction_read_only'), "
+                    "current_setting('idle_in_transaction_session_timeout')"
+                ).fetchone()
+            assert row == ("on", "1min")
+            if not read_only:
+                with store.writer():
+                    row = conn.execute(
+                        "SELECT current_setting('lock_timeout'), "
+                        "current_setting('idle_in_transaction_session_timeout')"
+                    ).fetchone()
+                assert row == ("30s", "1min")
+        finally:
+            store.close()
+    # Preparing every statement at once: queries with parameters are
+    # prepared, and the messages of several statements a unit of work sends
+    # never are (the server would refuse them).
+    with BudgetManager.open_postgres(pg_dsn, prepare_threshold=0, auditor=False) as gov:
+        preparing = gov.store
+        assert isinstance(preparing, PostgresStore) and preparing._conn.prepare_threshold == 0
+        for n in range(3):
+            spent = gov.spend("agent", "0.01", idempotency_key=f"k-{n}")
+            assert gov.entry(spent.sequence) == spent
+            assert gov.find_entries(ref=spent.ref)
+            assert not preparing.writer_lock_held(0.1)
+        gov.refresh()
+        gov.verify_integrity()
+    with pytest.raises(ValueError, match="prepare_threshold"):
+        PostgresStore(pg_dsn, prepare_threshold=-1)

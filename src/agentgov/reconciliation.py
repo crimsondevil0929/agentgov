@@ -35,17 +35,18 @@ tokens and tell a price-table drift apart from a genuine billing discrepancy.
 from __future__ import annotations
 
 import csv
+import functools
 import json
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from io import StringIO
 from pathlib import Path
-from typing import TypeVar
+from typing import ParamSpec, TypeVar
 
-from agentgov.core import BudgetManager, EntryType
+from agentgov.core import _ROUNDING, BudgetManager, EntryType
 from agentgov.exceptions import AgentGovError
 from agentgov.interceptor import PRICING, MeteredCall, TokenUsage, normalize_model_id
 
@@ -69,6 +70,25 @@ __all__ = [
 _CENT = Decimal("0.000001")
 
 R = TypeVar("R")
+
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+def _pinned(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+    """Run ``fn`` in the ledger's rounding context, not the calling thread's.
+
+    A reconciliation decides pass or fail on cost drift; a host that lowered
+    its own :mod:`decimal` precision must not change that decision.
+    """
+
+    @functools.wraps(fn)
+    def pinned(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        with localcontext(_ROUNDING):
+            return fn(*args, **kwargs)
+
+    return pinned
 
 
 class UsageParseError(AgentGovError):
@@ -670,6 +690,7 @@ class ReconciliationReport:
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     @property
+    @_pinned
     def invoiced_total(self) -> Decimal:
         """Everything the provider billed."""
         billed = [m.provider for m in self.matched]
@@ -678,6 +699,7 @@ class ReconciliationReport:
         return sum((record.total_cost for record in billed), Decimal(0))
 
     @property
+    @_pinned
     def metered_total(self) -> Decimal:
         """Everything AgentGov settled."""
         settled = [m.metered for m in self.matched]
@@ -686,16 +708,19 @@ class ReconciliationReport:
         return sum((record.settled_cost for record in settled), Decimal(0))
 
     @property
+    @_pinned
     def phantom_total(self) -> Decimal:
         """Billed spend with no local authorization behind it."""
         return sum((record.total_cost for record in self.phantom), Decimal(0))
 
     @property
+    @_pinned
     def variance(self) -> Decimal:
         """Invoiced minus metered. Positive means the provider billed more."""
         return self.invoiced_total - self.metered_total
 
     @property
+    @_pinned
     def variance_percent(self) -> float:
         """Variance relative to metered spend."""
         if self.metered_total == 0:
@@ -745,6 +770,7 @@ def _token_delta_percent(provider: ProviderUsageRecord, metered: MeteredRecord) 
     return abs(provider.total_tokens - metered_total) / metered_total * 100
 
 
+@_pinned
 def _cost_delta_percent(provider: ProviderUsageRecord, metered: MeteredRecord) -> float:
     """Relative cost drift between a billed and a settled line."""
     if metered.settled_cost == 0:
@@ -752,6 +778,7 @@ def _cost_delta_percent(provider: ProviderUsageRecord, metered: MeteredRecord) -
     return float(abs(provider.total_cost - metered.settled_cost) / metered.settled_cost * 100)
 
 
+@_pinned
 def reconcile(
     metered: Sequence[MeteredRecord],
     provider: Sequence[ProviderUsageRecord],
@@ -872,6 +899,7 @@ def reconcile(
     )
 
 
+@_pinned
 def format_report(report: ReconciliationReport, *, path: str = "", export: str = "") -> str:
     """Render a report as a terminal summary.
 

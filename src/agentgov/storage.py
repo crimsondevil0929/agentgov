@@ -38,11 +38,13 @@ floating-point column type.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import socket
 import sqlite3
 import sys
+import threading
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, suppress
@@ -50,17 +52,22 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar, runtime_checkable
 
 from agentgov.core import (
+    _CHECKPOINT_MEMO,
+    GENESIS_HASH,
     Authorization,
     BudgetNode,
     ControlEvent,
-    Direction,
     EntryType,
+    IdempotencyRecord,
     LedgerEntry,
     SettlementClaim,
     WriteBatch,
+    _amount_text,
+    _direction,
+    _entry_type,
     _iso,
     _parse_iso,
 )
@@ -72,26 +79,33 @@ from agentgov.exceptions import (
 )
 
 __all__ = [
+    "AuditMark",
     "JoinableStore",
     "PersistedAuthorization",
     "PersistedNode",
     "PersistenceStore",
     "SharedStore",
+    "Snapshot",
     "SqliteStore",
     "StoreDelta",
     "StoreImage",
     "WriterSession",
 ]
 
-_SCHEMA_VERSION = "2"
-"""v0.1.2: entries carry their payload ``version`` and hold ``ref``; control
-events name the chain entry that records them."""
+_SCHEMA_VERSION = "3"
+"""v1.0: checkpoint snapshots, the auditor's marks, idempotency records, and
+indexes on history (scope, type and memo, transaction, ref)."""
+
+_V2_SCHEMA_VERSION = "2"
+"""v0.1.2 to v0.4: entries carry their payload ``version`` and hold ``ref``;
+control events name the chain entry that records them. Read as it is when
+opened read-only; upgraded in place the first time it is opened for writing."""
 
 _LEGACY_SCHEMA_VERSION = "1"
 """v0.1.0 and v0.1.1. Read as-is when opened read-only; upgraded in place the
 first time it is opened for writing."""
 
-_SUPPORTED_VERSIONS = frozenset({_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION})
+_SUPPORTED_VERSIONS = frozenset({_LEGACY_SCHEMA_VERSION, _V2_SCHEMA_VERSION, _SCHEMA_VERSION})
 
 _ENTRY_COLUMNS = (
     "sequence, entry_id, transaction_id, timestamp, entry_type, direction, scope_id, "
@@ -133,11 +147,56 @@ class PersistedAuthorization:
 
 
 @dataclass(frozen=True, slots=True)
+class Snapshot:
+    """A checkpoint's snapshot of the chain state, as a store holds it.
+
+    :ivar sequence: The sequence the state is as of.
+    :ivar digest: The snapshot's digest (``docs/LEDGER_FORMAT.md``), which the
+        CHECKPOINT entry naming it commits into the chain.
+    :ivar body: The snapshot's canonical JSON.
+    :ivar signature: The signature over the digest, as JSON text, when the
+        checkpoint was signed.
+    """
+
+    sequence: int
+    digest: str
+    body: bytes
+    signature: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditMark:
+    """How far an auditor verified the chain, from genesis, and what it found.
+
+    :ivar sequence: The last entry it verified.
+    :ivar head: That entry's hash.
+    :ivar state_digest: The digest of the state the chain implies there.
+    :ivar status: ``"verified"``, or ``"failed"`` (and ``detail`` says why).
+    :ivar auditor: Who audited: a host and process, or a sidecar's name.
+    :ivar signature: The auditor's signature over the mark, when it has a key.
+    """
+
+    sequence: int
+    head: str
+    state_digest: str
+    status: str
+    detail: str
+    auditor: str
+    recorded_at: datetime
+    signature: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StoreImage:
     """Everything a store holds, read in one transaction.
 
-    :ivar control_high_water: The highest ``control_events`` row id read, so a
+    :ivar control_high_water: The highest ``control_events`` row id, so a
         later :meth:`PersistenceStore.snapshot` can continue from it.
+    :ivar snapshot: When the image was loaded from a checkpoint, the snapshot
+        it starts from: ``entries`` are then only the entries after it, and
+        ``control_events`` the rows for those entries and any a pre-0.1.2
+        governor kept outside the chain.
+    :ivar base: The sequence ``entries`` follow: the snapshot's, or 0.
     """
 
     schema_version: str
@@ -146,6 +205,8 @@ class StoreImage:
     control_events: tuple[ControlEvent, ...]
     authorizations: tuple[PersistedAuthorization, ...]
     control_high_water: int
+    snapshot: Snapshot | None = None
+    base: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,9 +238,23 @@ class PersistenceStore(Protocol):
     Every write is called with the manager's own lock held, so a store that
     only one governor writes never needs to provide its own concurrency
     control — it only needs to make each :meth:`commit` durable as a whole.
-    A store several governors write at once is a :class:`SharedStore`, which
-    adds the fleet-wide writer lock that process-local mutex cannot provide
-    (:class:`agentgov.postgres.PostgresStore`).
+    Reads of history are not: a store whose transactions belong to one
+    connection must keep each one whole against other threads (the stores
+    here hold a guard around each). A store several governors write at once
+    is a :class:`SharedStore`, which adds the fleet-wide writer lock that
+    process-local mutex cannot provide (:class:`agentgov.postgres.PostgresStore`).
+
+    Two capabilities are optional, found by name:
+
+    - ``idempotency(keys) -> dict[str, IdempotencyRecord]``: the calls
+      recorded under ``keys``, written with :attr:`WriteBatch.idempotency`.
+      Without it a governor refuses ``idempotency_key=``.
+    - ``unit()``: a context manager under which every :meth:`commit` joins one
+      transaction, committed when it ends (and rolled back, with
+      :class:`StorageError`, if a write in it failed). A single-writer store
+      with it shares units of work among concurrent callers, as a shared
+      store's writer session does, and makes
+      :meth:`~agentgov.core.BudgetManager.transaction` one transaction.
     """
 
     @property
@@ -196,15 +271,18 @@ class PersistenceStore(Protocol):
         """
         ...
 
-    def load(self) -> StoreImage:
-        """Read every table in one consistent read."""
+    def load(self, *, from_checkpoint: bool = False) -> StoreImage:
+        """Read every table in one consistent read; from the newest checkpoint's
+        snapshot, when asked and the store holds one."""
         ...
 
     def load_entries(self) -> tuple[LedgerEntry, ...]:
         """Return every persisted entry, oldest first."""
         ...
 
-    def snapshot(self, *, after_sequence: int, after_control_row: int) -> StoreDelta:
+    def snapshot(
+        self, *, after_sequence: int, after_control_row: int, authorizations: bool = True
+    ) -> StoreDelta:
         """Read what changed after ``after_sequence``, in one consistent read."""
         ...
 
@@ -244,6 +322,11 @@ class WriterSession(Protocol):
     @property
     def wrote(self) -> bool:
         """Whether :meth:`PersistenceStore.commit` was called in the session."""
+        ...
+
+    def abandon(self) -> None:
+        """Roll the session back when it ends, whatever it wrote: the unit of
+        work it carried failed as a whole (:meth:`BudgetManager.transaction`)."""
         ...
 
 
@@ -319,7 +402,9 @@ class _AdvisoryLock:
     The lock is held by an open file descriptor, which means the kernel
     releases it when the holding process exits — including on ``SIGKILL``.
     A crashed governor therefore leaves a stale *file* but never a stale
-    *lock*, so no timeout heuristic or manual cleanup is needed.
+    *lock*, so no timeout heuristic or manual cleanup is needed. (Windows
+    releases a dead process's lock a moment after it exits, not with the
+    exit: an open in that moment is refused, and the next one succeeds.)
 
     The holder writes its identity into the file so the next process can say
     who is holding it, not merely that someone is.
@@ -406,10 +491,15 @@ class _AdvisoryLock:
 
 
 if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
+    # The byte claimed, far past the holder's identity at the start of the
+    # file: Windows locks are mandatory, and a lock on the identity would keep
+    # every other handle from reading who holds the claim.
+    _CLAIMED_BYTE = 1 << 30
 
     def _lock_exclusive_nonblocking(fd: int) -> None:
         import msvcrt
 
+        os.lseek(fd, _CLAIMED_BYTE, os.SEEK_SET)
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError as exc:
@@ -420,7 +510,7 @@ if sys.platform == "win32":  # pragma: no cover - exercised on Windows CI only
     def _unlock(fd: int) -> None:
         import msvcrt
 
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _CLAIMED_BYTE, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 else:
@@ -434,6 +524,56 @@ else:
         import fcntl
 
         fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _guarded(method: Callable[Concatenate[Any, _P], _R]) -> Callable[Concatenate[Any, _P], _R]:
+    """Run a store method holding the store's guard.
+
+    A store has one connection, and a transaction on it is the connection's,
+    not the calling thread's: a read made from one thread while another holds
+    a write transaction open would read inside it (and, on SQLite, see its
+    uncommitted rows; on PostgreSQL, end it). So each transaction on the
+    connection, a write, a read or a writer's whole session, is made holding
+    the store's re-entrant guard. A governor's own lock is always taken
+    before it, never after, so the two cannot deadlock.
+    """
+
+    @functools.wraps(method)
+    def guarded(self: Any, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with self._guard:
+            return method(self, *args, **kwargs)
+
+    return guarded
+
+
+class _SqliteUnit:
+    """One SQLite transaction carrying many commits: see :meth:`SqliteStore.unit`."""
+
+    __slots__ = ("abandoned", "committed", "failed", "wrote")
+
+    def __init__(self) -> None:
+        self.wrote = False
+        self.committed = False
+        self.failed = False
+        self.abandoned = False
+
+    def abandon(self) -> None:
+        """Roll the unit back when it ends, whatever it wrote."""
+        self.abandoned = True
+
+
+def _idempotency_record(row: Sequence[Any]) -> IdempotencyRecord:
+    return IdempotencyRecord(
+        key=str(row[0]),
+        request=str(row[1]),
+        outcome=str(row[2]),
+        sequence=int(row[3]),
+        created_at=_parse_iso(str(row[4])),
+    )
 
 
 class SqliteStore:
@@ -472,6 +612,8 @@ class SqliteStore:
         self._path = str(path)
         self._read_only = read_only
         self._lock: _AdvisoryLock | None = None
+        self._unit: _SqliteUnit | None = None
+        self._guard = threading.RLock()  # one transaction on the connection at a time
 
         if read_only:
             # No exclusive claim: read-only exists precisely so an operator can
@@ -643,6 +785,10 @@ class SqliteStore:
                 conn.execute("ALTER TABLE entries ADD COLUMN ref TEXT")
             if not self._has_column("control_events", "entry_id"):
                 conn.execute("ALTER TABLE control_events ADD COLUMN entry_id TEXT")
+            # Schema 3 (v1.0) only adds, so an upgrade from version 1 or 2 is
+            # these statements, in this same transaction.
+            for statement in _SCHEMA_3:
+                conn.execute(statement)
             conn.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -660,10 +806,25 @@ class SqliteStore:
 
     # -- writing ----------------------------------------------------------
 
+    @_guarded
     def _write(self, operation: str, work: Callable[[sqlite3.Connection], None]) -> None:
-        """Run ``work`` as one immediate transaction, committed or rolled back."""
+        """Run ``work`` as one immediate transaction, committed or rolled back;
+        inside a :meth:`unit`, as part of the unit's transaction."""
         self._require_writable(operation)
         conn = self._conn
+        unit = self._unit
+        if unit is not None:
+            if unit.failed:
+                raise StorageError(
+                    f"cannot {operation}: an earlier write in this transaction failed"
+                )
+            unit.wrote = True
+            try:
+                work(conn)
+            except BaseException:
+                unit.failed = True  # partly written: the unit can only roll back
+                raise
+            return
         conn.execute("BEGIN IMMEDIATE")
         try:
             work(conn)
@@ -672,6 +833,94 @@ class SqliteStore:
             with suppress(sqlite3.Error):
                 conn.rollback()
             raise
+
+    def _write_unclaimed(self, operation: str, work: Callable[[sqlite3.Connection], None]) -> None:
+        """Write a table no governor's memory caches (the auditor's marks).
+
+        A read-only store, such as an auditor running beside the governor,
+        holds no claim on the database and its connection cannot write; it
+        writes on a short-lived connection of its own instead, which SQLite
+        serializes with the governor's writes.
+        """
+        if not self._read_only:
+            self._write(operation, work)
+            return
+        conn = sqlite3.connect(self._path, timeout=30)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            work(conn)
+            conn.commit()
+        except sqlite3.Error as exc:
+            raise StorageError(f"cannot {operation}: {exc}") from exc
+        finally:
+            conn.close()
+
+    @contextmanager
+    def unit(self) -> Iterator[_SqliteUnit]:
+        """Make every commit in the block part of one transaction, committed
+        when the block ends: all of it durable, or none of it.
+
+        Rolled back instead if the block raises, the unit is abandoned, or a
+        write in it failed (and then :class:`StorageError` is raised, so a
+        caller that caught the write's own error still learns nothing was
+        committed).
+        """
+        self._require_writable("write the ledger")
+        with self._guard:
+            if self._unit is not None:
+                raise StorageError("a unit of work does not nest")
+            unit = _SqliteUnit()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise StorageError(f"cannot begin a ledger transaction: {exc}") from exc
+            self._unit = unit
+            try:
+                yield unit
+            except BaseException:
+                self._unit = None
+                self._rollback_unit()
+                raise
+            self._unit = None
+            if unit.abandoned or unit.failed:
+                self._rollback_unit()
+                if unit.failed:
+                    raise StorageError(
+                        "a write in this transaction failed, so none of it was committed"
+                    )
+                return
+            try:
+                self._commit_unit()
+            except BaseException:
+                self._rollback_unit()
+                raise
+            unit.committed = True
+
+    def _commit_unit(self) -> None:
+        try:
+            self._conn.commit()
+        except sqlite3.Error as exc:
+            raise StorageError(f"the ledger transaction did not commit: {exc}") from exc
+
+    def _rollback_unit(self) -> None:
+        with suppress(sqlite3.Error):
+            self._conn.rollback()
+
+    @_guarded
+    def idempotency(self, keys: Sequence[str]) -> dict[str, IdempotencyRecord]:
+        """The calls recorded under ``keys``: those of them that were made."""
+        if not keys:
+            return {}
+        marks = ", ".join("?" * len(keys))
+        try:
+            rows = self._conn.execute(
+                "SELECT key, request, outcome, sequence, created_at FROM idempotency "  # noqa: S608
+                f"WHERE key IN ({marks})",
+                list(keys),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"cannot read the calls recorded under keys: {exc}") from exc
+        return {str(row[0]): _idempotency_record(row) for row in rows}
 
     def commit(self, batch: WriteBatch) -> None:
         """Durably apply one unit of work in a single transaction."""
@@ -714,6 +963,18 @@ class SqliteStore:
                 conn.execute(
                     "DELETE FROM open_authorizations WHERE authorization_id = ?",
                     (str(authorization_id),),
+                )
+            for record in batch.idempotency:
+                conn.execute(
+                    "INSERT INTO idempotency (key, request, outcome, sequence, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        record.key,
+                        record.request,
+                        record.outcome,
+                        record.sequence,
+                        _iso(record.created_at),
+                    ),
                 )
 
         count = len(batch.entries)
@@ -811,37 +1072,65 @@ class SqliteStore:
 
     @contextmanager
     def _read_transaction(self) -> Iterator[None]:
-        """Hold one read transaction, so several SELECTs see one snapshot."""
-        conn = self._conn
-        if conn.in_transaction:
-            yield
-            return
-        conn.execute("BEGIN")
-        try:
-            yield
-        finally:
-            with suppress(sqlite3.Error):
-                conn.rollback()
+        """Hold one read transaction, so several SELECTs see one snapshot.
+        Inside this thread's own write (a unit), the reads are the write's."""
+        with self._guard:
+            conn = self._conn
+            if conn.in_transaction:
+                yield
+                return
+            conn.execute("BEGIN")
+            try:
+                yield
+            finally:
+                with suppress(sqlite3.Error):
+                    conn.rollback()
 
-    def load(self) -> StoreImage:
-        """Read every table in one consistent read."""
+    def load(self, *, from_checkpoint: bool = False) -> StoreImage:
+        """Read every table in one consistent read.
+
+        :param from_checkpoint: Start from the snapshot the newest CHECKPOINT
+            entry names: the image then carries that snapshot and only the
+            entries after it, so the read costs the entries since the
+            checkpoint and the state, not the length of history.
+        """
         with self._read_transaction():
             version = self._read_schema_version()
-            entries = self._select_entries("", ())
+            snapshot = self._newest_snapshot() if from_checkpoint else None
+            base = snapshot.sequence if snapshot is not None else 0
+            entries = self._select_entries("WHERE sequence > ?", (base,))
             nodes = self._select_nodes()
-            rows = self._select_control_rows(after=0)
+            if base:
+                rows = self._select_control_rows(
+                    after=0,
+                    where="entry_id IS NULL OR entry_id IN "
+                    "(SELECT entry_id FROM entries WHERE sequence > ?)",
+                    params=(base,),
+                )
+            else:
+                rows = self._select_control_rows(after=0)
             authorizations = self._select_authorizations()
+            high_water = self._control_high_water()
         return StoreImage(
             schema_version=version,
             entries=entries,
             nodes=nodes,
             control_events=tuple(event for _, event in rows),
             authorizations=authorizations,
-            control_high_water=max((row_id for row_id, _ in rows), default=0),
+            control_high_water=high_water,
+            snapshot=snapshot,
+            base=base,
         )
 
-    def snapshot(self, *, after_sequence: int, after_control_row: int) -> StoreDelta:
-        """Read what changed after ``after_sequence``, in one consistent read."""
+    @_guarded
+    def snapshot(
+        self, *, after_sequence: int, after_control_row: int, authorizations: bool = True
+    ) -> StoreDelta:
+        """Read what changed after ``after_sequence``, in one consistent read.
+
+        :param authorizations: Read every open authorization too. A reader
+            that follows holds from the entries themselves need not.
+        """
         with self._read_transaction():
             version = self._read_schema_version()
             anchor: str | None = None
@@ -851,16 +1140,264 @@ class SqliteStore:
                 ).fetchone()
                 anchor = None if row is None else str(row[0])
             entries = self._select_entries("WHERE sequence > ?", (after_sequence,))
-            authorizations = self._select_authorizations()
+            auths = self._select_authorizations() if authorizations else ()
             rows = self._select_control_rows(after=after_control_row)
         return StoreDelta(
             schema_version=version,
             anchor_hash=anchor,
             entries=entries,
-            authorizations=authorizations,
+            authorizations=auths,
             legacy_control_events=tuple(event for _, event in rows if event.entry_id is None),
             control_high_water=max((row_id for row_id, _ in rows), default=after_control_row),
         )
+
+    # -- checkpoints ------------------------------------------------------
+
+    def _has_table(self, table: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        return row is not None
+
+    def _newest_snapshot(self) -> Snapshot | None:
+        """The snapshot the newest CHECKPOINT entry names, or ``None`` when no
+        entry is a checkpoint.
+
+        Only the newest. A snapshot row is never deleted, so a newest
+        checkpoint whose snapshot is missing, or whose memo does not parse,
+        is returned empty for the caller to refuse, not skipped for an older
+        one, which would paper over the damage.
+        """
+        if not self._has_table("snapshots"):
+            return None
+        row = self._conn.execute(
+            "SELECT memo FROM entries WHERE entry_type = 'checkpoint' "
+            "ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        found = _CHECKPOINT_MEMO.match(str(row[0]))
+        if found is None:
+            return Snapshot(sequence=0, digest="", body=b"")
+        sequence = int(found.group(1))
+        return self._select_snapshot(sequence) or Snapshot(sequence=sequence, digest="", body=b"")
+
+    def _select_snapshot(self, sequence: int) -> Snapshot | None:
+        row = self._conn.execute(
+            "SELECT sequence, digest, body, signature FROM snapshots WHERE sequence = ?",
+            (sequence,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Snapshot(
+            sequence=int(row[0]), digest=str(row[1]), body=bytes(row[2]), signature=row[3]
+        )
+
+    def put_snapshot(self, snapshot: Snapshot) -> None:
+        """Store a snapshot, once.
+
+        The state as of a sequence never changes, so an identical second
+        snapshot is a no-op and a different one is refused.
+
+        :raises LedgerIntegrityError: If a different snapshot of the same
+            sequence is already stored: two derivations of one chain disagree.
+        """
+
+        def work(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT OR IGNORE INTO snapshots (sequence, digest, body, signature, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    snapshot.sequence,
+                    snapshot.digest,
+                    snapshot.body,
+                    snapshot.signature,
+                    _iso(datetime.now(UTC)),
+                ),
+            )
+            row = conn.execute(
+                "SELECT digest FROM snapshots WHERE sequence = ?", (snapshot.sequence,)
+            ).fetchone()
+            if row is None or str(row[0]) != snapshot.digest:
+                raise LedgerIntegrityError(
+                    f"a different snapshot of sequence {snapshot.sequence} is already stored: "
+                    f"two derivations of the same chain disagree"
+                )
+
+        self._write("store a checkpoint snapshot", work)
+
+    def snapshot_at(self, sequence: int) -> Snapshot | None:
+        """The stored snapshot of ``sequence``, if any."""
+        with self._read_transaction():
+            if not self._has_table("snapshots"):
+                return None
+            return self._select_snapshot(sequence)
+
+    @_guarded
+    def checkpoints(self) -> tuple[tuple[int, int, str], ...]:
+        """Every well-formed CHECKPOINT entry: its own sequence, the sequence
+        its snapshot is of, and the snapshot's digest, oldest first."""
+        with self._read_transaction():
+            rows = self._conn.execute(
+                "SELECT sequence, memo FROM entries WHERE entry_type = 'checkpoint' "
+                "ORDER BY sequence ASC"
+            ).fetchall()
+        found = []
+        for sequence, memo in rows:
+            match = _CHECKPOINT_MEMO.match(str(memo))
+            if match is not None:
+                found.append((int(sequence), int(match.group(1)), match.group(2)))
+        return tuple(found)
+
+    # -- history ----------------------------------------------------------
+
+    @_guarded
+    def head(self) -> tuple[int, str]:
+        """The committed length and head hash."""
+        with self._read_transaction():
+            row = self._conn.execute(
+                "SELECT sequence, entry_hash FROM entries ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        return (0, GENESIS_HASH) if row is None else (int(row[0]), str(row[1]))
+
+    def entry_at(self, sequence: int) -> LedgerEntry | None:
+        """The entry at ``sequence``, if there is one."""
+        with self._read_transaction():
+            found = self._select_entries("WHERE sequence = ?", (sequence,))
+        return found[0] if found else None
+
+    def entry_by_id(self, entry_id: uuid.UUID) -> LedgerEntry | None:
+        """The entry with this ``entry_id``, if there is one."""
+        with self._read_transaction():
+            found = self._select_entries("WHERE entry_id = ?", (str(entry_id),))
+        return found[0] if found else None
+
+    def iter_entries(
+        self, *, after: int = 0, until: int | None = None, chunk: int = 10_000
+    ) -> Iterator[LedgerEntry]:
+        """Entries after ``after``, up to and including ``until``, oldest
+        first, read ``chunk`` at a time so memory stays bounded."""
+        position = after
+        while until is None or position < until:
+            params: tuple[object, ...]
+            if until is None:
+                where, params = "WHERE sequence > ?", (position,)
+            else:
+                where, params = "WHERE sequence > ? AND sequence <= ?", (position, until)
+            with self._read_transaction():
+                batch = self._select_entries(where, params, limit=chunk)
+            if not batch:
+                return
+            yield from batch
+            position = batch[-1].sequence
+
+    def find_entries(
+        self,
+        *,
+        scope_id: str | None = None,
+        entry_type: EntryType | None = None,
+        memo: str | None = None,
+        transaction_id: uuid.UUID | None = None,
+        ref: uuid.UUID | None = None,
+        after: int = 0,
+        limit: int | None = None,
+    ) -> tuple[LedgerEntry, ...]:
+        """Entries matching every criterion given, oldest first, by index."""
+        if ref is not None and not self._has_column("entries", "ref"):
+            return ()  # schema 1: no entry names another
+        clauses: list[str] = ["sequence > ?"]
+        params: list[object] = [after]
+        for column, value in (
+            ("scope_id", scope_id),
+            ("entry_type", entry_type.value if entry_type is not None else None),
+            ("memo", memo),
+            ("transaction_id", str(transaction_id) if transaction_id is not None else None),
+            ("ref", str(ref) if ref is not None else None),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        with self._read_transaction():
+            return self._select_entries(
+                "WHERE " + " AND ".join(clauses), tuple(params), limit=limit
+            )
+
+    @_guarded
+    def released(self, hold_id: uuid.UUID) -> bool:
+        """Whether an entry released the hold ``hold_id`` by name."""
+        with self._read_transaction():
+            if not self._has_column("entries", "ref"):
+                return False  # schema 1: no release named its hold
+            row = self._conn.execute(
+                "SELECT 1 FROM entries WHERE entry_type = 'hold_void' AND ref = ? LIMIT 1",
+                (str(hold_id),),
+            ).fetchone()
+        return row is not None
+
+    def control_events(self) -> tuple[ControlEvent, ...]:
+        """Every circuit-breaker trip and reset recorded, oldest first."""
+        with self._read_transaction():
+            return tuple(event for _, event in self._select_control_rows(after=0))
+
+    @_guarded
+    def _control_high_water(self) -> int:
+        row = self._conn.execute("SELECT max(id) FROM control_events").fetchone()
+        return int(row[0]) if row is not None and row[0] is not None else 0
+
+    # -- the auditor's marks ----------------------------------------------
+
+    def record_audit(self, mark: AuditMark) -> None:
+        """Record how far an auditor verified the chain, and what it found."""
+
+        def work(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO audit_marks (sequence, head, state_digest, status, detail, auditor, "
+                "recorded_at, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mark.sequence,
+                    mark.head,
+                    mark.state_digest,
+                    mark.status,
+                    mark.detail,
+                    mark.auditor,
+                    _iso(mark.recorded_at),
+                    mark.signature,
+                ),
+            )
+
+        self._write_unclaimed("record an audit mark", work)
+
+    def fork(self) -> SqliteStore:
+        """Another store over the same database, on a connection of its own
+        and without its claim: read-only, for an auditor beside the governor
+        (it records its marks through :meth:`record_audit`)."""
+        return SqliteStore(self._path, read_only=True)
+
+    @_guarded
+    def audit_marks(self) -> tuple[AuditMark, ...]:
+        """Every audit mark, oldest first."""
+        with self._read_transaction():
+            if not self._has_table("audit_marks"):
+                return ()
+            rows = self._conn.execute(
+                "SELECT sequence, head, state_digest, status, detail, auditor, recorded_at, "
+                "signature FROM audit_marks ORDER BY id ASC"
+            ).fetchall()
+        return tuple(_audit_mark(row) for row in rows)
+
+    @_guarded
+    def audit_failure(self) -> AuditMark | None:
+        """The newest audit mark, if it is a failure. A later mark that
+        verified the chain supersedes an earlier failure."""
+        with self._read_transaction():
+            if not self._has_table("audit_marks"):
+                return None
+            row = self._conn.execute(
+                "SELECT sequence, head, state_digest, status, detail, auditor, recorded_at, "
+                "signature FROM audit_marks ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        mark = None if row is None else _audit_mark(row)
+        return mark if mark is not None and mark.status == "failed" else None
 
     def load_entries(self) -> tuple[LedgerEntry, ...]:
         """Return every persisted entry, oldest first."""
@@ -885,33 +1422,17 @@ class SqliteStore:
         with self._read_transaction():
             return self._select_authorizations()
 
-    def _select_entries(self, where: str, params: tuple[object, ...]) -> tuple[LedgerEntry, ...]:
+    def _select_entries(
+        self, where: str, params: tuple[object, ...], *, limit: int | None = None
+    ) -> tuple[LedgerEntry, ...]:
         versioned = self._has_column("entries", "version")
         columns = _ENTRY_COLUMNS + (", version, ref" if versioned else "")
+        tail = f" LIMIT {int(limit)}" if limit is not None else ""
         rows = self._conn.execute(
-            f"SELECT {columns} FROM entries {where} ORDER BY sequence ASC",  # noqa: S608
+            f"SELECT {columns} FROM entries {where} ORDER BY sequence ASC{tail}",  # noqa: S608
             params,
         ).fetchall()
-        return tuple(
-            LedgerEntry(
-                sequence=row[0],
-                entry_id=uuid.UUID(row[1]),
-                transaction_id=uuid.UUID(row[2]),
-                timestamp=_parse_iso(row[3]),
-                entry_type=EntryType(row[4]),
-                direction=Direction(row[5]),
-                scope_id=row[6],
-                counterparty_id=row[7],
-                amount=Decimal(row[8]),
-                balance_after=Decimal(row[9]),
-                prev_hash=row[10],
-                entry_hash=row[11],
-                memo=row[12],
-                ref=uuid.UUID(row[14]) if versioned and row[14] else None,
-                version=row[13] if versioned else "AGOV1",
-            )
-            for row in rows
-        )
+        return tuple(_entry_from_row(row, versioned) for row in rows)
 
     def _select_nodes(self) -> tuple[PersistedNode, ...]:
         rows = self._conn.execute(
@@ -928,14 +1449,20 @@ class SqliteStore:
             for row in rows
         )
 
-    def _select_control_rows(self, *, after: int) -> tuple[tuple[int, ControlEvent], ...]:
+    def _select_control_rows(
+        self, *, after: int, where: str = "", params: tuple[object, ...] = ()
+    ) -> tuple[tuple[int, ControlEvent], ...]:
         chained = self._has_column("control_events", "entry_id")
         columns = "id, event_id, timestamp, event_type, scope_id, reason, ledger_head_hash"
         if chained:
             columns += ", entry_id"
+        if where and chained:
+            condition, arguments = f"id > ? AND ({where})", (after, *params)
+        else:
+            condition, arguments = "id > ?", (after,)
         rows = self._conn.execute(
-            f"SELECT {columns} FROM control_events WHERE id > ? ORDER BY id ASC",  # noqa: S608
-            (after,),
+            f"SELECT {columns} FROM control_events WHERE {condition} ORDER BY id ASC",  # noqa: S608
+            arguments,
         ).fetchall()
         return tuple(
             (
@@ -971,6 +1498,7 @@ class SqliteStore:
 
     # -- lifecycle --------------------------------------------------------
 
+    @_guarded
     def close(self) -> None:
         try:
             self._conn.close()
@@ -978,6 +1506,86 @@ class SqliteStore:
             if self._lock is not None:
                 self._lock.release()
                 self._lock = None
+
+
+_SCHEMA_3 = (
+    """
+    CREATE TABLE IF NOT EXISTS snapshots (
+        sequence   INTEGER PRIMARY KEY CHECK (sequence > 0),
+        digest     TEXT NOT NULL,
+        body       BLOB NOT NULL,
+        signature  TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS audit_marks (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        sequence     INTEGER NOT NULL,
+        head         TEXT NOT NULL,
+        state_digest TEXT NOT NULL,
+        status       TEXT NOT NULL CHECK (status IN ('verified', 'failed')),
+        detail       TEXT NOT NULL,
+        auditor      TEXT NOT NULL,
+        recorded_at  TEXT NOT NULL,
+        signature    TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS idempotency (
+        key        TEXT PRIMARY KEY,
+        request    TEXT NOT NULL,
+        outcome    TEXT NOT NULL,
+        sequence   INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    # History is looked up by scope and by type (anchors by memo, checkpoints).
+    # Not by transaction_id or ref: their values are random, so an index on
+    # either would cost every commit a page write for a lookup no write path
+    # makes; find_entries() filters by them instead.
+    "CREATE INDEX IF NOT EXISTS entries_by_scope ON entries (scope_id, sequence)",
+    "CREATE INDEX IF NOT EXISTS entries_by_type_memo ON entries (entry_type, memo)",
+    # The refunds naming a spend, which bound how much more of it may be
+    # refunded: a page only for a refund, which few writes are.
+    "CREATE INDEX IF NOT EXISTS entries_reversals ON entries (ref) WHERE entry_type = 'reversal'",
+    "CREATE INDEX IF NOT EXISTS control_events_by_entry ON control_events (entry_id)",
+)
+"""What schema 3 adds. ``IF NOT EXISTS`` throughout: an upgrade runs it over a
+version-1 or version-2 database, and a fresh database is created by it."""
+
+
+def _audit_mark(row: Sequence[Any]) -> AuditMark:
+    return AuditMark(
+        sequence=int(row[0]),
+        head=str(row[1]),
+        state_digest=str(row[2]),
+        status=str(row[3]),
+        detail=str(row[4]),
+        auditor=str(row[5]),
+        recorded_at=_parse_iso(str(row[6])),
+        signature=row[7],
+    )
+
+
+def _entry_from_row(row: Sequence[Any], versioned: bool) -> LedgerEntry:
+    return LedgerEntry(
+        sequence=row[0],
+        entry_id=uuid.UUID(row[1]),
+        transaction_id=uuid.UUID(row[2]),
+        timestamp=_parse_iso(row[3]),
+        entry_type=_entry_type(row[4]),
+        direction=_direction(row[5]),
+        scope_id=row[6],
+        counterparty_id=row[7],
+        amount=Decimal(row[8]),
+        balance_after=Decimal(row[9]),
+        prev_hash=row[10],
+        entry_hash=row[11],
+        memo=row[12],
+        ref=uuid.UUID(row[14]) if versioned and row[14] else None,
+        version=row[13] if versioned else "AGOV1",
+    )
 
 
 def _entry_row(entry: LedgerEntry) -> tuple[object, ...]:
@@ -990,8 +1598,8 @@ def _entry_row(entry: LedgerEntry) -> tuple[object, ...]:
         entry.direction.value,
         entry.scope_id,
         entry.counterparty_id,
-        str(entry.amount),
-        str(entry.balance_after),
+        _amount_text(entry, entry.amount),
+        _amount_text(entry, entry.balance_after),
         entry.prev_hash,
         entry.entry_hash,
         entry.memo,

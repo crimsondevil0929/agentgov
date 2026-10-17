@@ -24,10 +24,13 @@ SQLite-backed one instead::
     with BudgetManager.open_sqlite("governor.db") as gov:
         ...  # same API; state above is durable across restarts
 
+Or name any ledger by URL: ``agentgov.open("postgresql://...")``,
+``agentgov.open("sqlite:///governor.db")``, ``agentgov.open("memory:")``.
+
 See :mod:`agentgov.core` for the ledger and budget DAG,
 :mod:`agentgov.exceptions` for the error hierarchy,
 :mod:`agentgov.interceptor` for the call-site enforcement wrappers,
-:mod:`agentgov.storage` for the durable-store interface,
+:mod:`agentgov.spi` for what a store implementer needs,
 :mod:`agentgov.adapters` for the LangChain and CrewAI drop-ins, and
 :mod:`agentgov.reconciliation` for matching a provider invoice against the
 ledger.
@@ -35,6 +38,7 @@ ledger.
 
 from __future__ import annotations
 
+from agentgov._aio import AsyncBudgetManager
 from agentgov.cognitive import (
     CallCycleDetector,
     CognitiveBreaker,
@@ -54,6 +58,7 @@ from agentgov.core import (
     Authorization,
     BudgetManager,
     BudgetNode,
+    CheckpointSigning,
     ControlEvent,
     Direction,
     EntryType,
@@ -61,28 +66,27 @@ from agentgov.core import (
     JoinedTransaction,
     Ledger,
     LedgerEntry,
-    LedgerLine,
     SettlementClaim,
-    WriteBatch,
+    Transaction,
     format_audit_line,
     money,
 )
 from agentgov.exceptions import (
     AgentGovError,
     AgentThrashingError,
-    AgentThrashingException,
     BudgetError,
     BudgetExceededError,
     CircuitBreakerError,
     CircuitOpenError,
     ConcurrentGovernorError,
     DenialOfWalletError,
-    DenialOfWalletException,
     DoubleSpendError,
     DuplicateScopeError,
+    IdempotencyConflictError,
     LedgerConflictError,
     LedgerError,
     LedgerIntegrityError,
+    LedgerRollbackError,
     ReadOnlyLedgerError,
     RunawayLoopDetectedError,
     ScopeError,
@@ -104,6 +108,7 @@ from agentgov.interceptor import (
     normalize_model_id,
     pricing_for,
 )
+from agentgov.opening import open_url as open  # agentgov.open(url), as gzip.open
 from agentgov.proxy import GovernedClient, GovernorHandle, govern
 from agentgov.reconciliation import (
     MeteringJournal,
@@ -113,17 +118,7 @@ from agentgov.reconciliation import (
     load_provider_export,
     reconcile,
 )
-from agentgov.storage import (
-    JoinableStore,
-    PersistedAuthorization,
-    PersistedNode,
-    PersistenceStore,
-    SharedStore,
-    SqliteStore,
-    StoreDelta,
-    StoreImage,
-    WriterSession,
-)
+from agentgov.storage import SqliteStore
 from agentgov.streaming import AsyncMeteredStream, MeteredStream
 
 __all__ = [
@@ -131,7 +126,7 @@ __all__ = [
     "PRICING",
     "AgentGovError",
     "AgentThrashingError",
-    "AgentThrashingException",
+    "AsyncBudgetManager",
     "AsyncMeteredStream",
     "Authorization",
     "BudgetError",
@@ -139,6 +134,7 @@ __all__ = [
     "BudgetManager",
     "BudgetNode",
     "CallCycleDetector",
+    "CheckpointSigning",
     "CircuitBreakerError",
     "CircuitOpenError",
     "CognitiveBreaker",
@@ -146,7 +142,6 @@ __all__ = [
     "ConcurrentGovernorError",
     "ControlEvent",
     "DenialOfWalletError",
-    "DenialOfWalletException",
     "Direction",
     "DoubleSpendError",
     "DuplicateScopeError",
@@ -155,24 +150,21 @@ __all__ = [
     "GovernancePolicy",
     "GovernedClient",
     "GovernorHandle",
+    "IdempotencyConflictError",
     "Interceptor",
-    "JoinableStore",
     "JoinedTransaction",
     "Ledger",
     "LedgerConflictError",
     "LedgerEntry",
     "LedgerError",
     "LedgerIntegrityError",
-    "LedgerLine",
+    "LedgerRollbackError",
     "LoopDetector",
     "MeteredCall",
     "MeteredStream",
     "MeteringJournal",
     "ModelPricing",
     "NearDuplicateDetector",
-    "PersistedAuthorization",
-    "PersistedNode",
-    "PersistenceStore",
     "ProviderUsageRecord",
     "ReadOnlyLedgerError",
     "ReconciliationPolicy",
@@ -182,20 +174,16 @@ __all__ = [
     "ScopeError",
     "SemanticObserver",
     "SettlementClaim",
-    "SharedStore",
     "SpendGuard",
     "SqliteStore",
     "StorageError",
-    "StoreDelta",
-    "StoreImage",
     "SubBudgetAllocationError",
     "TokenUsage",
     "ToolCall",
     "TrajectoryEntropyObserver",
+    "Transaction",
     "UnknownScopeError",
     "Verdict",
-    "WriteBatch",
-    "WriterSession",
     "canonical_arguments",
     "default_usage_extractor",
     "estimate_tokens",
@@ -206,8 +194,60 @@ __all__ = [
     "load_provider_export",
     "money",
     "normalize_model_id",
+    "open",
     "pricing_for",
     "reconcile",
 ]
 
-__version__ = "0.4.0"
+__version__ = "1.0.0"
+
+
+# Names this package served before 1.0 that now live elsewhere: still served,
+# with a DeprecationWarning, until 2.0 removes them.
+_MOVED: dict[str, tuple[str, str, str]] = {
+    **{
+        name: ("agentgov.spi", name, f"from agentgov.spi import {name}")
+        for name in (
+            "JoinableStore",
+            "PersistedAuthorization",
+            "PersistedNode",
+            "PersistenceStore",
+            "SharedStore",
+            "StoreDelta",
+            "StoreImage",
+            "WriteBatch",
+            "WriterSession",
+        )
+    },
+    "AgentThrashingException": (
+        "agentgov.exceptions",
+        "AgentThrashingError",
+        "catch AgentThrashingError, which it has always been",
+    ),
+    "DenialOfWalletException": (
+        "agentgov.exceptions",
+        "DenialOfWalletError",
+        "catch DenialOfWalletError, which it has always been",
+    ),
+    "LedgerLine": (
+        "agentgov.core",
+        "LedgerLine",
+        "it described a line for Ledger.post(), which 1.0 removed; write through BudgetManager",
+    ),
+}
+
+
+def __getattr__(name: str) -> object:
+    moved = _MOVED.get(name)
+    if moved is None:
+        raise AttributeError(f"module 'agentgov' has no attribute {name!r}")
+    import importlib
+    import warnings
+
+    module, attribute, advice = moved
+    warnings.warn(
+        f"agentgov.{name} is deprecated and is removed in 2.0: {advice}",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return getattr(importlib.import_module(module), attribute)

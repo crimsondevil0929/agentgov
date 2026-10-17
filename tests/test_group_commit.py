@@ -1,0 +1,363 @@
+"""Group commit (Phase 5.2, D9): concurrent callers share units of work.
+
+On a shared ledger every mutation takes the fleet's writer lock, catches up
+and commits. Callers of one governor that arrive together share that: the
+first to get the governor's lock runs everything queued, in order, in one
+unit of work. Each caller's failure is its own, a trip recorded on the way
+still commits, and a commit that fails fails every mutation it carried. A
+caller holding ``ledger.lock`` around a check and its act runs alone.
+"""
+
+from __future__ import annotations
+
+import functools
+import threading
+import time
+from collections.abc import Callable, Iterator
+from typing import Any
+
+import pytest
+
+from agentgov import BudgetManager, GovernancePolicy, money
+from agentgov.exceptions import (
+    BudgetExceededError,
+    CircuitOpenError,
+    DenialOfWalletError,
+    StorageError,
+)
+from agentgov.postgres import PostgresStore
+
+UNLIMITED = GovernancePolicy(max_calls_per_window=0)
+
+
+@pytest.fixture
+def gov(pg_dsn: str) -> Iterator[BudgetManager]:
+    manager = BudgetManager.open_postgres(pg_dsn, policy=UNLIMITED, auditor=False)
+    manager.open_root("root", money("100"))
+    for name in ("a", "b", "c", "d"):
+        manager.delegate("root", name, money("10"))
+    try:
+        yield manager
+    finally:
+        manager.close()
+
+
+class Run(threading.Thread):
+    def __init__(self, call: Callable[[], object]) -> None:
+        super().__init__(daemon=True)
+        self._call = call
+        self.result: object = None
+        self.error: BaseException | None = None
+        self.start()
+
+    def run(self) -> None:
+        try:
+            self.result = self._call()
+        except BaseException as exc:  # the test inspects it
+            self.error = exc
+
+    def outcome(self) -> object:
+        self.join(20)
+        assert not self.is_alive()
+        return self.error if self.error is not None else self.result
+
+
+def _sessions(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    count = [0]
+    original = PostgresStore.writer
+
+    def counted(self: PostgresStore, **kwargs: Any) -> Any:
+        if self._session is None:
+            count[0] += 1
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(PostgresStore, "writer", counted)
+    return count
+
+
+def _queued(gov: BudgetManager, calls: list[Callable[[], object]]) -> list[Run]:
+    """Start ``calls`` while this thread holds the governor's lock, so they
+    queue up, and let them go together: one unit of work runs them all."""
+    with gov._lock:
+        runs = [Run(call) for call in calls]
+        deadline = time.monotonic() + 10
+        while len(gov._queue) < len(calls):
+            assert time.monotonic() < deadline, "the callers never queued"
+            time.sleep(0.001)
+    return runs
+
+
+def test_callers_that_arrive_together_share_one_unit_of_work(
+    gov: BudgetManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = _sessions(monkeypatch)
+    runs = _queued(gov, [functools.partial(gov.authorize, s, money("1")) for s in "abcd"])
+    holds = [run.outcome() for run in runs]
+    assert sessions[0] == 1, "four authorizations, one unit of work"
+    assert all(hold.scope_id == s for hold, s in zip(holds, "abcd", strict=True))  # type: ignore[attr-defined]
+    assert [gov.available(s) for s in "abcd"] == [money("9")] * 4
+    with BudgetManager.open_postgres(gov.store._conninfo, read_only=True) as view:  # type: ignore[union-attr]
+        assert [view.available(s) for s in "abcd"] == [money("9")] * 4
+        view.verify_integrity()
+
+
+def test_each_caller_keeps_its_own_failure(
+    gov: BudgetManager, monkeypatch: pytest.MonkeyPatch, pg_dsn: str
+) -> None:
+    """In one unit of work: a refused authorization writes nothing and raises
+    its own error; an overdraw trips its scope, which commits, and raises; the
+    others commit as if alone."""
+    advisory = BudgetManager.open_postgres(
+        pg_dsn,
+        policy=GovernancePolicy(max_calls_per_window=0, trip_on_overdraft=False),
+        auditor=False,
+    )
+    try:
+        sessions = _sessions(monkeypatch)
+        runs = _queued(
+            advisory,
+            [
+                lambda: advisory.authorize("a", money("1")),
+                lambda: advisory.authorize("b", money("50")),  # refused, nothing written
+                lambda: advisory.authorize("c", money("2")),
+            ],
+        )
+        outcomes = [run.outcome() for run in runs]
+        assert sessions[0] == 1
+        assert isinstance(outcomes[1], BudgetExceededError)
+        assert [advisory.available(s) for s in "abc"] == [money("9"), money("10"), money("8")]
+    finally:
+        advisory.close()
+
+    runs = _queued(
+        gov,
+        [
+            lambda: gov.authorize("a", money("1")),
+            lambda: gov.authorize("b", money("50")),  # overdraws: trips b, then raises
+            lambda: gov.authorize("c", money("2")),
+        ],
+    )
+    outcomes = [run.outcome() for run in runs]
+    assert isinstance(outcomes[1], DenialOfWalletError)
+    assert gov.is_halted("b") and not gov.is_halted("a")
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as view:
+        assert view.is_halted("b"), "the trip committed with the others"
+        assert view.available("a") == money("8") and view.available("c") == money("6")
+    with pytest.raises(CircuitOpenError):
+        gov.authorize("b", money("1"))
+
+
+def test_a_commit_that_fails_fails_every_mutation_it_carried(
+    gov: BudgetManager, monkeypatch: pytest.MonkeyPatch, pg_dsn: str
+) -> None:
+    def refuse(self: PostgresStore, session: Any) -> None:
+        self._rollback_quietly()
+        session.batches.clear()
+        raise StorageError("the database refused the commit")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PostgresStore, "_end", refuse)
+        runs = _queued(gov, [functools.partial(gov.authorize, s, money("1")) for s in "abc"])
+        outcomes = [run.outcome() for run in runs]
+    assert all(isinstance(o, StorageError) for o in outcomes), outcomes
+    assert [gov.available(s) for s in "abc"] == [money("10")] * 3, "re-read: nothing committed"
+    assert gov.stale_authorizations(0) == ()
+    gov.authorize("a", money("1"))
+    gov.verify_integrity()
+
+
+def test_a_statement_that_fails_inside_a_unit_fails_every_mutation_it_carried(
+    gov: BudgetManager, monkeypatch: pytest.MonkeyPatch, pg_dsn: str
+) -> None:
+    """Found by scripts/soak.py: a connection cut mid-unit failed one caller's
+    read inside the session (a refund resolving the spend it names), and that
+    caller raised it as its own error. The database had aborted the whole
+    transaction, but the session ended quietly, rolled back, and the other
+    callers were told their writes had committed. Every mutation a unit of
+    work carried fails when anything inside its transaction did."""
+    spend = gov.spend("a", money("1"))
+    original = PostgresStore.entry_by_id
+
+    def cut(self: PostgresStore, entry_id: Any) -> Any:
+        if self._session is not None:  # the transaction aborts, as a cut connection's does
+            with self._errors("read an entry"):
+                self._conn.execute("SELECT 1/0")
+        return original(self, entry_id)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PostgresStore, "entry_by_id", cut)
+        # In this order: the two that touch nothing but memory first, then the
+        # refund whose read fails. One failing first poisons the rest at once.
+        with gov._lock:
+            runs = []
+            for call in (
+                lambda: gov.spend("b", money("1")),
+                lambda: gov.authorize("c", money("1")),
+                lambda: gov.refund("a", money("0.5"), reverses=spend),
+            ):
+                runs.append(Run(call))
+                deadline = time.monotonic() + 10
+                while len(gov._queue) < len(runs):
+                    assert time.monotonic() < deadline, "the callers never queued"
+                    time.sleep(0.001)
+        outcomes = [run.outcome() for run in runs]
+    assert all(isinstance(o, StorageError) for o in outcomes), outcomes
+    assert [gov.available(s) for s in "abc"] == [money("9"), money("10"), money("10")]
+    with BudgetManager.open_postgres(pg_dsn, read_only=True) as view:
+        assert [view.available(s) for s in "abc"] == [money("9"), money("10"), money("10")]
+    gov.spend("b", money("1"))
+    gov.verify_integrity()
+
+
+def test_a_governor_alone_reads_no_breaker_event_twice(
+    gov: BudgetManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by scripts/soak.py: a governor current with the ledger skipped
+    catching up, and with it the mark past the control rows its own trips and
+    resets wrote. Every unit of work then read them all again, and decoded
+    them, under the writer lock: work that grew with the ledger's history."""
+    read: list[int] = []
+    delta = PostgresStore._delta
+
+    def counted(self: PostgresStore, anchor: Any, entries: Any, rows: Any, after: int) -> Any:
+        read.append(len(rows))
+        return delta(self, anchor, entries, rows, after)
+
+    for _ in range(20):
+        gov.trip("a", "halted for review")
+        gov.reset("a")
+    monkeypatch.setattr(PostgresStore, "_delta", counted)
+    gov.spend("b", money("1"))
+    gov.spend("b", money("1"))
+    assert read and max(read) <= 1, read
+
+
+def test_a_caller_holding_the_lock_runs_alone(gov: BudgetManager) -> None:
+    """A check and the act it decides, under ``ledger.lock``: work queued by
+    other callers meanwhile runs after, never between them. Deprecated for
+    transaction(), which is atomic across a fleet too, and still served."""
+    with pytest.warns(DeprecationWarning, match="Ledger.lock is deprecated"):
+        lock = gov.ledger.lock
+    with lock:
+        other = Run(lambda: gov.spend("a", money("5")))
+        deadline = time.monotonic() + 10
+        while not gov._queue:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert gov.available("a") == money("10")  # the check
+        gov.authorize("a", money("10"))  # the act: all of it, and nothing else ran
+        assert gov.available("a") == money("0") and len(gov._queue) == 1
+    outcome = other.outcome()
+    assert isinstance(outcome, DenialOfWalletError), "it ran after, and found nothing left"
+
+
+def test_many_threads_on_one_governor_stay_exact(
+    gov: BudgetManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = _sessions(monkeypatch)
+
+    def work(scope: str) -> None:
+        for _ in range(25):
+            hold = gov.authorize(scope, money("0.01"))
+            gov.capture(hold, money("0.004"))
+
+    runs = [Run(functools.partial(work, s)) for s in "abcd" for _ in range(4)]
+    for run in runs:
+        assert run.outcome() is None
+    assert [gov.available(s) for s in "abcd"] == [money("10") - money("0.004") * 100] * 4
+    assert sessions[0] < 800, f"{sessions[0]} units of work for 800 mutations"
+    gov.verify_integrity()
+
+
+def test_a_checkpoint_come_due_waits_for_the_units_callers_to_have_their_results(
+    pg_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A unit of work that makes a checkpoint due releases its callers first:
+    only the caller that led it runs the checkpoint, and the lock is free
+    meanwhile for the next unit."""
+    gov = BudgetManager.open_postgres(
+        pg_dsn, policy=GovernancePolicy(max_calls_per_window=0, checkpoint_every=8), auditor=False
+    )
+    try:
+        gov.open_root("root", money("100"))
+        for name in "abcd":
+            gov.delegate("root", name, money("10"))
+        started, release = threading.Event(), threading.Event()
+        original = BudgetManager.checkpoint
+
+        def held(self: BudgetManager) -> int:
+            started.set()
+            assert release.wait(20)
+            return original(self)
+
+        monkeypatch.setattr(BudgetManager, "checkpoint", held)
+        runs = _queued(gov, [functools.partial(gov.authorize, s, money("1")) for s in "abcdabcd"])
+        assert started.wait(10), "eight holds past the last checkpoint make one due"
+        deadline = time.monotonic() + 10
+        while sum(run.is_alive() for run in runs) > 1:
+            assert time.monotonic() < deadline, "callers waited on the checkpoint"
+            time.sleep(0.005)
+        assert gov.spend("a", money("1")).amount == money("1"), "the next unit ran meanwhile"
+        release.set()
+        assert all(run.outcome().scope_id in "abcd" for run in runs)  # type: ignore[attr-defined]
+        assert gov.ledger._state.last_checkpoint is not None
+    finally:
+        release.set()
+        gov.close()
+
+
+def test_sqlite_callers_share_one_transaction_and_its_sync(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On SQLite the unit of work is one transaction: one commit, one sync
+    of the file, for every caller queued."""
+    from agentgov.storage import SqliteStore
+
+    gov = BudgetManager.open_sqlite(str(tmp_path / "l.db"), policy=UNLIMITED, auditor=False)
+    try:
+        gov.open_root("root", money("100"))
+        for name in "abcd":
+            gov.delegate("root", name, money("10"))
+        units = [0]
+        original = SqliteStore.unit
+
+        def counted(self: SqliteStore) -> Any:
+            units[0] += 1
+            return original(self)
+
+        monkeypatch.setattr(SqliteStore, "unit", counted)
+        runs = _queued(gov, [functools.partial(gov.authorize, s, money("1")) for s in "abcd"])
+        assert all(run.outcome().scope_id in "abcd" for run in runs)  # type: ignore[attr-defined]
+        assert units[0] == 1
+    finally:
+        gov.close()
+    with BudgetManager.open_sqlite(str(tmp_path / "l.db"), read_only=True) as view:
+        assert [view.available(s) for s in "abcd"] == [money("9")] * 4
+
+
+def test_a_sqlite_commit_that_fails_fails_every_mutation_and_is_re_read(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentgov.storage import SqliteStore
+
+    gov = BudgetManager.open_sqlite(str(tmp_path / "l.db"), policy=UNLIMITED, auditor=False)
+    try:
+        gov.open_root("root", money("100"))
+        for name in "abc":
+            gov.delegate("root", name, money("10"))
+
+        def full(self: SqliteStore) -> None:
+            raise StorageError("database or disk is full")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(SqliteStore, "_commit_unit", full)
+            runs = _queued(gov, [functools.partial(gov.spend, s, money("1")) for s in "abc"])
+            outcomes = [run.outcome() for run in runs]
+        assert all(isinstance(o, StorageError) for o in outcomes), outcomes
+        assert [gov.available(s) for s in "abc"] == [money("10")] * 3, "re-read: nothing committed"
+        gov.verify_integrity()
+        gov.spend("a", money("1"))
+    finally:
+        gov.close()
+    with BudgetManager.open_sqlite(str(tmp_path / "l.db"), read_only=True) as view:
+        assert view.available("a") == money("9") and view.available("b") == money("10")

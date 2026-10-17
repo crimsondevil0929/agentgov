@@ -53,6 +53,8 @@ from agentgov.receipts import (
     HmacKey,
     InclusionProof,
     Intent,
+    Keyring,
+    KeyTransition,
     MerkleTree,
     Outcome,
     OutcomeStatus,
@@ -69,6 +71,7 @@ from agentgov.receipts.schema import Signature
 
 LOG_ID = "arc1-vectors"
 DELIVERY_LOG_ID = "arc1-vectors-delivery"
+V12_LOG_ID = "arc1-vectors-v12"
 WITNESS_ID = "arc1-vectors-witness"
 _NAMESPACE = uuid.UUID("5f3c9b1e-0a4d-4e6b-9c2f-7d1e8a0b3c4d")
 _BASE = datetime(2026, 9, 25, 14, 0, 0, tzinfo=UTC)
@@ -109,6 +112,8 @@ format is specified in [`docs/RECEIPTS.md`](../../docs/RECEIPTS.md).
 - `valid/`: bundles and row disclosures that verify.
 - `invalid/`: each one broken in exactly one way.
 - `delivery/`: ARC1 v1.1 delivery receipts, in a log of their own (below).
+- `v12/`: ARC1 1.2, signature version 2 and a key transition, in a log of
+  their own (below).
 - `manifest.json`: every command-line case, and the exit code it must produce.
 
 ## The receipts
@@ -146,6 +151,25 @@ capability for one tenant:
 claims the relay's id, a payload hash the relay never attested, a binding to
 another receipt, a status edited after signing, and a delivery placed before
 the action it follows from.
+
+## Signature version 2 and a key transition (ARC1 1.2)
+
+`v12/` is a third log, `arc1-vectors-v12`, of five receipts, every signature
+in it version 2 (`"sv": 2`: the domain and the SHA-512 of the canonical
+document are signed). Receipts 0 to 2 are signed by the issuer key. The
+issuer then signs a checkpoint at size 3 and the transition in
+`log/receipts.jsonl.transitions`, handing the log at size 3 to its successor
+(`keys/issuer-2.pub`), which signs receipts 3 and 4 and the checkpoint at
+size 5. The witness cosigns both checkpoints.
+
+- `valid/sealed.bundle.json`: receipt 1 under the checkpoint at 3, the
+  issuer's: it verifies with the issuer's key alone.
+- `valid/early.bundle.json` and `valid/late.bundle.json`: receipts 1 and 4
+  under the checkpoint at 5, the successor's. They verify from the issuer's
+  key by following the transition, or with both keys trusted outright.
+- `invalid/`: a transition forged in the issuer's name, a version 2
+  signature presented as version 1, a signature version that does not exist,
+  and a checkpoint the issuer signed past the size it handed over.
 
 ## Running the cases
 
@@ -192,7 +216,9 @@ class _Clock:
 
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -674,14 +700,14 @@ def generate(out: Path) -> None:
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    (out / "README.md").write_text(_README, encoding="utf-8")
+    (out / "README.md").write_text(_README, encoding="utf-8", newline="\n")
     keys = out / "keys"
     keys.mkdir()
-    (keys / "issuer.pub").write_text(issuer.public_key().spec() + "\n")
-    (keys / "issuer.seed").write_text(seed("issuer").hex() + "\n")
-    (keys / "witness.pub").write_text(witness_key.public_key().spec() + "\n")
-    (keys / "witness.seed").write_text(seed("witness").hex() + "\n")
-    (keys / "internal.hmac").write_text(internal.spec() + "\n")
+    (keys / "issuer.pub").write_text(issuer.public_key().spec() + "\n", newline="\n")
+    (keys / "issuer.seed").write_text(seed("issuer").hex() + "\n", newline="\n")
+    (keys / "witness.pub").write_text(witness_key.public_key().spec() + "\n", newline="\n")
+    (keys / "witness.seed").write_text(seed("witness").hex() + "\n", newline="\n")
+    (keys / "internal.hmac").write_text(internal.spec() + "\n", newline="\n")
 
     _write_json(out / "canonical.json", _canonical_vectors())
     _write_json(out / "merkle.json", _merkle_vectors())
@@ -867,16 +893,109 @@ def generate(out: Path) -> None:
     (invalid / "duplicate-key.bundle.json").write_text(
         text.replace('"v": "ARC1-bundle",', '"v": "ARC1-bundle",\n  "v": "ARC1-bundle",', 1),
         encoding="utf-8",
+        newline="\n",
     )
     (invalid / "float-amount.bundle.json").write_text(
-        text.replace('"settled_usd": "0.00549500"', '"settled_usd": 0.005495', 1), encoding="utf-8"
+        text.replace('"settled_usd": "0.00549500"', '"settled_usd": 0.005495', 1),
+        encoding="utf-8",
+        newline="\n",
     )
     unknown = json.loads(json.dumps(good))
     unknown["receipt"]["effect"]["confidence"] = "high"
     _write_json(invalid / "unknown-field.bundle.json", unknown)
 
     _delivery_vectors(out / "delivery", issuer, witness_key, attacker)
+    _v12_vectors(out / "v12", issuer, witness_key, attacker, scenarios)
     _write_json(out / "manifest.json", _manifest())
+
+
+def _v12_vectors(
+    out: Path,
+    issuer: Ed25519Signer,
+    witness_key: Ed25519Signer,
+    attacker: Ed25519Signer,
+    scenarios: list[tuple[str, ActionReceipt, RowCommitment]],
+) -> None:
+    """ARC1 1.2: signature version 2, and a key transition, in a log of their own."""
+    successor = Ed25519Signer(seed("issuer 2"))
+    keys = out / "keys"
+    keys.mkdir(parents=True)
+    (keys / "issuer-2.pub").write_text(successor.public_key().spec() + "\n", newline="\n")
+    (keys / "issuer-2.seed").write_text(seed("issuer 2").hex() + "\n", newline="\n")
+    drafts = [
+        replace(draft, receipt_id=_uuid(f"receipt:v12:{n}"))
+        for n, (_, draft, _) in enumerate(scenarios[:5])
+    ]
+    with tempfile.TemporaryDirectory() as scratch:
+        work = Path(scratch)
+        witness = FileWitness(
+            work / "cosignatures.jsonl",
+            witness_key,
+            witness_id=WITNESS_ID,
+            logs={V12_LOG_ID: Keyring([issuer.public_key(), successor.public_key()])},
+            clock=_Clock(_BASE + timedelta(hours=5), timedelta(minutes=5)),
+            signature_version=2,
+        )
+        log = ReceiptLog(
+            V12_LOG_ID,
+            issuer,
+            path=work / "receipts.jsonl",
+            witnesses=[witness],
+            policy=CheckpointPolicy(every_receipts=10**6, every_seconds=10**9, background=False),
+            clock=_Clock(_BASE + timedelta(hours=4), timedelta(minutes=1)),
+            signature_version=2,
+        )
+        for draft in drafts[:3]:
+            log.issue(draft)
+        sealed = log.publish()
+        transition = log.rotate(successor)
+        for draft in drafts[3:]:
+            log.issue(draft)
+        final = log.publish()
+        early, late = log.bundle(1, final), log.bundle(4, final)
+        sealed_bundle = log.bundle(1, sealed)
+        receipts = log.receipts()
+        log.close()
+        (out / "log").mkdir()
+        for name in ("receipts.jsonl", "receipts.jsonl.checkpoints", "receipts.jsonl.transitions"):
+            shutil.copy(work / name, out / "log" / name)
+        (out / "witness").mkdir()
+        shutil.copy(work / "cosignatures.jsonl", out / "witness" / "cosignatures.jsonl")
+
+    valid = out / "valid"
+    _write_json(valid / "sealed.bundle.json", sealed_bundle.to_json())
+    _write_json(valid / "early.bundle.json", early.to_json())
+    _write_json(valid / "late.bundle.json", late.to_json())
+
+    invalid = out / "invalid"
+    downgraded = late.to_json()
+    del downgraded["receipt"]["sig"]["sv"]
+    _write_json(invalid / "downgraded.bundle.json", downgraded)
+    unknown = late.to_json()
+    unknown["receipt"]["sig"]["sv"] = 3
+    _write_json(invalid / "unknown-version.bundle.json", unknown)
+
+    # The attacker hands the log to its own key, claiming the issuer's key id.
+    forged = KeyTransition.of(
+        V12_LOG_ID, transition.tree_size, attacker.public_key(), transition.issued_at
+    ).sign(attacker, version=2)
+    assert forged.signature is not None
+    forged = replace(forged, signature=replace(forged.signature, key_id=issuer.key_id))
+    invalid.mkdir(exist_ok=True)
+    (invalid / "forged.transitions").write_bytes(canonical_bytes(forged.to_json()) + b"\n")
+
+    # The issuer, past its era, signs the true root at size 5.
+    tree = MerkleTree(r.leaf_hash() for r in receipts)
+    past = Checkpoint(
+        log_id=V12_LOG_ID,
+        tree_size=5,
+        root_hash=tree.root().hex(),
+        issued_at=final.issued_at,
+    ).sign(issuer, version=2)
+    _write_json(
+        invalid / "old-key-past-its-era.bundle.json",
+        replace(early, checkpoint=past).to_json(),
+    )
 
 
 _REFUND_PAYLOAD = {"amount": 48000, "payment_intent": "pi_3Pq1VectorCharge"}
@@ -890,8 +1009,8 @@ def _delivery_vectors(
     relay = Ed25519Signer(seed("relay"))
     keys = out / "keys"
     keys.mkdir(parents=True)
-    (keys / "relay.pub").write_text(relay.public_key().spec() + "\n")
-    (keys / "relay.seed").write_text(seed("relay").hex() + "\n")
+    (keys / "relay.pub").write_text(relay.public_key().spec() + "\n", newline="\n")
+    (keys / "relay.seed").write_text(seed("relay").hex() + "\n", newline="\n")
     _write_json(out / "payload.json", _REFUND_PAYLOAD)
 
     payload_hash = hashlib.sha256(canonical_bytes(_REFUND_PAYLOAD)).hexdigest()
@@ -1039,6 +1158,14 @@ def _manifest() -> dict[str, Any]:
         "--action",
         "delivery/valid/refund-call.bundle.json",
     ]
+    v12_witnessed = [
+        *issuer,
+        "--witness",
+        "v12/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+    ]
+    followed = ["--transitions", "v12/log/receipts.jsonl.transitions"]
 
     def case(name: str, exit_code: int, args: list[str], what: str) -> dict[str, Any]:
         return {"name": name, "exit": exit_code, "args": args, "description": what}
@@ -1251,6 +1378,67 @@ def _manifest() -> dict[str, Any]:
                 3,
                 ["delivery/invalid/delivered-before-action.bundle.json", *issuer],
                 "a delivery that claims a place before the action it follows from",
+            ),
+            case(
+                "v12-sealed",
+                0,
+                ["v12/valid/sealed.bundle.json", *v12_witnessed],
+                "signature version 2: a receipt under the outgoing key's last checkpoint, "
+                "checked with that key alone",
+            ),
+            case(
+                "v12-early",
+                0,
+                ["v12/valid/early.bundle.json", *v12_witnessed, *followed],
+                "a receipt of the outgoing key's era, under the incoming key's checkpoint, "
+                "followed from the outgoing key",
+            ),
+            case(
+                "v12-late",
+                0,
+                ["v12/valid/late.bundle.json", *v12_witnessed, *followed],
+                "a receipt of the incoming key, followed from the outgoing key",
+            ),
+            case(
+                "v12-late-both-keys",
+                0,
+                ["v12/valid/late.bundle.json", *issuer, "--pubkey", "v12/keys/issuer-2.pub"],
+                "the same receipt, with both keys trusted outright",
+            ),
+            case(
+                "v12-late-unfollowed",
+                4,
+                ["v12/valid/late.bundle.json", *issuer],
+                "the incoming key's receipt, without the transition that names its key",
+            ),
+            case(
+                "v12-forged-transition",
+                4,
+                [
+                    "v12/valid/late.bundle.json",
+                    *issuer,
+                    "--transitions",
+                    "v12/invalid/forged.transitions",
+                ],
+                "a transition to another key, signed by it, claiming the issuer's key id",
+            ),
+            case(
+                "v12-downgraded",
+                4,
+                ["v12/invalid/downgraded.bundle.json", *issuer, *followed],
+                "a version 2 signature presented as version 1",
+            ),
+            case(
+                "v12-unknown-version",
+                3,
+                ["v12/invalid/unknown-version.bundle.json", *issuer],
+                "a signature version that does not exist",
+            ),
+            case(
+                "v12-old-key-past-its-era",
+                5,
+                ["v12/invalid/old-key-past-its-era.bundle.json", *issuer, *followed],
+                "the outgoing key signs a checkpoint past the size it handed over",
             ),
         ],
     }

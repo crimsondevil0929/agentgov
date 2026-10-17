@@ -1,0 +1,145 @@
+{
+  "v": "ARC1-bundle",
+  "receipt": {
+    "v": "ARC1",
+    "receipt_id": "5f710564-93cf-56d6-9b62-3b38e30d9643",
+    "issued_at": "2026-09-25T14:41:00.045551Z",
+    "issuer": "interlock/0.2.0 support-eu-1",
+    "authority": {
+      "scope_path": [
+        "orchestrator",
+        "support-agent"
+      ],
+      "trajectory_id": "traj-ddec8035ce33",
+      "capability": {
+        "grant": "grant:support-agent/tables-rw@v3",
+        "tables": [
+          "customers",
+          "order_audit",
+          "orders",
+          "refunds",
+          "support_notes"
+        ],
+        "tenants": [
+          "acme"
+        ],
+        "row_limit": 8
+      }
+    },
+    "intent": {
+      "plan_hash": "1675b3e9cfa4e61f8cdf3e29fbdd691ae97421321cc1f2e98c552351fefb2ac0",
+      "stated": {
+        "rows": 1,
+        "tables": [
+          "orders"
+        ]
+      }
+    },
+    "effect": {
+      "substrate_id": "sqlite",
+      "schema_hash": "57e7211a7e34df0b936d2d9689882cd7b461f72d2cf826780b8e58afdc55c20b",
+      "diff_hash": "2659fe360feb8d539d0dd4db5cf3b65f7736320e892b4c4599a2467615426bc6",
+      "row_root": "1a7f605764d9f980c525511be1f654fb3eef946f2b21d1d36d0372a35b16b1c1",
+      "row_count": 1,
+      "summary": {
+        "ins": 0,
+        "upd": 1,
+        "del": 0,
+        "tables": [
+          "orders"
+        ],
+        "tenants": [
+          "acme"
+        ]
+      },
+      "truncated": false
+    },
+    "coverage": {
+      "observed_tables": [
+        "customers",
+        "order_audit",
+        "orders",
+        "refunds",
+        "support_notes"
+      ],
+      "cascade_closed": true,
+      "authorizer_on": true,
+      "known_gaps": [
+        "rows written by database triggers into unobserved tables"
+      ]
+    },
+    "decision": {
+      "verdict_hash": "35276e7d6ecb74cd9e43e52297e76250af86e96be8528be7942d6fda72f7bf34",
+      "admitted": true,
+      "checkers": [
+        {
+          "name": "blast_radius",
+          "config_hash": "bb9f138a16e216e85cbe9676b3dab7bde97bfde04007c8033119177febdf89c6"
+        },
+        {
+          "name": "tenant_isolation",
+          "config_hash": "3826b3ac6a80ea35bc6135ebc3bd72b1e0f919d7be1136d839a2b2f44ea3ade3"
+        },
+        {
+          "name": "no_delete",
+          "config_hash": "823c37ae2da6dbd285e0b8b184e91f1a420dc2cd8f1e505ac5bf9e3693cef871"
+        },
+        {
+          "name": "stated_footprint",
+          "config_hash": "5f4299e89ff2109c70982f15808dfea32a2d27ddbaa3df9888392b132683fda0"
+        }
+      ],
+      "policy_epoch": 7,
+      "repair_of": "73fdf098-5737-57f5-bd62-5cef23477056"
+    },
+    "cost": {
+      "ledger_txn_ids": [
+        "9c43c49a-c93d-5b12-8b1e-56afbc1c3c21"
+      ],
+      "settled_usd": "0.00221000",
+      "served_models": [
+        "claude-sonnet-5"
+      ]
+    },
+    "outcome": {
+      "status": "committed",
+      "substrate_txid": "stage:448a3ab7-ddea-565d-ac38-26d745fd4086"
+    },
+    "anchors": {
+      "agentgov": {
+        "seq": 1287,
+        "head": "bfd627d15a9a20cc501b3fc6a3e3a9fa3a5338634d950328f2f3aa557aa5e25e"
+      },
+      "escrow": null,
+      "log": {
+        "log_id": "arc1-vectors-v12",
+        "leaf_index": 4
+      }
+    },
+    "sig": {
+      "alg": "ed25519",
+      "key_id": "604a1d2cdcd6dac1",
+      "signature": "c469c24257008f72072c4e55c32e7f5178aeb21f9708f88dce603ba33ad4f018750f36030db2e4ebfd8963393e423001d669bff40c5e0f282e93db61f3e96f07"
+    }
+  },
+  "inclusion": {
+    "leaf_index": 4,
+    "tree_size": 5,
+    "audit_path": [
+      "3b4fcfea0e7a7b8d2238fa4a4e4006f212f748efc32eaa974972fb36cd7d2eb1"
+    ]
+  },
+  "checkpoint": {
+    "v": "ARC1-checkpoint",
+    "log_id": "arc1-vectors-v12",
+    "tree_size": 5,
+    "root_hash": "9917ffae63c8201b9734019dd31a3d047cc4011cea1dbbd731dd92da988127e8",
+    "issued_at": "2026-09-25T18:02:00.000000Z",
+    "sig": {
+      "alg": "ed25519",
+      "key_id": "604a1d2cdcd6dac1",
+      "sv": 2,
+      "signature": "5e81eed41d76b3b8740640803ca208959d6e6a217359c56503f5f1a2b8906f001f0ed97d97621cff46ae14cd45ffd6c97a9b84523f733c8c7edaed241c921b01"
+    }
+  }
+}

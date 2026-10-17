@@ -31,19 +31,19 @@ from decimal import Decimal
 __all__ = [
     "AgentGovError",
     "AgentThrashingError",
-    "AgentThrashingException",
     "BudgetError",
     "BudgetExceededError",
     "CircuitBreakerError",
     "CircuitOpenError",
     "ConcurrentGovernorError",
     "DenialOfWalletError",
-    "DenialOfWalletException",
     "DoubleSpendError",
     "DuplicateScopeError",
+    "IdempotencyConflictError",
     "LedgerConflictError",
     "LedgerError",
     "LedgerIntegrityError",
+    "LedgerRollbackError",
     "MalformedReceiptError",
     "ReadOnlyLedgerError",
     "ReceiptError",
@@ -169,11 +169,6 @@ class DenialOfWalletError(BudgetExceededError):
             f"Denial-of-wallet backstop tripped for scope {scope_id!r} ({verb}): "
             f"requested {requested}, available {available}",
         )
-
-
-DenialOfWalletException = DenialOfWalletError
-"""Alias for :class:`DenialOfWalletError`, for callers who prefer the
-``Exception`` suffix. Both names refer to the same class."""
 
 
 class SubBudgetAllocationError(BudgetError):
@@ -413,11 +408,6 @@ class AgentThrashingError(CircuitOpenError):
         CircuitBreakerError.__init__(self, message)
 
 
-AgentThrashingException = AgentThrashingError
-"""Alias for :class:`AgentThrashingError`, for callers who prefer the
-``Exception`` suffix. Both names refer to the same class."""
-
-
 class RunawayLoopDetectedError(CircuitBreakerError):
     """Raised when the breaker detects a denial-of-wallet loop pattern.
 
@@ -471,6 +461,45 @@ class LedgerIntegrityError(LedgerError):
         super().__init__(f"Ledger integrity violation{where}: {detail}")
 
 
+class LedgerRollbackError(LedgerIntegrityError):
+    """Raised when the ledger is shorter than a chain this governor verified,
+    and what is left of it is the chain it verified, cut back.
+
+    Not tampering: the entries after :attr:`ledger_length` are gone, and every
+    one before them is as verified. The usual cause is a failover to a replica
+    that had not yet received the last commits (asynchronous replication).
+    The governor stops writing, as it does for any chain it cannot follow:
+    anchors and receipts may name heads the ledger no longer holds. See the
+    operations guide's failover runbook.
+
+    :param verified_length: How many entries this governor had verified.
+    :param ledger_length: How many the ledger holds now.
+    :param confirmed: Whether entry ``ledger_length`` was compared with the
+        one this governor verified there, and matched. ``False`` when it lies
+        further back than the governor remembers: then only the length is
+        known, and ``agentgov verify`` (and a witness's cosignatures) can tell
+        the rest.
+    """
+
+    def __init__(self, verified_length: int, ledger_length: int, *, confirmed: bool) -> None:
+        self.verified_length = verified_length
+        self.ledger_length = ledger_length
+        self.confirmed = confirmed
+        lost = verified_length - ledger_length
+        detail = (
+            f"entry {ledger_length} is the one it verified, so the {lost} after it were lost, "
+            f"not rewritten"
+            if confirmed
+            else f"entry {ledger_length} is further back than this governor remembers, so it "
+            f"could not be compared with what was verified there"
+        )
+        super().__init__(
+            f"the ledger was rolled back: it holds {ledger_length} entries, and this governor "
+            f"had verified {verified_length}; {detail} (a failover to a replica that had not "
+            f"received the last commits?)"
+        )
+
+
 class DoubleSpendError(LedgerError):
     """Raised when an authorization is settled more than once.
 
@@ -490,6 +519,32 @@ class DoubleSpendError(LedgerError):
         super().__init__(
             f"Double-spend rejected for scope {scope_id!r}: "
             f"authorization {authorization_id} {detail}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Caller errors
+# --------------------------------------------------------------------------
+
+
+class IdempotencyConflictError(AgentGovError):
+    """Raised when an idempotency key already used for one call comes with another.
+
+    A call retried under its key, with the same arguments, returns the first
+    call's result and writes nothing. A different call under the key is
+    refused before anything is written: a key names one call, so reusing it
+    for another is a bug in the caller, not a retry.
+
+    :param key: The idempotency key.
+    :param operation: The operation the key was first used for.
+    """
+
+    def __init__(self, key: str, operation: str) -> None:
+        self.key = key
+        self.operation = operation
+        super().__init__(
+            f"idempotency key {key!r} was used for a different call ({operation}); a retry "
+            f"repeats the call its key names, with the same arguments"
         )
 
 
@@ -543,3 +598,26 @@ class SignerUnavailableError(ReceiptError):
     Ed25519 signing uses the ``cryptography`` package: install it with
     ``pip install 'agentgov[sign]'``. Verification never needs it.
     """
+
+
+_ALIASES: dict[str, type[AgentGovError]] = {
+    "AgentThrashingException": AgentThrashingError,
+    "DenialOfWalletException": DenialOfWalletError,
+}
+
+
+def __getattr__(name: str) -> type[AgentGovError]:
+    """The ``*Exception`` aliases: the same classes as their ``*Error``
+    names, deprecated, and removed in 2.0."""
+    target = _ALIASES.get(name)
+    if target is None:
+        raise AttributeError(f"module 'agentgov.exceptions' has no attribute {name!r}")
+    import warnings
+
+    warnings.warn(
+        f"{name} is deprecated and is removed in 2.0: catch {target.__name__}, which it has "
+        f"always been",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return target
