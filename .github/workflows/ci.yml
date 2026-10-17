@@ -255,7 +255,9 @@ jobs:
   # Interlock is agentgov's main downstream consumer. Its whole suite runs
   # against this branch, PostgreSQL and PgBouncer included, exactly as
   # Interlock's own CI runs it: a change here that breaks Interlock fails
-  # here, before it is released.
+  # here, before it is released. The tests docs/MIGRATING_TO_1.0.md tells
+  # Interlock to change run changed (scripts/downstream/), until Interlock's
+  # own tests make the change.
   downstream:
     name: Interlock's suite against this branch
     runs-on: ubuntu-latest
