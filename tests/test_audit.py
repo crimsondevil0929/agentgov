@@ -217,6 +217,9 @@ def test_the_checkpoint_and_export_commands(tmp_path: Path) -> None:
 def test_urls_name_every_kind_of_ledger(tmp_path: Path) -> None:
     assert parse_url("memory:") == ("memory", "", {})
     assert parse_url("sqlite:///abs/ledger.db") == ("sqlite", "/abs/ledger.db", {})
+    assert parse_url("sqlite:///C:/abs/ledger.db") == ("sqlite", "C:/abs/ledger.db", {})
+    assert parse_url("sqlite:///C:\\abs\\ledger.db") == ("sqlite", "C:\\abs\\ledger.db", {})
+    assert parse_url("C:\\abs\\ledger.db") == ("sqlite", "C:\\abs\\ledger.db", {})
     assert parse_url("sqlite:rel/ledger.db") == ("sqlite", "rel/ledger.db", {})
     assert parse_url("ledger.db") == ("sqlite", "ledger.db", {})
     kind, dsn, options = parse_url(

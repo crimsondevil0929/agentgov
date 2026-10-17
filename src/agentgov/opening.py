@@ -4,8 +4,9 @@ One string names any ledger, so configuration needs no code to tell a SQLite
 path from a PostgreSQL DSN:
 
 - ``memory:``: a governor with no store (tests and examples);
-- ``sqlite:///path/to/ledger.db`` (absolute; ``sqlite:////path`` too),
-  ``sqlite:ledger.db`` (relative), or a bare filesystem path;
+- ``sqlite:///path/to/ledger.db`` (absolute; ``sqlite:////path`` too, and
+  ``sqlite:///C:/path`` on a Windows drive), ``sqlite:ledger.db`` (relative),
+  or a bare filesystem path;
 - ``postgresql://user:password@host:port/database?schema=agentgov`` (or
   ``postgres://``). ``schema``, ``lock_timeout``, ``idle_timeout`` and
   ``prepare_threshold`` (an integer, or ``none``) are read from the query and
@@ -42,6 +43,8 @@ _POSTGRES_OPTIONS: dict[str, Any] = {
 }
 _CONNINFO = re.compile(r"\A\s*[a-z_]+\s*=")
 """A libpq ``key=value`` connection string, as opposed to a URL or a path."""
+_DRIVE = re.compile(r"/[A-Za-z]:[\\/]")
+"""An absolute path on a Windows drive, after the slash a URL puts before it."""
 
 
 def parse_url(url: str) -> tuple[str, str, dict[str, Any]]:
@@ -86,6 +89,8 @@ def parse_url(url: str) -> tuple[str, str, dict[str, Any]]:
                     f"no host: {url!r}"
                 )
             path = "/" + rest.lstrip("/")
+            if _DRIVE.match(path):  # sqlite:///C:/path/ledger.db
+                path = path[1:]
         if not path:
             raise ValueError("a SQLite URL needs a path")
         return "sqlite", path, {}
