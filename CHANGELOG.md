@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
-## [1.0.0] - 2026-10-15
+## [1.0.0] - 2026-10-17
 
 The first stable release: the API frozen for 1.x, the ledger format specified,
 and a governor whose open, memory and write path no longer grow with history.
