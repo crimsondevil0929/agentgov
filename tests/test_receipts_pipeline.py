@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import sys
 import threading
 import time
 import uuid
@@ -82,6 +83,8 @@ class GatedSigner:
         self.gates: dict[str, tuple[threading.Event, threading.Event]] = {}
         self.failing: set[str] = set()
         self.calls = 0
+        self.signing = 0
+        self.most_at_once = 0  # the most signatures in progress together
         self._lock = threading.Lock()
 
     @property
@@ -119,7 +122,12 @@ class GatedSigner:
                     self.failing.discard(receipt_id)
                     raise SignerUnavailableError("the key service refused")
         if self.latency:
+            with self._lock:
+                self.signing += 1
+                self.most_at_once = max(self.most_at_once, self.signing)
             time.sleep(self.latency)
+            with self._lock:
+                self.signing -= 1
         return KEY.sign(message)
 
 
@@ -159,8 +167,11 @@ def test_slow_signatures_overlap(tmp_path: Path) -> None:
         runs = [Run(functools.partial(four, n)) for n in range(16)]
         issued = [r for run in runs for r in run.outcome()]  # type: ignore[attr-defined]
         took = time.monotonic() - began
-        # 64 signatures of 50 ms, 16 at a time: about 0.2 s, against 3.2 s in turn.
-        assert took < 1.2, f"64 receipts took {took:.2f}s"
+        # 64 signatures of 50 ms, 16 at a time: about 0.2 s, against 3.2 s in
+        # turn. A Windows runner syncs each append to disk far more slowly, so
+        # there the bound is the time the signatures alone take in turn.
+        assert took < (3.2 if sys.platform == "win32" else 1.2), f"64 receipts took {took:.2f}s"
+        assert signer.most_at_once > 1, "no two signatures were ever made at once"
         assert sorted(position(r) for r in issued) == list(range(64))
         assert log.receipts() == tuple(sorted(issued, key=position))
         assert not (log._held or log._held_ids or log._signed), "nothing held once issued"
@@ -518,7 +529,9 @@ def test_issue_async_signs_without_blocking_the_loop(tmp_path: Path) -> None:
         took, ticks, issued = asyncio.run(main())
     finally:
         log.close()
-    assert took < 1.0, f"32 receipts took {took:.2f}s"  # about 0.05 s; 1.6 s in turn
+    # About 0.05 s, against 1.6 s in turn; on Windows, whose runners sync each
+    # append far more slowly, the bound is the signatures in turn.
+    assert took < (1.6 if sys.platform == "win32" else 1.0), f"32 receipts took {took:.2f}s"
     assert ticks >= 5
     assert sorted(position(r) for r in issued) == list(range(32))
     for receipt in issued:
