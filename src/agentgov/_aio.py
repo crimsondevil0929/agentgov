@@ -75,7 +75,11 @@ async def _run(
     context = contextvars.copy_context()
     future = loop.run_in_executor(executor, context.run, call)
     try:
-        return await asyncio.shield(future)
+        # Not asyncio.shield, which on Python 3.14.8 reports a call that fails
+        # after its caller was cancelled as an unhandled error, though it is
+        # read here. wait() never cancels the call, and reports nothing.
+        await asyncio.wait((future,))
+        return future.result()
     except asyncio.CancelledError:
         await _finish(future)
         if undo is not None and not future.cancelled() and future.exception() is None:
@@ -93,11 +97,9 @@ async def _finish(future: asyncio.Future[object] | asyncio.Future[R]) -> None:
     """Wait for ``future`` to complete, through any number of cancellations."""
     while not future.done():
         try:
-            await asyncio.shield(future)
+            await asyncio.wait((future,))
         except asyncio.CancelledError:
             continue
-        except BaseException:  # its outcome is the caller's to read
-            return
 
 
 _CANCELLED_MEMO = "released: the caller was cancelled before using the hold"
