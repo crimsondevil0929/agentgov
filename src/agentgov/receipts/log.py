@@ -237,7 +237,9 @@ class ReceiptLog:
         # Lock order: _publish_lock, then _lock; never the reverse.
         self._lock = threading.RLock()
         self._turn = threading.Condition(self._lock)  # positions handed back, rotations ended
-        self._publish_lock = threading.Lock()
+        # Re-entrant: whoever takes a due checkpoint holds it through the
+        # publication, which takes it again.
+        self._publish_lock = threading.RLock()
         self._leaves: MemoryLeaves | FileLeaves = MemoryLeaves()
         self._latest: Checkpoint | None = None  # the newest checkpoint, always known
         self._checkpoint_list: list[Checkpoint] | None = []  # all of them, read when asked for
@@ -749,19 +751,27 @@ class ReceiptLog:
         if self._policy.background:
             return
         with self._lock:
-            due, self._due = self._due, False
-        if due:
-            self._publish_quietly()
+            if not self._due:
+                return  # without waiting on a publication in progress
+        with self._publish_lock:
+            with self._lock:
+                due, self._due = self._due, False
+            if due:
+                self._publish_quietly()
 
     def _run_publisher(self) -> None:
         while True:
             self._wake.wait()
-            with self._lock:
-                self._wake.clear()
-                stopping = self._stopping
-                due, self._due = self._due, False
-            if due:
-                self._publish_quietly()
+            # The flag is taken under the publish lock, so a flush() either
+            # finds the checkpoint due or waits for this publication of it,
+            # never the gap between the two.
+            with self._publish_lock:
+                with self._lock:
+                    self._wake.clear()
+                    stopping = self._stopping
+                    due, self._due = self._due, False
+                if due:
+                    self._publish_quietly()
             if stopping:
                 return
 

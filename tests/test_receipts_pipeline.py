@@ -422,6 +422,54 @@ def test_flush_publishes_a_due_checkpoint_now() -> None:
         assert len(log.checkpoints()) == 1
 
 
+def test_a_flush_finds_the_checkpoint_due_or_waits_for_its_publication() -> None:
+    """The publisher takes a due checkpoint under the publish lock. Taken
+    before it, a flush in between would find nothing due and nothing being
+    published, and return before the checkpoint existed."""
+    every_two = CheckpointPolicy(every_receipts=2, every_seconds=10**9)
+    with ReceiptLog(LOG_ID, KEY, policy=every_two) as log:
+        with log._publish_lock:  # a publication in progress, to the publisher
+            for n in range(2):
+                log.issue(draft(n))
+            time.sleep(0.2)  # the publisher has woken, and waits
+            assert log._due, "the publisher took the checkpoint it could not yet publish"
+        log.flush()
+        assert log.checkpoints()[-1].tree_size == 2
+
+
+def test_an_issue_that_made_nothing_due_does_not_wait_on_a_publication() -> None:
+    """One publication runs at a time, and issuing goes on meanwhile: without
+    a background publisher, an issue publishes only what it made due."""
+    inline = CheckpointPolicy(every_receipts=10, every_seconds=10**9, background=False)
+    with ReceiptLog(LOG_ID, KEY, policy=inline) as log:
+        with log._publish_lock:  # a publication in progress
+            issuer = threading.Thread(target=log.issue, args=(draft(0),))
+            issuer.start()
+            issuer.join(5)
+            assert not issuer.is_alive(), "the issue waited on the publication"
+        assert len(log) == 1 and log.checkpoints() == ()
+
+
+def test_issues_that_find_their_checkpoint_published_publish_nothing_more() -> None:
+    """Two issues that each made a checkpoint due wait for the publication in
+    progress. The first to follow it publishes both; the second finds nothing
+    left to publish."""
+    inline = CheckpointPolicy(every_receipts=1, every_seconds=10**9, background=False)
+    with ReceiptLog(LOG_ID, KEY, policy=inline) as log:
+        with log._publish_lock:  # a publication in progress
+            issuers = [threading.Thread(target=log.issue, args=(draft(n),)) for n in range(2)]
+            for issuer in issuers:
+                issuer.start()
+            for _ in range(500):
+                if len(log) == 2:
+                    break
+                time.sleep(0.01)
+            time.sleep(0.2)  # both appended, and both waiting to publish
+        for issuer in issuers:
+            issuer.join(5)
+        assert [c.tree_size for c in log.checkpoints()] == [2]
+
+
 # -- from a coroutine --------------------------------------------------------------
 
 
