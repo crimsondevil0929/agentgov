@@ -1277,6 +1277,8 @@ def test_a_probe_the_server_cancels_is_an_error_and_the_store_still_probes(pg_ds
 
     from tests.test_lock_free_open import _hold_writer_lock
 
+    if not _direct(pg_dsn):
+        pytest.skip("a pooler refuses a statement_timeout among the startup options")
     with BudgetManager.open_postgres(pg_dsn, auditor=False) as gov:
         gov.open_root("org", money("1"))
     store = PostgresStore(make_conninfo(pg_dsn, options="-c statement_timeout=50"), read_only=True)
@@ -1304,6 +1306,16 @@ def _admin(dsn: str, *statements: str) -> None:
     with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as conn:
         for statement in statements:
             conn.execute(statement)
+
+
+def _direct(dsn: str) -> bool:
+    """Whether ``dsn`` reaches the server itself. Behind a pooler, the pid a
+    connection reports is the pooler's, not that of the backend serving it."""
+    import psycopg
+
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as conn:
+        row = conn.execute("SELECT pg_backend_pid()").fetchone()
+        return row is not None and row[0] == conn.info.backend_pid
 
 
 def test_a_postgres_store_keeps_its_word_as_the_sqlite_store_does(pg_dsn: str) -> None:
@@ -1345,6 +1357,8 @@ def test_a_postgres_store_keeps_its_word_as_the_sqlite_store_does(pg_dsn: str) -
 
 
 def test_a_postgres_store_reads_on_a_new_connection_after_the_server_ended_one(pg_dsn: str) -> None:
+    if not _direct(pg_dsn):
+        pytest.skip("a pooler replaces a server connection that ends, unseen")
     with BudgetManager.open_postgres(pg_dsn, policy=NEVER, auditor=False) as gov:
         gov.open_root("org", money("1"))
         gov.spend("org", money("0.1"), idempotency_key="k")
@@ -1804,6 +1818,8 @@ def test_a_session_the_server_cancels_is_an_error_and_the_next_one_begins(pg_dsn
 
     from tests.test_lock_free_open import _hold_writer_lock
 
+    if not _direct(pg_dsn):
+        pytest.skip("a pooler refuses a statement_timeout among the startup options")
     with BudgetManager.open_postgres(pg_dsn, auditor=False) as gov:
         gov.open_root("org", money("1"))
     store = PostgresStore(make_conninfo(pg_dsn, options="-c statement_timeout=50"))
@@ -1854,6 +1870,8 @@ def test_a_session_whose_read_fails_leaves_the_store_able_to_begin_again(pg_dsn:
 
 
 def test_a_session_whose_connection_ends_before_its_commit_did_not_commit(pg_dsn: str) -> None:
+    if not _direct(pg_dsn):
+        pytest.skip("a pooler replaces a server connection that ends, unseen")
     with BudgetManager.open_postgres(pg_dsn, auditor=False) as gov:
         gov.open_root("org", money("1"))
     store = PostgresStore(pg_dsn)
