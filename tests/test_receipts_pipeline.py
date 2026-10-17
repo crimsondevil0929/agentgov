@@ -560,3 +560,38 @@ def test_issue_async_gives_back_a_position_when_signing_fails() -> None:
         with pytest.raises(SignerUnavailableError):
             asyncio.run(log.issue_async(draft(0)))
         assert log._held == {} and log._next == 0
+
+
+def test_an_async_issue_signed_first_waits_for_the_position_before_it() -> None:
+    """Receipts are appended in position order: an async issue whose signature
+    comes back before an earlier position's waits for it, off the event loop,
+    and that position's append wakes it."""
+
+    class SlowFirst(AsyncKey):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def sign_async(self, message: bytes) -> bytes:
+            if draft(0).receipt_id.encode() in message:
+                self.entered.set()
+                await self.release.wait()
+            return KEY.sign(message)
+
+    async def main() -> tuple[ActionReceipt, ActionReceipt]:
+        key = SlowFirst()
+        with ReceiptLog(LOG_ID, key, policy=NEVER) as log:
+            first = asyncio.create_task(log.issue_async(draft(0)))
+            await asyncio.wait_for(key.entered.wait(), 5)  # position 0, signing
+            second = asyncio.create_task(log.issue_async(draft(1)))
+            for _ in range(500):
+                if 1 in log._signed:  # signed and delivered, its turn not come
+                    break
+                await asyncio.sleep(0.01)
+            assert 1 in log._signed and not second.done()
+            key.release.set()
+            return await asyncio.wait_for(asyncio.gather(first, second), 5)
+
+    first, second = asyncio.run(main())
+    assert (position(first), position(second)) == (0, 1)
