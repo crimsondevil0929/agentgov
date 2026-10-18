@@ -31,18 +31,6 @@ rsync -a --delete \
   --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache \
   "$src/" "$work/interlock/"
 
-# Interlock's tests that agentgov's documented changes reach, changed in the
-# copy as docs/MIGRATING_TO_1.0.md says, while a patch still fits them.
-for patch in "$here"/scripts/downstream/*.patch; do
-  [ -e "$patch" ] || continue
-  if patch -s -p1 -N --dry-run -d "$work/interlock" < "$patch" > /dev/null 2>&1; then
-    patch -s -p1 -N -d "$work/interlock" < "$patch"
-    echo "applied $(basename "$patch")" >&2
-  else
-    echo "left out $(basename "$patch"): it no longer fits Interlock's tests" >&2
-  fi
-done
-
 if [ ! -x "$work/venv/bin/python" ]; then
   uv venv --quiet --python "$python" "$work/venv"
 fi
