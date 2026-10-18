@@ -31,20 +31,11 @@ rsync -a --delete \
   --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache \
   "$src/" "$work/interlock/"
 
-# Interlock's tests that agentgov's documented changes reach, changed in the
-# copy as docs/MIGRATING_TO_1.0.md says, while a patch still fits them.
-for patch in "$here"/scripts/downstream/*.patch; do
-  [ -e "$patch" ] || continue
-  if patch -s -p1 -N --dry-run -d "$work/interlock" < "$patch" > /dev/null 2>&1; then
-    patch -s -p1 -N -d "$work/interlock" < "$patch"
-    echo "applied $(basename "$patch")" >&2
-  else
-    echo "left out $(basename "$patch"): it no longer fits Interlock's tests" >&2
-  fi
-done
-
+# A Python uv manages, as Interlock's CI installs it (`uv python install`): a
+# system interpreter may be an early patch release with bugs Interlock's
+# suite, which makes every DeprecationWarning an error, does not expect.
 if [ ! -x "$work/venv/bin/python" ]; then
-  uv venv --quiet --python "$python" "$work/venv"
+  uv venv --quiet --python-preference only-managed --python "$python" "$work/venv"
 fi
 export VIRTUAL_ENV="$work/venv"
 
@@ -59,6 +50,6 @@ uv pip install --quiet --no-deps -e "$work/interlock"
 uv pip install --quiet "pytest>=8.0.0" "hypothesis>=6.100" "psycopg[binary]>=3.2" \
   "cryptography>=42"
 
-"$work/venv/bin/python" -c 'import agentgov, sys; print("agentgov", agentgov.__version__, "from", agentgov.__file__, file=sys.stderr)'
+"$work/venv/bin/python" -c 'import agentgov, platform, sys; print("agentgov", agentgov.__version__, "from", agentgov.__file__, "on Python", platform.python_version(), file=sys.stderr)'
 cd "$work/interlock"
 exec "$work/venv/bin/python" -m pytest -p no:cacheprovider "$@"
