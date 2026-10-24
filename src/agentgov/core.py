@@ -3616,9 +3616,9 @@ class Transaction:
         """:meth:`BudgetManager.trip`, in this transaction."""
         self._governor().trip(scope_id, reason)
 
-    def reset(self, scope_id: str) -> None:
+    def reset(self, scope_id: str, *, memo: str = "operator reset") -> None:
         """:meth:`BudgetManager.reset`, in this transaction."""
-        self._governor().reset(scope_id)
+        self._governor().reset(scope_id, memo=memo)
 
 
 @dataclass(slots=True)
@@ -6412,7 +6412,7 @@ class BudgetManager:
             self._trip(scope_id, reason)
 
     @_grouped
-    def reset(self, scope_id: str) -> None:
+    def reset(self, scope_id: str, *, memo: str = "operator reset") -> None:
         """Clear a tripped breaker so the scope may spend again.
 
         The breaker latches deliberately: a denial-of-wallet halt must not
@@ -6421,14 +6421,21 @@ class BudgetManager:
         :attr:`EntryType.CIRCUIT_RESET` entry.
 
         :param scope_id: The scope to re-arm.
+        :param memo: The entry's memo: why, or on whose authority, the scope
+            was reset (a signed approval's digest, say), so the entry itself
+            names it. ``"operator reset"`` by default.
         :raises UnknownScopeError: If no such scope is registered.
+        :raises ValueError: If ``memo`` is empty, or not a memo the ledger
+            holds (control characters, past its size).
         """
+        if not memo:
+            raise ValueError("a reset's memo says why the scope was reset")
         with self._mutating():
             self._require_node(scope_id)
             if self._state.trip_of(scope_id) is None:
                 return
             pending = self._ledger._begin()
-            self._stage_control(pending, EntryType.CIRCUIT_RESET, scope_id, "operator reset")
+            self._stage_control(pending, EntryType.CIRCUIT_RESET, scope_id, memo)
             self._commit(pending)
             velocity = self._velocity.get(scope_id)
             if velocity is not None:

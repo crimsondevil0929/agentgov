@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
+## [Unreleased]
+
+### Added
+
+- **A reset names its authority** (`reset(scope_id, memo=...)`, on `BudgetManager`, in a
+  transaction, and on `AsyncBudgetManager`). The `CIRCUIT_RESET` entry's memo, and its
+  control event's reason, say why or on whose authority the scope was reset (a signed
+  approval's digest, say), where every reset said `operator reset`; that is still the
+  default. An empty memo is refused, and the memo is held to every memo's rules.
+
 ## [1.0.0] - 2026-10-17
 
 The first stable release: the API frozen for 1.x, the ledger format specified,

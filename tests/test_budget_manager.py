@@ -309,6 +309,36 @@ def test_reset_re_arms_a_halted_scope(gov: BudgetManager) -> None:
     ]
 
 
+def test_a_reset_names_its_authority_in_its_memo(gov: BudgetManager) -> None:
+    """The reset entry says why, or on whose authority (a signed approval's
+    digest, say), so the entry itself names it; ``operator reset`` when
+    nothing is said. In a transaction, and as a coroutine, alike."""
+    import asyncio
+
+    from agentgov import AsyncBudgetManager
+
+    warrant = "FIDU1 warrant " + "a" * 64 + " reset worker"
+    gov.delegate("root", "worker", money("0.10"))
+    gov.trip("worker", "a halt")
+    gov.reset("worker", memo=warrant)
+    gov.trip("worker", "again")
+    with gov.transaction():
+        gov.reset("worker", memo="approved by ops")
+    gov.trip("worker", "a third time")
+    asyncio.run(AsyncBudgetManager(gov).reset("worker", memo="approved, async"))
+    gov.trip("worker", "a fourth time")
+    gov.reset("worker")
+    said = [warrant, "approved by ops", "approved, async", "operator reset"]
+    resets = [e for e in gov.audit_trail("worker") if e.entry_type is EntryType.CIRCUIT_RESET]
+    assert [e.memo for e in resets] == said
+    assert [e.reason for e in gov.control_events if e.event_type == "circuit_reset"] == said
+    gov.trip("worker", "a fifth time")
+    for memo, problem in (("", "says why"), ("a\x00b", "NUL"), ("x" * 70_000, "bytes")):
+        with pytest.raises(ValueError, match=problem):
+            gov.reset("worker", memo=memo)
+    assert gov.is_halted("worker")
+
+
 def test_a_realized_overdraft_is_recorded_and_halts(gov: BudgetManager) -> None:
     """Money that was really spent must be booked, even past the limit."""
     gov.delegate("root", "worker", money("0.10"))

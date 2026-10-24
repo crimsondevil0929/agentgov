@@ -362,9 +362,9 @@ class AsyncBudgetManager:
         """:meth:`BudgetManager.trip`."""
         await self._call(self._manager.trip, scope_id, reason)
 
-    async def reset(self, scope_id: str) -> None:
+    async def reset(self, scope_id: str, *, memo: str = "operator reset") -> None:
         """:meth:`BudgetManager.reset`."""
-        await self._call(self._manager.reset, scope_id)
+        await self._call(self._manager.reset, scope_id, memo=memo)
 
     async def void_stale(
         self, older_than: timedelta | float, *, scope_id: str | None = None, memo: str = ""
