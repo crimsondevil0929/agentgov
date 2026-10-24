@@ -866,7 +866,10 @@ See [`tests/test_postgres_joined.py`](tests/test_postgres_joined.py).
   hash chain's head, into this chain as a zero-value entry. It moves no money, and
   editing the memo afterwards breaks verification. This is how
   [interlock](https://github.com/crimsondevil0929/interlock) binds its record of
-  database writes to this ledger.
+  database writes to this ledger, and how
+  [fiduciary](https://github.com/crimsondevil0929/fiduciary), the mandate layer above
+  both, binds its decision log; it also names, in each reset's memo
+  (`reset(scope_id, memo=...)`), the signed warrant that authorized the reset.
 
 ## Known limitations
 
