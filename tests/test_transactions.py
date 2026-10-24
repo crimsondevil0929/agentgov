@@ -284,9 +284,13 @@ def test_a_sqlite_transaction_whose_commit_fails_leaves_memory_as_the_file(
 ) -> None:
     from agentgov.storage import SqliteStore
 
+    def auditors() -> set[threading.Thread]:
+        return {t for t in threading.enumerate() if t.name == "agentgov-auditor"}
+
     backend = Backend("sqlite", tmp_path, None)
     try:
         gov = backend.seeded()
+        running = auditors()
 
         def refuse(self: SqliteStore) -> None:
             raise StorageError("disk I/O error")
@@ -296,6 +300,10 @@ def test_a_sqlite_transaction_whose_commit_fails_leaves_memory_as_the_file(
             with pytest.raises(StorageError), gov.transaction() as txn:
                 txn.authorize("a", money("3"))
         assert gov.available("a") == money("10") and _holds(gov) == set()
+        # Read again as a fresh open would, but no auditor of its own: the view
+        # it was read into is adopted and dropped, and its auditor would follow
+        # the ledger for nothing, reporting to no governor.
+        assert auditors() == running
         gov.verify_integrity()
         gov.authorize("a", money("1"))
     finally:

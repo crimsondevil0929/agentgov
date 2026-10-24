@@ -27,7 +27,10 @@ executor uses when it is installed.
   a line, and the test matched any "must be positive": each operation's refusal is now
   held to its own message, and the ledger to unchanged. And a governor's open computed the
   checkpoint it owes behind a guard that could not change it (its one reader returns first
-  wherever the guard is false): the guard is gone. No behavior changes.
+  wherever the guard is false): the guard is gone. A fourth came to light once the shards
+  moved: nothing held the full re-read after a transaction that did not commit to starting
+  no auditor of its own, which would follow the ledger for a view already dropped. A test
+  now does. No behavior changes.
 
 ## [1.0.0] - 2026-10-17
 
