@@ -1,6 +1,6 @@
 [project]
 name = "interlock-agentgov"
-version = "1.0.0"
+version = "1.0.1"
 description = "Runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets."
 readme = "README.md"
 requires-python = ">=3.11"

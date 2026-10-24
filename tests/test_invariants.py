@@ -42,16 +42,21 @@ def gov() -> BudgetManager:
 
 @pytest.mark.parametrize("amount", ["0", "-0.01"])
 def test_non_positive_amounts_are_refused_everywhere(gov: BudgetManager, amount: str) -> None:
-    with pytest.raises(ValueError, match="must be positive"):
+    """Each operation refuses the amount itself, naming the argument it was
+    given, before anything reaches the ledger (whose own check of a line,
+    "line amount must be positive", is the backstop, not the answer)."""
+    before = gov.audit_trail()
+    with pytest.raises(ValueError, match=r"^envelope must be positive"):
         gov.open_root("other", Decimal(amount))
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match=r"^funding must be positive"):
         gov.fund("root", Decimal(amount))
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match=r"^delegated amount must be positive"):
         gov.delegate("root", "fresh", Decimal(amount))
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match=r"^authorization amount must be positive"):
         gov.authorize("child", Decimal(amount))
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match=r"^refund must be positive"):
         gov.refund("child", Decimal(amount))
+    assert gov.audit_trail() == before
 
 
 def test_capture_refuses_a_negative_cost(gov: BudgetManager) -> None:

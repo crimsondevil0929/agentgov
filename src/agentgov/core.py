@@ -3970,14 +3970,12 @@ class BudgetManager:
                 store, opened_from_checkpoint=image.snapshot is not None, want=auditor
             )
         self._remember_head()
-        every = self._policy.checkpoint_every
-        if every > 0 and store is not None and not store.read_only:
-            # A ledger already a checkpoint's worth past its newest (upgraded
-            # from before checkpoints, or left by a governor that died owing
-            # one) is checkpointed after this governor's first write: no
-            # crossing of the next line would come soon enough.
-            last = self._state.last_checkpoint
-            self._checkpoint_owed = self._state.length - (last[0] if last else 0) >= every
+        # A ledger already a checkpoint's worth past its newest (upgraded from
+        # before checkpoints, or left by a governor that died owing one) is
+        # checkpointed after this governor's first write: no crossing of the
+        # next line would come soon enough. Only _after_mutation reads this,
+        # and only for a governor that writes checkpoints.
+        self._checkpoint_owed = self._unlocked_checkpoint_lag() >= self._policy.checkpoint_every
         if metrics is not None and store is not None:
             metrics.record("agentgov.open.duration", time.perf_counter() - started)
 
