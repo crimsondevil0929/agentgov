@@ -25,6 +25,18 @@ Zero runtime dependencies. Pure standard library (`decimal`, `hashlib`, `threadi
 
 ---
 
+## The stack: consequence control, under the gateway
+
+Gateways decide whether an agent may make a call. This stack decides whether the call's
+consequence may stand, and proves it to someone who trusts neither the agent nor the
+operator. It sits under an MCP or policy gateway, not in place of one.
+
+| Layer | Package | The question it answers |
+|---|---|---|
+| [AgentGov](https://github.com/crimsondevil0929/agentgov) | [`interlock-agentgov`](https://pypi.org/project/interlock-agentgov/) | May this scope spend this amount, counted across its whole delegation tree and every session, with in-flight calls held? |
+| [Interlock](https://github.com/crimsondevil0929/interlock) | [`interlock-escrow`](https://pypi.org/project/interlock-escrow/) | Does what this transaction actually changed, read back from the database, satisfy policy? Commit it or roll it back, and deliver its outside calls exactly once. |
+| [Fiduciary](https://github.com/crimsondevil0929/fiduciary) | [`interlock-fiduciary`](https://pypi.org/project/interlock-fiduciary/) | Who set those limits, and who approved each exception? Signed mandates, quorum warrants, and an audit bundle anyone verifies offline. |
+
 ## The benchmark
 
 [`examples/denial_of_wallet_benchmark.py`](examples/denial_of_wallet_benchmark.py) runs
