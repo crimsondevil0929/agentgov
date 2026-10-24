@@ -6,7 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
-## [Unreleased]
+## [1.0.1] - 2026-10-23
+
+Upgrades from 1.0.0 in place, with nothing to do: the ledger format, the API and every
+default are unchanged. A reset can name what authorized it, which Interlock-Fiduciary's
+executor uses when it is installed.
 
 ### Added
 
@@ -15,6 +19,15 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
   control event's reason, say why or on whose authority the scope was reset (a signed
   approval's digest, say), where every reset said `operator reset`; that is still the
   default. An empty memo is refused, and the memo is held to every memo's rules.
+
+### Fixed (the nightly mutation pass)
+
+- **No mutant survives `phase2`.** The nightly pass failed from 1.0.0 on on three. A zero
+  envelope given to `open_root` with its own check weakened fell to the ledger's check of
+  a line, and the test matched any "must be positive": each operation's refusal is now
+  held to its own message, and the ledger to unchanged. And a governor's open computed the
+  checkpoint it owes behind a guard that could not change it (its one reader returns first
+  wherever the guard is false): the guard is gone. No behavior changes.
 
 ## [1.0.0] - 2026-10-17
 
