@@ -12,11 +12,12 @@
 When an agent spawns sub-agents that spawn tools, nothing in the stack enforces a dollar
 ceiling on the *tree*. A per-account rate limit watches one caller. It does not see a
 fan-out of 50 sub-agents each making a handful of individually reasonable calls that,
-together, burn a budget in seconds. AgentGov sits below the payment layer as that missing control
-plane: a hierarchical, capability-scoped spend envelope over an immutable, hash-chained
+together, spend a budget in seconds. AgentGov sits below the payment layer and provides that
+control: a hierarchical, capability-scoped spend envelope over an immutable, hash-chained
 ledger, with a circuit breaker that halts a runaway branch before settlement, not after.
-A second, *cognitive* breaker attacks the root cause: it detects the agent looping without
-making progress and halts it for a fraction of a cent, long before the envelope is touched.
+A second, *cognitive* breaker targets the most common cause of runaway spend: it detects an
+agent looping without making progress and halts it for a fraction of a cent, well before the
+envelope is reached.
 The ledger, topology, and any in-flight authorization survive a process crash, backed by
 SQLite via the standard library, or by PostgreSQL for a fleet of governors on many hosts.
 
@@ -34,7 +35,7 @@ operator. It sits under an MCP or policy gateway, not in place of one.
 | Layer | Package | The question it answers |
 |---|---|---|
 | [AgentGov](https://github.com/crimsondevil0929/agentgov) | [`interlock-agentgov`](https://pypi.org/project/interlock-agentgov/) | May this scope spend this amount, counted across its whole delegation tree and every session, with in-flight calls held? |
-| [Interlock](https://github.com/crimsondevil0929/interlock) | [`interlock-escrow`](https://pypi.org/project/interlock-escrow/) | Does what this transaction actually changed, read back from the database, satisfy policy? Commit it or roll it back, and deliver its outside calls exactly once. |
+| [Interlock](https://github.com/crimsondevil0929/interlock) | [`interlock-escrow`](https://pypi.org/project/interlock-escrow/) | Does what this transaction actually changed, read back from the database, satisfy policy? Commit it or roll it back, and deliver its outbound API calls exactly once. |
 | [Fiduciary](https://github.com/crimsondevil0929/fiduciary) | [`interlock-fiduciary`](https://pypi.org/project/interlock-fiduciary/) | Who set those limits, and who approved each exception? Signed mandates, quorum warrants, and an audit bundle anyone verifies offline. |
 
 ## The benchmark
