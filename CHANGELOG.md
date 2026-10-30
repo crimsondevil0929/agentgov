@@ -6,6 +6,54 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
+## [Unreleased]
+
+### 1.1.0: any unit, and honest receipts
+
+Upgrades from 1.0.1 in place, with nothing to do. Every ledger, receipt, snapshot and
+vector written before keeps its bytes and its meaning: a ledger that declares no unit
+conserves US dollars, and a receipt that names no measurement class is transactional.
+
+### Added
+
+- **A ledger conserves a declared unit** (`Unit`, `BudgetManager(unit=...)`,
+  `open_sqlite(..., unit=...)`, `open_postgres(..., unit=...)`, `BudgetManager.unit`). A
+  unit is a code (`mme`, `vcpu`, `gib`, `seats`) and how many decimal places of it the
+  ledger counts, 0 to 8; a ledger of 0 places counts whole things. The unit is fixed before
+  the first entry and committed by the genesis hash, the `prev_hash` of entry 1:
+  SHA-256 of `agentgov-genesis v1 unit=<code> places=<places>`, and still 64 zeros for US
+  dollars at eight places. Amounts are written with eight places whatever the unit, so the
+  AGOV3 payload is unchanged; a replay refuses an amount finer than the unit's quantum,
+  and every operation rounds to it as before (costs up, credits down). A store records
+  its unit in `schema_meta`, a checkpoint snapshot in an optional `unit` member, and on
+  PostgreSQL the trigger that admits entry 1 requires the unit's genesis. An open naming
+  another unit is refused. `docs/LEDGER_FORMAT.md` §3.8 (amended in 1.1.0);
+  `vectors/agov/units.json`. `agentgov inspect` prints a unit ledger's amounts in its unit.
+- **ARC1 1.3** (`docs/RECEIPTS.md` §15), three optional fields, each written only when it
+  is not the default: `coverage.measurement` (`transactional`, `plan-bound`, `predicted`
+  or `request-only`), which the verifier reports; `cost.quantities` (`Quantity`: unit,
+  amount and that ledger's transactions), which `verify_bundle(ledgers=...)` and
+  `agentgov verify-receipt --unit-ledger UNIT=DB` hold to the ledger of each unit; and
+  `cost.served_by`, the systems other than models that served the action. Writing a
+  default out is malformed. `vectors/arc1/v13/`: three receipts and six broken ones.
+- **Reconciling a system of record's actions** (`agentgov.reconciliation`:
+  `reconcile_actions`, `ActionRecord`, `ActionReport`, `load_actions`; and
+  `agentgov reconcile-actions`). The actions a cloud's audit trail, a cluster's audit log
+  or a code host's audit log saw are matched against the agent's ARC1 receipts by an
+  identifier both carry (a receipt id, a stage, a commit, an idempotency key), and every
+  action of a governed actor that no receipt explains is a phantom, which fails the audit.
+  Parsers for AWS CloudTrail, the Kubernetes audit log, GitHub's audit log and any other
+  log as JSON or CSV with a field map, in a registry (`Parser`, `register_parser`,
+  `parsers`) that also holds the invoice parsers; a package adds its own under the
+  `agentgov.parsers` entry-point group.
+- **Neutral names** beside the old ones: `BudgetExhaustedError` (`DenialOfWalletError`)
+  and `quantity()` (`money()` for any unit).
+
+### Changed
+
+- A parse failure says `cannot parse the export: ...`, where it said `cannot parse
+  provider usage export: ...`: it may be a system of record's.
+
 ## [1.0.1] - 2026-10-23
 
 Upgrades from 1.0.0 in place, with nothing to do: the ledger format, the API and every
