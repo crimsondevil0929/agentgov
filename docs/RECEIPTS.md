@@ -1,10 +1,12 @@
 # ARC1: verifiable action receipts
 
-**Status:** draft 1.2 (`agentgov.receipts`, from agentgov 1.0). Version 1.2
-adds signature version 2, which signs a digest (section 4.5), and key
-transitions, by which a log outlives its key (section 14). Version 1.1 added
-delivery receipts and relay attestations (section 13). Every version 1.0 and
-1.1 document, signature, leaf and root is unchanged, and means what it meant.
+**Status:** draft 1.3 (`agentgov.receipts`, from agentgov 1.0; 1.3 from
+agentgov 1.1). Version 1.3 says how strongly each action was measured, and
+what it cost in any unit (section 15). Version 1.2 added signature version 2,
+which signs a digest (section 4.5), and key transitions, by which a log
+outlives its key (section 14). Version 1.1 added delivery receipts and relay
+attestations (section 13). Every version 1.0, 1.1 and 1.2 document,
+signature, leaf and root is unchanged, and means what it meant.
 Every ARC1 document names its version in its `v` field, and every signature
 names its document type in a domain string. A breaking change will get a new
 version. ARC1 documents will never be reinterpreted.
@@ -44,6 +46,7 @@ against them.
 - [12. Security considerations](#12-security-considerations)
 - [13. Delivery receipts (1.1)](#13-delivery-receipts-11)
 - [14. Key transitions (1.2)](#14-key-transitions-12)
+- [15. Measurement, units and other systems (1.3)](#15-measurement-units-and-other-systems-13)
 
 ## 1. What a receipt proves
 
@@ -296,6 +299,7 @@ and its `sig` names the version:
 | `cascade_closed` | boolean | writes by foreign-key cascades were followed into the diff |
 | `authorizer_on` | boolean | writes to tables outside `observed_tables` were refused at the substrate |
 | `known_gaps` | *set* | what the issuer knows the measurement cannot see, in words |
+| `measurement` | *text*, optional (1.3) | how strongly the effect was measured: `plan-bound`, `predicted` or `request-only` (section 15.1); absent means `transactional` |
 
 A receipt must never promise more than was measured, so its blind spots are
 part of what is signed.
@@ -317,6 +321,8 @@ part of what is signed.
 | `ledger_txn_ids` | array of *uuid*, sorted (section 2), no duplicates | the AgentGov ledger transactions that paid for the action |
 | `settled_usd` | *money* | the SPEND those transactions settled, in total |
 | `served_models` | *set* | the models that served the calls |
+| `quantities` | array, optional (1.3) | what the action consumed in ledgers of other units (section 15.2) |
+| `served_by` | *set*, optional (1.3) | the systems other than models that served it (section 15.3) |
 
 ### 5.8 `outcome`
 
@@ -521,6 +527,7 @@ its command line is `agentgov verify-receipt`.
 | 3 | log inclusion | the checkpoint verifies under the log's key; the receipt's `anchors.log` names the checkpoint's `log_id` and the proof's `leaf_index`; the proof's `tree_size` is the checkpoint's; the audit path leads from the receipt's leaf hash to `root_hash` | a bundle with a checkpoint; the log's key (the issuer's by default) | 5 `INCLUSION` |
 | 4 | witnessed | section 8, for the bundle's checkpoint | the witness's cosignature file and key | 6 `WITNESS` |
 | 5 | agentgov ledger | the ledger has at least `anchors.agentgov.seq` entries; entry `seq` hashes to `head` (seq 0 is the genesis hash); every `cost.ledger_txn_ids` transaction is among the first `seq` entries; their SPEND amounts sum to exactly `cost.settled_usd` | the AgentGov ledger, which itself verifies at open | 7 `LEDGER` |
+| 5a | unit ledgers (1.3) | for each `cost.quantities` entry whose unit's ledger is given: the ledger conserves that unit, every one of its `ledger_txn_ids` is in it, and their SPEND amounts sum to exactly its `amount` | AgentGov ledgers of those units | 7 `LEDGER` |
 | 6 | disclosed rows | section 6 | a disclosure | 8 `ROWS` |
 
 A check with no evidence is reported as skipped, not passed. An input that
@@ -535,6 +542,7 @@ $ agentgov verify-receipt BUNDLE --pubkey KEY [--pubkey KEY ...]
       [--transitions FILE]                   # the log's key transitions (section 14)
       [--witness FILE --witness-pubkey KEY]  # the witness's cosignatures, and its key
       [--ledger DB]                          # an AgentGov SQLite ledger, opened read-only
+      [--unit-ledger UNIT=DB ...]            # ledgers of other units (section 15.2)
       [--rows FILE]                          # an ARC1-rows disclosure
       [--relay-key KEY ...]                  # a delivery receipt's relays (section 13)
       [--action BUNDLE]                      # the action a delivery follows from
@@ -556,6 +564,9 @@ its [README](../vectors/arc1/README.md) for the layout. `manifest.json` lists
 every command-line case with its expected exit code, which makes it a
 conformance suite for any other verifier. `v12/` holds the 1.2 cases: a log
 signed at version 2 throughout, whose key hands it to a successor at size 3.
+`v13/` holds the 1.3 cases: a request-only receipt served by an MCP server, a
+transactional one with a quantity in `mme`, a plan-bound one consuming `vcpu`,
+and each new field broken one way.
 
 ## 12. Security considerations
 
@@ -778,4 +789,53 @@ Without transitions, a verifier checks each signature under any key it holds
   outgoing key's signature. A key that is lost or disabled cannot hand the log
   over; verifiers must then be given the new key outright, or the log starts
   again under a new `log_id`.
+
+## 15. Measurement, units and other systems (1.3)
+
+A receipt for a Kubernetes change or a write through an MCP tool is not a
+receipt for a SQL transaction priced in model spend, and must not read as
+one. Version 1.3 adds three optional fields. Each is **written only when it is
+not the default**, so every earlier receipt keeps its bytes and reads as what
+it was: a transactional action, priced in dollars, served by models. A field
+written with its default (`"measurement": "transactional"`, an empty
+`quantities` or `served_by`) is malformed: one action has one encoding.
+
+### 15.1 `coverage.measurement`
+
+How strongly the action's effect was measured, strongest first:
+
+| Class | The issuer promises |
+|---|---|
+| `transactional` (absent) | what was measured is exactly what committed, or nothing committed: a stage inside a SQL transaction, a Git ref moved by compare-and-swap |
+| `plan-bound` | what was measured is the plan that was applied, and the apply refuses if the system moved since it was measured: a saved Terraform plan, a Kubernetes dry-run applied under its `resourceVersion` |
+| `predicted` | the before image was read, the after image predicted, the write made conditional on the version read, and the result read back and compared |
+| `request-only` | only the request was measured: judged, and delivered at most or exactly once. Its effect is the remote system's word |
+
+A verifier reports the class of every receipt that names one. An issuer
+labels an action by its weakest measured part that carries the effect: a plan
+whose only effect is an outbound request is `request-only`, whatever
+substrate staged the request.
+
+### 15.2 `cost.quantities`
+
+What the action consumed in AgentGov ledgers of units other than the one
+`settled_usd` names (AgentGov's `docs/LEDGER_FORMAT.md` §3.8): a dose in
+`mme`, capacity in `vcpu`, seats. An array of objects, sorted by `unit`
+(section 2), no unit twice:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `unit` | `[a-z][a-z0-9_.-]{0,31}` | the unit, which names its ledger: a deployment runs one ledger per unit |
+| `amount` | *money* | what the action consumed, at eight places whatever the unit |
+| `ledger_txn_ids` | array of *uuid*, sorted, no duplicates | that ledger's transactions that settled it |
+
+Check 5a holds each quantity to the ledger of its unit, as check 5 holds
+`settled_usd` to the dollar ledger.
+
+### 15.3 `cost.served_by`
+
+A *set* of the systems other than models that served the action, in the
+issuer's words: `mcp:crm-server`, `terraform`, `fhir:epic`. It names, and
+claims nothing about what they did; `coverage.measurement` says how much of
+that was measured.
 

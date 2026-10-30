@@ -12,6 +12,10 @@ Anything a 1.x release writes verifies under every later 1.x release.
 Entries written as `AGOV1` (v0.1.0, v0.1.1), `AGOV2` (v0.1.2 to v0.4) and
 `AGOV3` (from v1.0) each verify under their own version's rules, below.
 
+*Amended in 1.1.0:* a ledger may declare the unit it conserves (§3.8). A
+ledger that declares none conserves US dollars, as every ledger before 1.1
+did, and keeps its bytes: its genesis is still 64 zeros.
+
 ## Contents
 
 1. [Entries](#1-entries)
@@ -63,8 +67,9 @@ scope (an agent's budget) and is linked to the entry before it by hash.
 | `seal` | `--` | no | Written once, when a pre-0.1.2 ledger is upgraded (§3.7). |
 | `checkpoint` | `--` | no | `AGOV3` only: commits a snapshot of the state (§4). |
 
-**Amounts** are decimal numbers of US dollars, at most 10¹² in magnitude,
-with exactly eight decimal places (the quantum is 0.00000001). **Instants**
+**Amounts** are decimal numbers of the ledger's unit (§3.8; US dollars when it
+declares none), at most 10¹² in magnitude, written with exactly eight decimal
+places (the quantum is 0.00000001, or the unit's own, coarser one). **Instants**
 are rendered `YYYY-MM-DDTHH:MM:SS.ffffffZ`, always with six fractional digits.
 **UUIDs** are rendered as 36 lowercase hexadecimal characters with hyphens.
 
@@ -153,7 +158,8 @@ a replay. The state a replay keeps:
 ### 3.1 Position and versions
 
 1. `sequence` is one more than the previous entry's (1 for the first).
-2. `prev_hash` equals the previous entry's `entry_hash` (64 zeros for the first).
+2. `prev_hash` equals the previous entry's `entry_hash`, and for the first, the
+   genesis of the ledger's unit (§3.8): 64 zeros for US dollars.
 3. `entry_hash` is the hash of the entry's hash input (§2).
 4. Versions never go back: no `AGOV1` entry after an `AGOV2` or `AGOV3` one,
    and no `AGOV2` entry after an `AGOV3` one.
@@ -173,6 +179,8 @@ a replay. The state a replay keeps:
    `counterparty_id` hold no control character (Unicode category Cc) and are
    at most 1024 bytes of UTF-8; `memo` is at most 65536 bytes.
 6. **AGOV3 time:** `timestamp` is not earlier than the previous entry's.
+7. **Units** (1.1): the amount of a type that moves money is a whole number of
+   the ledger's unit's quantum (§3.8).
 
 ### 3.3 Money
 
@@ -240,6 +248,34 @@ each as `[event_id, timestamp, event_type, scope_id, reason,
 ledger_head_hash]`. A ledger has at most one seal, and only if it has
 `AGOV1` history.
 
+### 3.8 The unit
+
+*Added in 1.1.0.* A ledger conserves one unit: US dollars, morphine milligram
+equivalents, vCPUs, gibibytes, seats. A unit is a **code**, lowercase letters,
+digits, `_`, `.` and `-`, starting with a letter, at most 32 characters
+(`[a-z][a-z0-9_.-]{0,31}`: every lowercase ISO 4217 code is one), and a number
+of **places**, 0 to 8: how many decimal places of it the ledger counts. Its
+quantum is `10^-places`; a ledger of 0 places counts whole things.
+
+The unit is fixed before the first entry and committed by the **genesis**, the
+`prev_hash` of entry 1, so changing the unit a ledger claims breaks entry 1's
+link, and every hash after it:
+
+- for US dollars at eight places, the default: 64 zeros, as before units;
+- for any other unit: the lowercase hex SHA-256 of the ASCII text
+  `agentgov-genesis v1 unit=<code> places=<places>`, for example
+  `agentgov-genesis v1 unit=mme places=8`.
+
+Amounts are written with eight places whatever the unit, so the `AGOV3`
+payload (§2.1) is unchanged; a ledger of fewer places refuses an amount that
+is not a whole number of its quantum (§3.2 rule 7). Writers round to the
+quantum as they always have: what is paid out up, what is granted down.
+
+A ledger of one unit is one ledger; a deployment that conserves several runs
+one ledger per unit, and an anchor (an `anchor` entry naming another chain's
+head) links them. `vectors/agov/units.json` holds the genesis of several units
+and a chain of a ledger of whole seats.
+
 ## 4. Checkpoints and snapshots
 
 A checkpoint lets a governor open without replaying history: it is a
@@ -271,6 +307,7 @@ whole state of §3 as of a sequence `s`. Its fields (the reference encoder is
 | `legacy` | the pre-0.1.2 control events (§3.7) |
 | `last_checkpoint` | `[s', digest']` of the previous checkpoint, or null |
 | `frontier` | the Merkle frontier (§4.3), as hex |
+| `unit` | `[code, places]` of the ledger's unit (§3.8); absent for US dollars at eight places, so a dollar ledger's snapshots keep their bytes. *Added in 1.1.0.* |
 
 Amounts are fixed-point strings (§2.1). The encoding is canonical, so one
 state has exactly one snapshot, and a reader refuses a snapshot whose bytes
@@ -362,7 +399,7 @@ it by `repair`), or evidence that is never edited.
 | `audit_marks` | evidence | One row per auditor result: the sequence verified, its head, the state digest there, `verified` or `failed`. Never edited. |
 | `idempotency` | records | One row per idempotency key an operation was given: the request it named and what it returned, committed with its entries. |
 | `claims` | PostgreSQL only | Settlement claims committed inside callers' transactions. |
-| `schema_meta` | metadata | `schema_version`. |
+| `schema_meta` | metadata | `schema_version`, and `unit` (`<code>/<places>`) for a ledger that declares one (§3.8). |
 
 Indexes on `entries`: `(scope_id, sequence)`, `(entry_type, memo)`
 (PostgreSQL: `(entry_type, md5(memo))`), the `reversal` entries by `ref`
@@ -370,6 +407,11 @@ Indexes on `entries`: `(scope_id, sequence)`, `(entry_type, memo)`
 sequence. `transaction_id` and the `ref` of other entries are not indexed:
 their values are random, so an index on either would cost every commit a
 page write, and no write or replay looks an entry up by them.
+
+A ledger's unit is declared once, by the first governor that opens it with one,
+while it holds no entry. On PostgreSQL the trigger that admits entry 1 is then
+redefined to require the unit's genesis. An open naming another unit than the
+ledger's is refused.
 
 **Upgrades** are in place and forward-only: a writer opening an older layout
 upgrades it, under the writer lock, in one transaction, before it writes

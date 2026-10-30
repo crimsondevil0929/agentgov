@@ -131,6 +131,7 @@ __all__ = [
     "GENESIS_HASH",
     "MAX_AMOUNT",
     "QUANTUM",
+    "USD",
     "Authorization",
     "BudgetManager",
     "BudgetNode",
@@ -143,9 +144,11 @@ __all__ = [
     "LedgerEntry",
     "LedgerLine",
     "SettlementClaim",
+    "Unit",
     "WriteBatch",
     "format_audit_line",
     "money",
+    "quantity",
 ]
 
 audit_log: Final = logging.getLogger("agentgov.audit")
@@ -228,6 +231,89 @@ MAX_MEMO_BYTES: Final = 65536
 # --------------------------------------------------------------------------
 
 
+_UNIT_CODE: Final = re.compile(r"[a-z][a-z0-9_.-]{0,31}")
+"""A unit's code: lowercase, starting with a letter. Every lowercase ISO 4217
+currency code is one."""
+
+
+@dataclass(frozen=True, slots=True)
+class Unit:
+    """What a ledger conserves: a named unit, counted to ``places`` decimals.
+
+    Every ledger conserves one unit, fixed before its first entry. The unit is
+    committed by the ledger's genesis hash, the ``prev_hash`` of entry 1, so
+    no entry can be read as counting anything else. US dollars at eight
+    places is the default: it is the unit of every ledger written before units
+    existed, and its genesis is :data:`GENESIS_HASH`, so those ledgers keep
+    their bytes. Amounts are still written with eight places
+    (docs/LEDGER_FORMAT.md §3.8); a ledger of fewer places refuses an amount
+    finer than its own quantum, and one of no places counts whole things
+    (seats, records, calls).
+
+    :param code: The unit's name: ``usd``, ``mme``, ``vcpu``, ``gib``,
+        ``seats``. Lowercase letters, digits, ``_``, ``.`` and ``-``, starting
+        with a letter, at most 32 characters.
+    :param places: How many decimal places of it the ledger counts, 0 to 8.
+    :raises ValueError: On a code or a number of places that is not one.
+    """
+
+    code: str = "usd"
+    places: int = 8
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, str) or not _UNIT_CODE.fullmatch(self.code):
+            raise ValueError(
+                f"a unit's code is lowercase letters, digits, '_', '.' and '-', starting with "
+                f"a letter, at most 32 characters: {self.code!r}"
+            )
+        if isinstance(self.places, bool) or not isinstance(self.places, int):
+            raise ValueError(f"a unit's places is a whole number, not {self.places!r}")
+        if not 0 <= self.places <= 8:
+            raise ValueError(f"a unit is counted to 0 to 8 places, not {self.places}")
+
+    @property
+    def quantum(self) -> Decimal:
+        """The smallest amount the ledger counts: ``10 ** -places``."""
+        return QUANTUM if self.places == 8 else Decimal(1).scaleb(-self.places)
+
+    @property
+    def genesis(self) -> str:
+        """The ``prev_hash`` of a ledger of this unit's first entry:
+        :data:`GENESIS_HASH` for :data:`USD`, otherwise the SHA-256 of
+        ``agentgov-genesis v1 unit=<code> places=<places>``."""
+        if self == USD:
+            return GENESIS_HASH
+        declaration = f"agentgov-genesis v1 unit={self.code} places={self.places}"
+        return hashlib.sha256(declaration.encode("ascii")).hexdigest()
+
+    def text(self) -> str:
+        """``<code>/<places>``, as a store records it."""
+        return f"{self.code}/{self.places}"
+
+    @classmethod
+    def parse(cls, text: str) -> Unit:
+        """The inverse of :meth:`text`.
+
+        :raises ValueError: On text that names no unit.
+        """
+        code, sep, places = text.partition("/")
+        if not sep or not places.isdigit() or len(places) != 1:
+            raise ValueError(f"not a unit: {text!r}")
+        return cls(code, int(places))
+
+    def __str__(self) -> str:
+        if self.places == 8:
+            return self.code
+        if self.places == 0:
+            return f"{self.code} (whole)"
+        return f"{self.code} (to {self.places} places)"
+
+
+USD: Final = Unit()
+"""US dollars, counted to eight places: the unit of every ledger that declares
+none."""
+
+
 def money(value: Decimal | int | str) -> Decimal:
     """Construct a quantized monetary :class:`~decimal.Decimal`.
 
@@ -244,11 +330,23 @@ def money(value: Decimal | int | str) -> Decimal:
     return _coerce(value, rounding=ROUND_FLOOR, label="amount")
 
 
+def quantity(value: Decimal | int | str, unit: Unit = USD) -> Decimal:
+    """:func:`money` for any unit: ``value`` quantized to ``unit``'s quantum,
+    rounded down. ``quantity(x)`` is ``money(x)``.
+
+    :raises TypeError: If ``value`` is a ``float``.
+    :raises ValueError: If ``value`` is not a valid decimal amount, or
+        exceeds :data:`MAX_AMOUNT` in magnitude.
+    """
+    return _coerce(value, rounding=ROUND_FLOOR, label="amount", quantum=unit.quantum)
+
+
 def _coerce(
     value: Decimal | int | str,
     *,
     rounding: str,
     label: str,
+    quantum: Decimal = QUANTUM,
 ) -> Decimal:
     """Coerce ``value`` to a quantized ``Decimal`` with the given rounding."""
     if isinstance(value, float):
@@ -266,26 +364,34 @@ def _coerce(
     if value.copy_abs() > MAX_AMOUNT:
         raise ValueError(f"{label} exceeds the maximum of {MAX_AMOUNT}: {value}")
     # In the ledger's own context, never the caller's: a host thread at low
-    # precision would otherwise refuse (or round) an exact amount.
+    # precision would otherwise refuse (or round) an exact amount. A coarser
+    # quantum rounds first, then the result is written at eight places.
+    if quantum != QUANTUM:
+        value = value.quantize(quantum, rounding=rounding, context=_ROUNDING)
     return value.quantize(QUANTUM, rounding=rounding, context=_ROUNDING)
 
 
-def _cost(value: Decimal | int | str) -> Decimal:
+def _cost(value: Decimal | int | str, unit: Unit = USD) -> Decimal:
     """Quantize an amount the governor pays out, rounding **up**.
 
     Costs, holds, and spends round toward the ceiling so the ledger can never
     under-record what an agent consumed.
     """
-    return _coerce(value, rounding=ROUND_CEILING, label="cost")
+    return _coerce(value, rounding=ROUND_CEILING, label="cost", quantum=unit.quantum)
 
 
-def _credit(value: Decimal | int | str) -> Decimal:
+def _credit(value: Decimal | int | str, unit: Unit = USD) -> Decimal:
     """Quantize an amount the governor grants, rounding **down**.
 
     Fundings, allocations, and refunds round toward the floor so the governor
     can never over-issue spending power.
     """
-    return _coerce(value, rounding=ROUND_FLOOR, label="credit")
+    return _coerce(value, rounding=ROUND_FLOOR, label="credit", quantum=unit.quantum)
+
+
+def _counted(amount: Decimal, unit: Unit) -> bool:
+    """Whether ``amount`` is a whole number of ``unit``'s quantum."""
+    return unit.places == 8 or amount == amount.quantize(unit.quantum, context=_ROUNDING)
 
 
 # --------------------------------------------------------------------------
@@ -900,6 +1006,8 @@ class _ChainState:
     :ivar last_checkpoint: The newest CHECKPOINT entry's sequence and
         snapshot digest.
     :ivar frontier: The RFC 9162 compact range over every entry hash.
+    :ivar unit: What the ledger conserves. Its genesis is the ``prev_hash``
+        of entry 1, so ``head`` starts there.
     """
 
     balances: dict[str, Decimal] = field(default_factory=dict)
@@ -924,6 +1032,12 @@ class _ChainState:
     last_timestamp: datetime | None = None
     last_checkpoint: tuple[int, str] | None = None
     frontier: tuple[bytes, ...] = ()
+    unit: Unit = USD
+
+    @classmethod
+    def empty(cls, unit: Unit = USD, legacy: Sequence[ControlEvent] = ()) -> _ChainState:
+        """The state of a ledger of ``unit`` with no entries."""
+        return cls(head=unit.genesis, unit=unit, legacy=tuple(legacy))
 
     def copy(self) -> _ChainState:
         """An independent copy, nodes included, taken in time proportional
@@ -1366,6 +1480,13 @@ class _Overlay:
                     f"entry {entry.sequence}: amount must be positive, got {entry.amount}",
                     entry.scope_id,
                 )
+            unit = self._base.unit
+            if not _counted(entry.amount, unit):
+                raise LedgerIntegrityError(
+                    f"entry {entry.sequence}: amount {entry.amount} is finer than this "
+                    f"ledger's unit, {unit.code} counted to {unit.places} places",
+                    entry.scope_id,
+                )
             return
         if entry.amount != ZERO:
             raise LedgerIntegrityError(
@@ -1715,6 +1836,7 @@ def _replay(
     finish: bool = False,
     resolve: Callable[[uuid.UUID], LedgerEntry | None] | None = None,
     refunds: Callable[[uuid.UUID, int], Decimal] | None = None,
+    unit: Unit = USD,
 ) -> _ChainState:
     """Rebuild chain state from nothing but the entries, verifying each.
 
@@ -1725,11 +1847,12 @@ def _replay(
         spend. By default, the spends among ``entries`` themselves.
     :param refunds: For entries whose store keeps history: the state then
         remembers no spend's refunds (see :class:`_Overlay`).
+    :param unit: What the ledger conserves: entry 1 links to its genesis.
     """
     if resolve is None:
         entries = entries if isinstance(entries, Sequence) else list(entries)
         resolve = _spend_index(entries)
-    state = _ChainState(legacy=tuple(legacy))
+    state = _ChainState.empty(unit, legacy)
     view = _Overlay(state, resolve=resolve, refunds=refunds)
     released: set[uuid.UUID] = set()
     for entry in entries:
@@ -1864,6 +1987,8 @@ def _snapshot_document(state: _ChainState) -> dict[str, object]:
             "spent": _fixed(totals.spent),
         },
         "tripped": {scope: [_iso(at), reason] for scope, (at, reason) in state.tripped.items()},
+        # Only when declared, so every USD ledger's snapshots keep their bytes.
+        **({} if state.unit == USD else {"unit": [state.unit.code, state.unit.places]}),
     }
 
 
@@ -2279,6 +2404,21 @@ def _decode_snapshot(body: bytes) -> _ChainState:
         raise LedgerIntegrityError("snapshot $.last_checkpoint is not a checkpoint")
     seal = r.raw("seal")
     last_timestamp = r.text("last_timestamp", nullable=True)
+    unit = USD
+    if "unit" in document:
+        declared = r.raw("unit")
+        if (
+            not isinstance(declared, list)
+            or len(declared) != 2
+            or not isinstance(declared[0], str)
+            or not isinstance(declared[1], int)
+            or isinstance(declared[1], bool)
+        ):
+            raise LedgerIntegrityError("snapshot $.unit is not a unit")
+        try:
+            unit = Unit(declared[0], declared[1])
+        except ValueError as exc:
+            raise LedgerIntegrityError(f"snapshot $.unit is not a unit: {exc}") from exc
     state = _ChainState(
         balances=amounts("balances"),
         totals=_Totals(
@@ -2308,6 +2448,7 @@ def _decode_snapshot(body: bytes) -> _ChainState:
         last_timestamp=_instant(last_timestamp, "$.last_timestamp") if last_timestamp else None,
         last_checkpoint=(last[0], last[1]) if isinstance(last, list) else None,
         frontier=tuple(frontier),
+        unit=unit,
     )
     if _encode_snapshot(state) != body:
         raise LedgerIntegrityError(
@@ -2599,9 +2740,13 @@ class Ledger:
 
     All state is guarded by :attr:`lock`, a re-entrant mutex that the owning
     :class:`BudgetManager` shares rather than nesting its own beneath.
+
+    :param store: A durable backend, whose chain this ledger serves.
+    :param unit: What a ledger with no store conserves; :data:`USD` when
+        omitted. A ledger over a store conserves the store's unit.
     """
 
-    def __init__(self, *, store: PersistenceStore | None = None) -> None:
+    def __init__(self, *, store: PersistenceStore | None = None, unit: Unit = USD) -> None:
         self._lock = threading.RLock()
         self._store: PersistenceStore | None = store
         # History lives in the store when the store can answer for it, and
@@ -2609,7 +2754,7 @@ class Ledger:
         # holds, never the entries. Only a ledger with no store (or with a
         # store that cannot be queried for history) keeps its entries here.
         self._entries: list[LedgerEntry] | None = None if _keeps_history(store) else []
-        self._state = _ChainState()
+        self._state = _ChainState.empty(unit)
         self._open_auths: dict[uuid.UUID, Authorization] = {}
         self._legacy_auth_ids: dict[uuid.UUID, uuid.UUID] = {}
         # Calls made under an idempotency key, for a ledger with no store to
@@ -2620,6 +2765,7 @@ class Ledger:
             # was corrupted by a crash mid-write, must never be trusted
             # silently. Refuse to start rather than serve a wrong balance.
             image = store.load()
+            self._state = _ChainState.empty(image.unit)
             self._adopt(image.entries, _legacy_events(image), finish=store.read_only)
 
     @classmethod
@@ -2630,9 +2776,10 @@ class Ledger:
         legacy: Sequence[ControlEvent] = (),
         *,
         finish: bool = False,
+        unit: Unit = USD,
     ) -> Ledger:
         """A ledger over ``store`` holding ``entries``, already read from it."""
-        ledger = cls()
+        ledger = cls(unit=unit)
         ledger._store = store
         ledger._entries = None if _keeps_history(store) else []
         ledger._adopt(entries, legacy, finish=finish)
@@ -2651,11 +2798,13 @@ class Ledger:
         full, or from the checkpoint snapshot the image carries, checked
         against ``signing``."""
         if image.snapshot is None:
-            replayed = cls._from_entries(store, image.entries, _legacy_events(image), finish=finish)
+            replayed = cls._from_entries(
+                store, image.entries, _legacy_events(image), finish=finish, unit=image.unit
+            )
             if signing is not None:
                 replayed._check_newest_statement(signing)
             return replayed
-        ledger = cls()
+        ledger = cls(unit=image.unit)
         ledger._store = store
         ledger._entries = None if _keeps_history(store) else []
         ledger._adopt_snapshot(image, signing)
@@ -2736,6 +2885,11 @@ class Ledger:
             raise LedgerIntegrityError(
                 f"the snapshot stored as sequence {snapshot.sequence} is of sequence {state.length}"
             )
+        if state.unit != image.unit:
+            raise LedgerIntegrityError(
+                f"the checkpoint's snapshot is of a ledger of {state.unit}, and the store "
+                f"declares {image.unit}"
+            )
         if signing is not None:
             assert self._store is not None
             first = self._store.entry_at(1)  # type: ignore[attr-defined]
@@ -2776,7 +2930,9 @@ class Ledger:
     ) -> None:
         """Replace this ledger's contents with ``entries``, verified first."""
         loaded = list(entries)
-        state = _replay(loaded, legacy, finish=finish, refunds=self._refund_lookup())
+        state = _replay(
+            loaded, legacy, finish=finish, refunds=self._refund_lookup(), unit=self._state.unit
+        )
         with self._lock:
             self._entries = loaded if self._entries is not None else None
             self._state = state
@@ -2889,8 +3045,14 @@ class Ledger:
             self._store.close()
 
     @property
+    def unit(self) -> Unit:
+        """What this ledger conserves."""
+        return self._state.unit
+
+    @property
     def head_hash(self) -> str:
-        """``entry_hash`` of the most recent entry, or :data:`GENESIS_HASH`.
+        """``entry_hash`` of the most recent entry, or, before the first, the
+        unit's genesis (:data:`GENESIS_HASH` for a ledger of :data:`USD`).
 
         This value commits to the entire history: quoting it in an external
         system anchors that system's records to this ledger.
@@ -3137,13 +3299,14 @@ class Ledger:
         ledger's lock, so writers keep writing meanwhile."""
         entries = self.iter_entries(until=live.length)
         if self._entries is not None:
-            return _replay(list(entries), live.legacy, finish=live.legacy_applied)
+            return _replay(list(entries), live.legacy, finish=live.legacy_applied, unit=live.unit)
         assert self._store is not None
         return _replay(
             entries,
             live.legacy,
             finish=live.legacy_applied,
             resolve=self._store.entry_by_id,  # type: ignore[attr-defined]
+            unit=live.unit,
         )
 
     def verify_chain(self) -> None:
@@ -3440,7 +3603,7 @@ class JoinedTransaction:
         :raises ValueError: If ``amount`` is negative, or ``hold`` belongs to
             another scope.
         """
-        owed = _cost(amount)
+        owed = _cost(amount, self._manager.unit)
         if owed < ZERO:
             raise ValueError(f"a claim cannot owe a negative amount, got {owed}")
         if not memo:
@@ -3860,6 +4023,10 @@ class BudgetManager:
     :param metrics: Where to report how this governor is doing (lock waits,
         units of work, catch-ups, trips, checkpoint lag): see
         :mod:`agentgov.metrics`. Nothing is measured without it.
+    :param unit: What the ledger conserves (:class:`Unit`); :data:`USD` when
+        omitted. A store's unit is declared once, by the first governor that
+        opens it with one, before its first entry; a governor that names
+        another unit than the store's is refused.
 
     **A shared ledger.** Over a :class:`~agentgov.storage.SharedStore` (see
     :meth:`open_postgres`) this manager is one of several governors writing
@@ -3885,6 +4052,7 @@ class BudgetManager:
         auditor: bool | None = None,
         signing: CheckpointSigning | None = None,
         metrics: Metrics | None = None,
+        unit: Unit | None = None,
     ) -> None:
         started = time.perf_counter()
         if verify not in _VERIFY_POLICIES:
@@ -3906,6 +4074,8 @@ class BudgetManager:
                 image = store.load(from_checkpoint=verify == "checkpoint" and ledger is None)
             else:
                 image = store.load()  # a store written before checkpoints existed
+            if unit is not None and unit != image.unit:
+                image = _declare_unit(store, image, unit)
             legacy = _legacy_events(image)
             if ledger is None:
                 ledger = Ledger._from_image(store, image, finish=store.read_only, signing=signing)
@@ -3914,8 +4084,11 @@ class BudgetManager:
                 # be behind it; serve the snapshot, which the caches match.
                 ledger._adopt(image.entries, legacy)
         elif ledger is None:
-            ledger = Ledger()
+            ledger = Ledger(unit=USD if unit is None else unit)
+        if unit is not None and ledger.unit != unit:
+            raise ValueError(f"the ledger conserves {ledger.unit}, not {unit}")
         self._ledger = ledger
+        self._unit = ledger.unit
         self._policy = policy if policy is not None else GovernancePolicy()
         # One mutex for the whole control plane. Sharing the ledger's lock
         # (rather than nesting a second one under it) removes any possibility
@@ -4029,6 +4202,7 @@ class BudgetManager:
         auditor: bool | None = None,
         signing: CheckpointSigning | None = None,
         metrics: Metrics | None = None,
+        unit: Unit | None = None,
     ) -> BudgetManager:
         """Open (or create) a durable, SQLite-backed governor in one call.
 
@@ -4071,6 +4245,9 @@ class BudgetManager:
             checkpoint; pass ``False`` where a sidecar audits instead.
         :param signing: Sign every checkpoint this governor writes, and check
             the one it opens from: see :class:`CheckpointSigning`.
+        :param unit: What the ledger conserves. A new database is declared
+            this unit; an existing one must already conserve it. Omitted, the
+            database's own (:data:`USD` for one that declares none).
         :returns: A restored or freshly created :class:`BudgetManager`.
         :raises agentgov.exceptions.ConcurrentGovernorError: If another
             process already holds this database for writing. Two governors
@@ -4092,6 +4269,7 @@ class BudgetManager:
                 auditor=auditor,
                 signing=signing,
                 metrics=metrics,
+                unit=unit,
             )
         except BaseException:
             # Never leak the advisory claim if restore-and-verify rejects the
@@ -4115,6 +4293,7 @@ class BudgetManager:
         auditor: bool | None = None,
         signing: CheckpointSigning | None = None,
         metrics: Metrics | None = None,
+        unit: Unit | None = None,
     ) -> BudgetManager:
         """Open one governor of a ledger shared through PostgreSQL.
 
@@ -4145,6 +4324,8 @@ class BudgetManager:
         :param verify: What to verify at open; see :meth:`open_sqlite`.
         :param auditor: Run an auditor thread; see :meth:`open_sqlite`.
         :param signing: Sign checkpoints, and check them; see :meth:`open_sqlite`.
+        :param unit: What the ledger conserves; see :meth:`open_sqlite`. One
+            ledger per unit, so one schema per unit: ``schema="agentgov_mme"``.
         :raises agentgov.exceptions.StorageError: If the database cannot be
             reached.
         :raises agentgov.exceptions.LedgerIntegrityError: If the shared chain,
@@ -4169,6 +4350,7 @@ class BudgetManager:
                 auditor=auditor,
                 signing=signing,
                 metrics=metrics,
+                unit=unit,
             )
         except BaseException:
             store.close()
@@ -5380,6 +5562,12 @@ class BudgetManager:
     # -- accessors --------------------------------------------------------
 
     @property
+    def unit(self) -> Unit:
+        """What this governor's ledger conserves. Every amount it takes is
+        quantized to the unit's quantum: costs up, credits down."""
+        return self._unit
+
+    @property
     def ledger(self) -> Ledger:
         """The immutable ledger backing this manager."""
         return self._ledger
@@ -5565,7 +5753,7 @@ class BudgetManager:
         :raises ValueError: If ``envelope`` is not positive, or ``scope_id``
             is empty.
         """
-        amount = _credit(envelope)
+        amount = _credit(envelope, self._unit)
         if amount <= ZERO:
             raise ValueError(f"envelope must be positive, got {amount}")
         _require_scope_id(scope_id)
@@ -5615,7 +5803,7 @@ class BudgetManager:
         :raises ValueError: If ``scope_id`` is not a root or ``amount`` is
             not positive.
         """
-        credited = _credit(amount)
+        credited = _credit(amount, self._unit)
         if credited <= ZERO:
             raise ValueError(f"funding must be positive, got {credited}")
 
@@ -5677,7 +5865,7 @@ class BudgetManager:
         :raises ValueError: If ``amount`` is not positive, or ``child_id``
             is empty.
         """
-        granted = _credit(amount)
+        granted = _credit(amount, self._unit)
         if granted <= ZERO:
             raise ValueError(f"delegated amount must be positive, got {granted}")
         _require_scope_id(child_id)
@@ -5765,7 +5953,7 @@ class BudgetManager:
                 raise ValueError(f"root scope {scope_id!r} has no parent to release to")
 
             available = self._ledger.balance(scope_id)
-            returned = available if amount is None else _credit(amount)
+            returned = available if amount is None else _credit(amount, self._unit)
             if returned <= ZERO:
                 return ZERO
             if returned > available:
@@ -5878,7 +6066,7 @@ class BudgetManager:
         *,
         trip: bool,
     ) -> Authorization | None:
-        held = _cost(amount)
+        held = _cost(amount, self._unit)
         if held <= ZERO:
             raise ValueError(f"authorization amount must be positive, got {held}")
 
@@ -5961,7 +6149,7 @@ class BudgetManager:
         :raises DenialOfWalletError: If the settled cost overdrew the scope.
         :raises ValueError: If ``actual_cost`` is negative.
         """
-        settled = _cost(actual_cost)
+        settled = _cost(actual_cost, self._unit)
         if settled < ZERO:
             raise ValueError(f"actual cost must not be negative, got {settled}")
 
@@ -6102,7 +6290,7 @@ class BudgetManager:
             call under the key raises :class:`IdempotencyConflictError`.
         :returns: The committed spend entry.
         """
-        cost = _cost(amount)
+        cost = _cost(amount, self._unit)
         with self._mutating():
             call = self._called(
                 idempotency_key, "entry", "spend", scope_id=scope_id, amount=cost, memo=memo
@@ -6166,7 +6354,7 @@ class BudgetManager:
         idempotency_key: str | None,
     ) -> LedgerEntry:
         """:meth:`refund`, in a unit of work it may share."""
-        credited = _credit(amount)
+        credited = _credit(amount, self._unit)
         if credited <= ZERO:
             raise ValueError(f"refund must be positive, got {credited}")
         named = reverses.entry_id if isinstance(reverses, LedgerEntry) else reverses
@@ -6849,10 +7037,33 @@ def _shared_store(store: PersistenceStore) -> SharedStore | None:
     return store if isinstance(store, SharedStore) else None
 
 
+def _declare_unit(store: PersistenceStore, image: StoreImage, unit: Unit) -> StoreImage:
+    """``image``, of a store now declaring ``unit``: a store with no entries,
+    whose unit nobody declared, declares it; any other refuses.
+
+    :raises LedgerIntegrityError: If the store holds entries or declares
+        another unit, or cannot record one.
+    """
+    holder: Any = store
+    declared = holder.declared_unit() if hasattr(holder, "declared_unit") else None
+    if declared is not None or image.entries or image.snapshot is not None:
+        raise LedgerIntegrityError(
+            f"this ledger conserves {image.unit}, not {unit}: a ledger's unit is fixed "
+            f"before its first entry"
+        )
+    if store.read_only or not hasattr(holder, "declare_unit"):
+        raise LedgerIntegrityError(
+            f"this ledger declares no unit, so it conserves {image.unit}; open it for "
+            f"writing to declare {unit} before its first entry"
+        )
+    holder.declare_unit(unit)
+    return store.load()
+
+
 def _image_head(image: StoreImage) -> tuple[int, str]:
     """The length and head hash of the chain in ``image``."""
     if not image.entries:
-        return 0, GENESIS_HASH
+        return 0, image.unit.genesis
     return len(image.entries), image.entries[-1].entry_hash
 
 

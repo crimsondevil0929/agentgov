@@ -1,7 +1,8 @@
 """The 1.0 API, frozen (Phase 6.1).
 
 ``agentgov`` exports what a user of the governor needs; ``agentgov.spi`` what
-a store implementer needs. The lists below are the 1.0 surface: a change to
+a store implementer needs. The lists below are the 1.0 surface, with what 1.1
+added (units: ``Unit``, ``quantity``, ``BudgetExhaustedError``): a change to
 either is a change to the API, made on purpose, here. Names 1.0 moved or
 retired are still served, with a ``DeprecationWarning``, until 2.0.
 """
@@ -27,6 +28,7 @@ PUBLIC = [
     "Authorization",
     "BudgetError",
     "BudgetExceededError",
+    "BudgetExhaustedError",
     "BudgetManager",
     "BudgetNode",
     "CHARS_PER_TOKEN",
@@ -80,6 +82,7 @@ PUBLIC = [
     "ToolCall",
     "TrajectoryEntropyObserver",
     "Transaction",
+    "Unit",
     "UnknownScopeError",
     "Verdict",
     "canonical_arguments",
@@ -94,6 +97,7 @@ PUBLIC = [
     "normalize_model_id",
     "open",
     "pricing_for",
+    "quantity",
     "reconcile",
 ]
 

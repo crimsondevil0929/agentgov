@@ -68,14 +68,17 @@ from agentgov.core import (
     LedgerEntry,
     SettlementClaim,
     Transaction,
+    Unit,
     format_audit_line,
     money,
+    quantity,
 )
 from agentgov.exceptions import (
     AgentGovError,
     AgentThrashingError,
     BudgetError,
     BudgetExceededError,
+    BudgetExhaustedError,
     CircuitBreakerError,
     CircuitOpenError,
     ConcurrentGovernorError,
@@ -131,6 +134,7 @@ __all__ = [
     "Authorization",
     "BudgetError",
     "BudgetExceededError",
+    "BudgetExhaustedError",
     "BudgetManager",
     "BudgetNode",
     "CallCycleDetector",
@@ -182,6 +186,7 @@ __all__ = [
     "ToolCall",
     "TrajectoryEntropyObserver",
     "Transaction",
+    "Unit",
     "UnknownScopeError",
     "Verdict",
     "canonical_arguments",
@@ -196,10 +201,11 @@ __all__ = [
     "normalize_model_id",
     "open",
     "pricing_for",
+    "quantity",
     "reconcile",
 ]
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 
 # Names this package served before 1.0 that now live elsewhere: still served,

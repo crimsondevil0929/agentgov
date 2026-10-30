@@ -88,6 +88,7 @@ from typing import Any, Final, LiteralString
 from agentgov.core import (
     _CHECKPOINT_MEMO,
     GENESIS_HASH,
+    USD,
     Authorization,
     BudgetNode,
     ControlEvent,
@@ -95,6 +96,7 @@ from agentgov.core import (
     IdempotencyRecord,
     LedgerEntry,
     SettlementClaim,
+    Unit,
     WriteBatch,
     _amount_text,
     _direction,
@@ -335,6 +337,7 @@ class PostgresStore:
             schema, _lock_keys(schema), self._lock_timeout_ms, self._idle_timeout_ms
         )
         self._guard = threading.RLock()  # one transaction on the connection at a time
+        self._genesis = GENESIS_HASH  # the unit's, once the schema is read
         self._conn = self._connect()
         try:
             self._version = self._open()
@@ -415,6 +418,9 @@ class PostgresStore:
         # make every governor that opens wait on, and stall, every writer.
         with self._reading():
             version = self._installed_version()
+            if version is not None:
+                declared = self._unit_row(self._conn)
+                self._genesis = (USD if declared is None else declared).genesis
         if version == _SCHEMA_VERSION:
             return version
         if self._read_only:
@@ -611,12 +617,12 @@ class PostgresStore:
             # Shorter than this view: the ledger was cut back under it. Its
             # real head, for the caller's catch-up to refuse.
             row = conn.execute(self._sql.head).fetchone()
-            head = (int(row[0]), str(row[1])) if row is not None else (0, GENESIS_HASH)
+            head = (int(row[0]), str(row[1])) if row is not None else (0, self._genesis)
             return head, self._delta(None, [], control_rows, after_control_row)
         anchor = found[0].entry_hash if after_sequence > 0 else None
         entries = found[1:] if after_sequence > 0 else found
         last = found[-1] if found else None
-        head = (last.sequence, last.entry_hash) if last is not None else (0, GENESIS_HASH)
+        head = (last.sequence, last.entry_hash) if last is not None else (0, self._genesis)
         return head, self._delta(anchor, entries, control_rows, after_control_row)
 
     def _delta(
@@ -1065,8 +1071,48 @@ class PostgresStore:
         with self._errors("read the ledger head"):
             row = self._live().execute(self._sql.head).fetchone()
         if row is None:
-            return 0, GENESIS_HASH
+            return 0, self._genesis
         return int(row[0]), str(row[1])
+
+    def _unit_row(self, conn: psycopg.Connection[Any]) -> Unit | None:
+        row = conn.execute(self._sql.get_unit).fetchone()
+        if row is None:
+            return None
+        try:
+            return Unit.parse(str(row[0]))
+        except ValueError as exc:
+            raise LedgerIntegrityError(
+                f"ledger schema {self._schema!r} declares no unit this version reads: {exc}"
+            ) from exc
+
+    @_guarded
+    def declared_unit(self) -> Unit | None:
+        """The unit this ledger declares, or ``None`` (it conserves
+        :data:`~agentgov.core.USD`)."""
+        with self._reading(), self._errors("read the ledger's unit"):
+            return self._unit_row(self._conn)
+
+    @_guarded
+    def declare_unit(self, unit: Unit) -> None:
+        """Record that this ledger conserves ``unit``, before its first entry,
+        and admit entry 1 only on the unit's genesis.
+
+        :raises LedgerIntegrityError: If the ledger holds an entry, or
+            declares a unit.
+        """
+        self._require_writable("declare the ledger's unit")
+        with self.writer() as session:
+            self._flush()
+            session.wrote = True
+            conn = self._conn
+            with self._errors("declare the ledger's unit"):
+                if conn.execute(self._sql.any_entry).fetchone() is not None:
+                    raise LedgerIntegrityError("a ledger's unit is declared before its first entry")
+                if self._unit_row(conn) is not None:
+                    raise LedgerIntegrityError(f"ledger schema {self._schema!r} declares its unit")
+                conn.execute(self._sql.set_unit, (unit.text(),))
+                conn.execute(_extend_function(self._schema, unit.genesis), prepare=False)
+        self._genesis = unit.genesis
 
     @_guarded
     def load(self, *, from_checkpoint: bool = False) -> StoreImage:
@@ -1091,6 +1137,8 @@ class PostgresStore:
                 rows = self._select_control_rows(after=0)
             authorizations = self._select_authorizations()
             found = self._conn.execute(self._sql.control_high_water).fetchone()
+            declared = self._unit_row(self._conn)
+        self._genesis = (USD if declared is None else declared).genesis
         return StoreImage(
             schema_version=version,
             entries=entries,
@@ -1100,6 +1148,7 @@ class PostgresStore:
             control_high_water=int(found[0]) if found and found[0] is not None else 0,
             snapshot=snapshot,
             base=base,
+            unit=USD if declared is None else declared,
         )
 
     @_guarded
@@ -1624,6 +1673,9 @@ class _Statements:
             "INSERT INTO {} (key, value) VALUES ('schema_version', %s) "
             "ON CONFLICT (key) DO UPDATE SET value = excluded.value"
         ).format(meta)
+        self.get_unit = sql.SQL("SELECT value FROM {} WHERE key = 'unit'").format(meta)
+        self.set_unit = sql.SQL("INSERT INTO {} (key, value) VALUES ('unit', %s)").format(meta)
+        self.any_entry = sql.SQL("SELECT 1 FROM {} LIMIT 1").format(entries)
         self.head = sql.SQL(
             "SELECT sequence, entry_hash FROM {} ORDER BY sequence DESC LIMIT 1"
         ).format(entries)
@@ -1896,35 +1948,7 @@ def _install_statements(schema: str) -> tuple[sql.Composed, ...]:
             )
             """
         ).format(table("open_authorizations")),
-        # An entry is admitted only if it links to the one before it. With
-        # `sequence` the primary key, that makes an insert succeed only on the
-        # committed head: a stale or lock-skipping writer is refused, never
-        # forked. The message names no hash, so a refusal leaks nothing.
-        sql.SQL(
-            """
-            CREATE FUNCTION {fn}() RETURNS trigger LANGUAGE plpgsql
-            SET search_path = pg_catalog, pg_temp AS $agentgov$
-            BEGIN
-                IF NEW.sequence = 1 THEN
-                    IF NEW.prev_hash <> {genesis} THEN
-                        RAISE EXCEPTION 'agentgov: entry 1 does not link to the genesis hash'
-                            USING ERRCODE = 'integrity_constraint_violation';
-                    END IF;
-                ELSIF NOT EXISTS (
-                    SELECT 1 FROM {entries} AS e
-                    WHERE e.sequence = NEW.sequence - 1 AND e.entry_hash = NEW.prev_hash
-                ) THEN
-                    RAISE EXCEPTION 'agentgov: entry % does not extend the committed chain',
-                        NEW.sequence
-                        USING ERRCODE = 'integrity_constraint_violation',
-                              HINT = 'a writer must hold the ledger writer lock and build on '
-                                     'the committed head';
-                END IF;
-                RETURN NEW;
-            END
-            $agentgov$
-            """
-        ).format(fn=extend, entries=entries, genesis=sql.Literal(GENESIS_HASH)),
+        _extend_function(schema, GENESIS_HASH),
         sql.SQL(
             """
             CREATE FUNCTION {fn}() RETURNS trigger LANGUAGE plpgsql
@@ -1953,6 +1977,44 @@ def _install_statements(schema: str) -> tuple[sql.Composed, ...]:
             "ENABLE ALWAYS TRIGGER append_only, ENABLE ALWAYS TRIGGER append_only_truncate"
         ).format(entries),
         *_join_statements(schema),
+    )
+
+
+def _extend_function(schema: str, genesis: str) -> sql.Composed:
+    """The trigger function that admits an entry only if it links to the one
+    before it, and entry 1 only if it links to ``genesis``: the ledger's
+    unit's (``Unit.genesis``)."""
+    # With `sequence` the primary key, that makes an insert succeed only on
+    # the committed head: a stale or lock-skipping writer is refused, never
+    # forked. The message names no hash, so a refusal leaks nothing.
+    return sql.SQL(
+        """
+        CREATE OR REPLACE FUNCTION {fn}() RETURNS trigger LANGUAGE plpgsql
+        SET search_path = pg_catalog, pg_temp AS $agentgov$
+        BEGIN
+            IF NEW.sequence = 1 THEN
+                IF NEW.prev_hash <> {genesis} THEN
+                    RAISE EXCEPTION 'agentgov: entry 1 does not link to the genesis hash'
+                        USING ERRCODE = 'integrity_constraint_violation';
+                END IF;
+            ELSIF NOT EXISTS (
+                SELECT 1 FROM {entries} AS e
+                WHERE e.sequence = NEW.sequence - 1 AND e.entry_hash = NEW.prev_hash
+            ) THEN
+                RAISE EXCEPTION 'agentgov: entry % does not extend the committed chain',
+                    NEW.sequence
+                    USING ERRCODE = 'integrity_constraint_violation',
+                          HINT = 'a writer must hold the ledger writer lock and build on '
+                                 'the committed head';
+            END IF;
+            RETURN NEW;
+        END
+        $agentgov$
+        """
+    ).format(
+        fn=sql.Identifier(schema, "extend_chain"),
+        entries=sql.Identifier(schema, "entries"),
+        genesis=sql.Literal(genesis),
     )
 
 

@@ -58,6 +58,7 @@ from agentgov.receipts import (
     MerkleTree,
     Outcome,
     OutcomeStatus,
+    Quantity,
     ReceiptBundle,
     ReceiptLog,
     RowChange,
@@ -67,11 +68,12 @@ from agentgov.receipts import (
     commit_rows,
 )
 from agentgov.receipts.merkle import leaf_hash
-from agentgov.receipts.schema import Signature
+from agentgov.receipts.schema import PLAN_BOUND, REQUEST_ONLY, Signature
 
 LOG_ID = "arc1-vectors"
 DELIVERY_LOG_ID = "arc1-vectors-delivery"
 V12_LOG_ID = "arc1-vectors-v12"
+V13_LOG_ID = "arc1-vectors-v13"
 WITNESS_ID = "arc1-vectors-witness"
 _NAMESPACE = uuid.UUID("5f3c9b1e-0a4d-4e6b-9c2f-7d1e8a0b3c4d")
 _BASE = datetime(2026, 9, 25, 14, 0, 0, tzinfo=UTC)
@@ -114,6 +116,8 @@ format is specified in [`docs/RECEIPTS.md`](../../docs/RECEIPTS.md).
 - `delivery/`: ARC1 v1.1 delivery receipts, in a log of their own (below).
 - `v12/`: ARC1 1.2, signature version 2 and a key transition, in a log of
   their own (below).
+- `v13/`: ARC1 1.3, measurement classes, quantities in other units and the
+  systems that served, in a log of their own (below).
 - `manifest.json`: every command-line case, and the exit code it must produce.
 
 ## The receipts
@@ -170,6 +174,28 @@ size 5. The witness cosigns both checkpoints.
 - `invalid/`: a transition forged in the issuer's name, a version 2
   signature presented as version 1, a signature version that does not exist,
   and a checkpoint the issuer signed past the size it handed over.
+
+## Measurement classes, quantities and other systems (ARC1 1.3)
+
+`v13/` is a fourth log, `arc1-vectors-v13`, of three receipts. Each uses a
+field 1.3 adds, which is written only when it is not the default, so every
+receipt above keeps its bytes:
+
+0. `mcp-write`: an agent's write to a CRM through an MCP tool, held for a
+   warrant and delivered at most once. Only the request was measured:
+   `coverage.measurement` is `request-only`, and `cost.served_by` names the
+   MCP server.
+1. `dose-order`: a medication order measured in a SQL transaction, so it names
+   no measurement (transactional). `cost.quantities` holds what it consumed in
+   the ledger of morphine milligram equivalents, `mme`, beside the model
+   spend in `settled_usd`.
+2. `scale-up`: a capacity change applied from a saved plan,
+   `plan-bound`, consuming 8 `vcpu`.
+
+`invalid/` breaks the new fields one way each: `"transactional"` written out
+(a receipt that names none is transactional, so it is never written),
+a measurement class that does not exist, an empty `quantities`, quantities out
+of order, one unit twice, and an empty `served_by`.
 
 ## Running the cases
 
@@ -906,6 +932,7 @@ def generate(out: Path) -> None:
 
     _delivery_vectors(out / "delivery", issuer, witness_key, attacker)
     _v12_vectors(out / "v12", issuer, witness_key, attacker, scenarios)
+    _v13_vectors(out / "v13", issuer, witness_key, scenarios)
     _write_json(out / "manifest.json", _manifest())
 
 
@@ -996,6 +1023,104 @@ def _v12_vectors(
         invalid / "old-key-past-its-era.bundle.json",
         replace(early, checkpoint=past).to_json(),
     )
+
+
+def _v13_vectors(
+    out: Path,
+    issuer: Ed25519Signer,
+    witness_key: Ed25519Signer,
+    scenarios: list[tuple[str, ActionReceipt, RowCommitment]],
+) -> None:
+    """ARC1 1.3: measurement classes, quantities and the systems that served."""
+    base = scenarios[0][1]
+    write = replace(
+        base,
+        receipt_id=_uuid("receipt:v13:mcp-write"),
+        coverage=replace(base.coverage, measurement=REQUEST_ONLY),
+        cost=Cost(
+            ledger_txn_ids=(_uuid("txn:v13:mcp-write"),),
+            settled_usd=Decimal("0.00012000"),
+            served_models=("claude-sonnet-5",),
+            served_by=("mcp:crm-server",),
+        ),
+    )
+    dose = replace(
+        base,
+        receipt_id=_uuid("receipt:v13:dose-order"),
+        cost=Cost(
+            ledger_txn_ids=(_uuid("txn:v13:dose-order"),),
+            settled_usd=Decimal("0.00230000"),
+            served_models=("claude-sonnet-5",),
+            quantities=(Quantity("mme", Decimal("30"), (_uuid("txn:v13:dose-order:mme"),)),),
+        ),
+    )
+    scale = replace(
+        base,
+        receipt_id=_uuid("receipt:v13:scale-up"),
+        coverage=replace(base.coverage, measurement=PLAN_BOUND),
+        cost=Cost(
+            quantities=(Quantity("vcpu", Decimal("8"), (_uuid("txn:v13:scale-up:vcpu"),)),),
+            served_by=("terraform",),
+        ),
+    )
+    with tempfile.TemporaryDirectory() as scratch:
+        work = Path(scratch)
+        witness = FileWitness(
+            work / "cosignatures.jsonl",
+            witness_key,
+            witness_id=WITNESS_ID,
+            logs={V13_LOG_ID: issuer.public_key()},
+            clock=_Clock(_BASE + timedelta(hours=7), timedelta(minutes=5)),
+            signature_version=2,
+        )
+        log = ReceiptLog(
+            V13_LOG_ID,
+            issuer,
+            path=work / "receipts.jsonl",
+            witnesses=[witness],
+            policy=CheckpointPolicy(every_receipts=10**6, every_seconds=10**9, background=False),
+            clock=_Clock(_BASE + timedelta(hours=6), timedelta(minutes=1)),
+            signature_version=2,
+        )
+        for draft in (write, dose, scale):
+            log.issue(draft)
+        final = log.publish()
+        bundles = [log.bundle(n, final) for n in range(3)]
+        log.close()
+        (out / "log").mkdir(parents=True)
+        for name in ("receipts.jsonl", "receipts.jsonl.checkpoints"):
+            shutil.copy(work / name, out / "log" / name)
+        (out / "witness").mkdir()
+        shutil.copy(work / "cosignatures.jsonl", out / "witness" / "cosignatures.jsonl")
+
+    valid = out / "valid"
+    for name, bundle in zip(("mcp-write", "dose-order", "scale-up"), bundles, strict=True):
+        _write_json(valid / f"{name}.bundle.json", bundle.to_json())
+
+    invalid = out / "invalid"
+    good = bundles[0].to_json()
+    dose_json = bundles[1].to_json()
+
+    def broken(name: str, document: dict[str, Any], change: Any) -> None:
+        copy = json.loads(json.dumps(document))
+        change(copy["receipt"])
+        _write_json(invalid / f"{name}.bundle.json", copy)
+
+    broken(
+        "transactional-written",
+        dose_json,
+        lambda r: r["coverage"].update(measurement="transactional"),
+    )
+    broken("unknown-measurement", good, lambda r: r["coverage"].update(measurement="estimated"))
+    broken("empty-quantities", good, lambda r: r["cost"].update(quantities=[]))
+    two = [
+        {"unit": "vcpu", "amount": "1.00000000", "ledger_txn_ids": []},
+        {"unit": "mme", "amount": "1.00000000", "ledger_txn_ids": []},
+    ]
+    broken("unsorted-quantities", dose_json, lambda r: r["cost"].update(quantities=two))
+    twice = [dict(two[1]), dict(two[1])]
+    broken("unit-twice", dose_json, lambda r: r["cost"].update(quantities=twice))
+    broken("empty-served-by", dose_json, lambda r: r["cost"].update(served_by=[]))
 
 
 _REFUND_PAYLOAD = {"amount": 48000, "payment_intent": "pi_3Pq1VectorCharge"}
@@ -1166,6 +1291,13 @@ def _manifest() -> dict[str, Any]:
         "keys/witness.pub",
     ]
     followed = ["--transitions", "v12/log/receipts.jsonl.transitions"]
+    v13_witnessed = [
+        *issuer,
+        "--witness",
+        "v13/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+    ]
 
     def case(name: str, exit_code: int, args: list[str], what: str) -> dict[str, Any]:
         return {"name": name, "exit": exit_code, "args": args, "description": what}
@@ -1439,6 +1571,35 @@ def _manifest() -> dict[str, Any]:
                 5,
                 ["v12/invalid/old-key-past-its-era.bundle.json", *issuer, *followed],
                 "the outgoing key signs a checkpoint past the size it handed over",
+            ),
+            case(
+                "v13-mcp-write",
+                0,
+                ["v13/valid/mcp-write.bundle.json", *v13_witnessed],
+                "ARC1 1.3: a request-only receipt, served by an MCP server",
+            ),
+            case(
+                "v13-dose-order",
+                0,
+                ["v13/valid/dose-order.bundle.json", *v13_witnessed],
+                "a transactional receipt with a quantity in a ledger of mme",
+            ),
+            case(
+                "v13-scale-up",
+                0,
+                ["v13/valid/scale-up.bundle.json", *v13_witnessed],
+                "a plan-bound receipt consuming vcpu",
+            ),
+            *(
+                case(f"v13-{name}", 3, [f"v13/invalid/{name}.bundle.json", *issuer], what)
+                for name, what in (
+                    ("transactional-written", "the default measurement, written out"),
+                    ("unknown-measurement", "a measurement class that does not exist"),
+                    ("empty-quantities", "quantities written with none in it"),
+                    ("unsorted-quantities", "quantities out of order"),
+                    ("unit-twice", "one unit twice"),
+                    ("empty-served-by", "served_by written naming nothing"),
+                )
             ),
         ],
     }

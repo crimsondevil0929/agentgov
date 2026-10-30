@@ -36,6 +36,11 @@ from agentgov.receipts.log import CheckpointPolicy, ReceiptLog
 from agentgov.receipts.merkle import MerkleTree, verify_consistency, verify_inclusion
 from agentgov.receipts.rows import RowCommitment, commit_rows, verify_disclosure
 from agentgov.receipts.schema import (
+    MEASUREMENTS,
+    PLAN_BOUND,
+    PREDICTED,
+    REQUEST_ONLY,
+    TRANSACTIONAL,
     ActionBinding,
     ActionReceipt,
     Anchors,
@@ -62,6 +67,7 @@ from agentgov.receipts.schema import (
     LogAnchor,
     Outcome,
     OutcomeStatus,
+    Quantity,
     ReceiptBundle,
     RowChange,
     RowDisclosure,
@@ -86,6 +92,11 @@ from agentgov.receipts.verify import Check, Failure, VerificationReport, verify_
 from agentgov.receipts.witness import FileWitness, Witness, find_cosignature, load_cosignatures
 
 __all__ = [
+    "MEASUREMENTS",
+    "PLAN_BOUND",
+    "PREDICTED",
+    "REQUEST_ONLY",
+    "TRANSACTIONAL",
     "ActionBinding",
     "ActionReceipt",
     "Anchors",
@@ -124,6 +135,7 @@ __all__ = [
     "MerkleTree",
     "Outcome",
     "OutcomeStatus",
+    "Quantity",
     "ReceiptBundle",
     "ReceiptLog",
     "RemoteSigner",

@@ -12,6 +12,8 @@ another language checks itself against (docs/LEDGER_FORMAT.md).
 - ``chain.json``: a chain from genesis, with the state it implies, a checkpoint
   snapshot of it, and that snapshot's digest.
 - ``invalid.json``: chains that break exactly one rule each, with the rule.
+- ``units.json``: the genesis of each of several units, a chain of a ledger of
+  whole seats, and chains a ledger of that unit refuses.
 
 Usage::
 
@@ -37,10 +39,12 @@ import agentgov.core as core
 from agentgov import BudgetManager, GovernancePolicy, money
 from agentgov.core import (
     GENESIS_HASH,
+    USD,
     Direction,
     EntryType,
     LedgerEntry,
     LedgerLine,
+    Unit,
     _encode_snapshot,
     _frontier_root,
     _hash_entry,
@@ -449,6 +453,85 @@ def _invalid_cases(chain: list[LedgerEntry]) -> list[dict[str, Any]]:
     return out
 
 
+_SEATS = Unit("seats", 0)
+
+
+def _units() -> dict[str, Any]:
+    """Units (1.1): each unit's genesis, and a ledger of whole seats."""
+    genesis = []
+    for unit in (USD, Unit("mme"), _SEATS, Unit("gib", 2)):
+        declaration = (
+            None if unit == USD else f"agentgov-genesis v1 unit={unit.code} places={unit.places}"
+        )
+        genesis.append(
+            {
+                "unit": unit.code,
+                "places": unit.places,
+                "declaration": declaration,
+                "genesis": unit.genesis,
+            }
+        )
+    with _deterministic():
+        gov = BudgetManager(policy=GovernancePolicy(max_calls_per_window=0), unit=_SEATS)
+        gov.open_root("org", Decimal("40.9"))
+        gov.delegate("org", "team", Decimal("12"))
+        hold = gov.authorize("team", Decimal("2.2"))
+        gov.capture(hold, Decimal("1.5"))
+        chain = list(gov.audit_trail())
+        final = gov.ledger._state
+    funding = chain[0]
+    fraction = dataclasses.replace(
+        chain[2],
+        amount=Decimal("0.50000000"),
+        balance_after=chain[1].balance_after - Decimal("0.5"),
+        entry_id=_id("half a seat"),
+    )
+    forged = _rehashed(chain[:2], fraction)
+    cases = [
+        {
+            "name": "the-seat-chain-as-usd",
+            "unit": "usd",
+            "places": 8,
+            "error": "broken chain link at sequence 1",
+            "entries": [_document(e) for e in chain],
+        },
+        {
+            "name": "half-a-seat",
+            "unit": "seats",
+            "places": 0,
+            "error": "finer than this ledger's unit",
+            "entries": [_document(e) for e in forged],
+        },
+    ]
+    for case in cases:
+        try:
+            _replay(
+                forged if case["unit"] == "seats" else chain,
+                unit=Unit(case["unit"], case["places"]),
+            )
+        except LedgerIntegrityError as exc:
+            assert case["error"] in str(exc), (case["name"], str(exc))
+        else:  # pragma: no cover - a vector that does not fail is a broken vector
+            raise AssertionError(f"invalid vector {case['name']!r} replays")
+    assert funding.prev_hash == _SEATS.genesis
+    return {
+        "description": "Units (1.1): what each unit's genesis is, a chain of a ledger of whole "
+        "seats and the state it implies, and chains that ledger refuses.",
+        "genesis": genesis,
+        "chain": {
+            "unit": _SEATS.code,
+            "places": _SEATS.places,
+            "entries": [_document(e) for e in chain],
+            "state": {
+                "length": final.length,
+                "head": final.head,
+                "balances": {s: core._fixed(b) for s, b in sorted(final.balances.items())},
+            },
+        },
+        "invalid": cases,
+    }
+
+
 def generate(out: Path) -> None:
     """Write every vector into ``out``, replacing whatever was there."""
     chain, summary = _chain()
@@ -468,6 +551,7 @@ def generate(out: Path) -> None:
             "description": "Chains that each break one rule; 'error' is in the refusal.",
             "cases": _invalid_cases(chain),
         },
+        "units.json": _units(),
     }
     staging = Path(tempfile.mkdtemp())
     try:
@@ -500,6 +584,11 @@ committed file differs. The format they exercise is specified in
   root of the entry hashes, and a checkpoint's snapshot and digest.
 - `invalid.json`: chains that each break exactly one rule; a replay must
   refuse every one (`error` is part of agentgov's own message, for reference).
+- `units.json` (1.1): each unit's genesis, the SHA-256 of its `declaration`
+  (US dollars at eight places keep the 64 zeros, and declare nothing); a
+  chain of a ledger of whole seats, whose entry 1 links to the seats genesis,
+  with the state it implies; and chains that ledger, or a dollar ledger,
+  refuses.
 
 Every value in `entry` objects is a string, as `LedgerEntry.to_audit_record()`
 renders it; an empty `counterparty_id` or `ref` means none.

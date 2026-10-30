@@ -51,20 +51,35 @@ from agentgov.exceptions import AgentGovError
 from agentgov.interceptor import PRICING, MeteredCall, TokenUsage, normalize_model_id
 
 __all__ = [
+    "PARSER_ENTRY_POINTS",
+    "ActionMatch",
+    "ActionRecord",
+    "ActionReport",
     "Discrepancy",
     "MatchedCall",
     "MeteredRecord",
     "MeteringJournal",
+    "Parser",
     "ProviderUsageRecord",
     "ReconciliationPolicy",
     "ReconciliationReport",
     "UsageParseError",
+    "format_action_report",
     "format_report",
+    "load_actions",
     "load_provider_export",
     "metered_records",
     "parse_anthropic_csv",
+    "parse_cloudtrail_json",
+    "parse_github_audit",
+    "parse_k8s_audit",
     "parse_openai_json",
+    "parse_records",
+    "parsers",
+    "receipt_refs",
     "reconcile",
+    "reconcile_actions",
+    "register_parser",
 ]
 
 _CENT = Decimal("0.000001")
@@ -92,13 +107,14 @@ def _pinned(fn: Callable[_P, _T]) -> Callable[_P, _T]:
 
 
 class UsageParseError(AgentGovError):
-    """Raised when a provider export cannot be interpreted.
+    """Raised when an export cannot be interpreted: a provider's usage, or a
+    system of record's actions.
 
     :param detail: What could not be read, and what was expected instead.
     """
 
     def __init__(self, detail: str) -> None:
-        super().__init__(f"cannot parse provider usage export: {detail}")
+        super().__init__(f"cannot parse the export: {detail}")
 
 
 # --------------------------------------------------------------------------
@@ -573,7 +589,8 @@ def load_provider_export(path: str | Path, *, fmt: str = "auto") -> tuple[Provid
     """Read a provider export, choosing a parser by extension or by ``fmt``.
 
     :param path: The export file.
-    :param fmt: ``"auto"``, ``"openai-json"``, or ``"anthropic-csv"``.
+    :param fmt: ``"auto"``, ``"openai-json"``, ``"anthropic-csv"``, or the name
+        of an installed ``usage`` :class:`Parser`.
     :returns: The parsed records.
     :raises UsageParseError: If the format cannot be determined or parsed.
     """
@@ -593,11 +610,12 @@ def load_provider_export(path: str | Path, *, fmt: str = "auto") -> tuple[Provid
         else:
             chosen = "openai-json" if text.lstrip()[:1] in "[{" else "anthropic-csv"
 
-    if chosen == "openai-json":
-        return parse_openai_json(text, source=location.name)
-    if chosen == "anthropic-csv":
-        return parse_anthropic_csv(text, source=location.name)
-    raise UsageParseError(f"unknown format {fmt!r}; expected auto, openai-json, or anthropic-csv")
+    found = parsers("usage").get(chosen)
+    if found is None:
+        raise UsageParseError(
+            f"unknown format {fmt!r}; expected auto or one of {', '.join(parsers('usage'))}"
+        )
+    return found.parse(text, source=location.name)  # type: ignore[return-value]
 
 
 # --------------------------------------------------------------------------
@@ -984,4 +1002,485 @@ def format_report(report: ReconciliationReport, *, path: str = "", export: str =
         if report.discrepant:
             reasons.append(f"{len(report.discrepant)} cost discrepancy(ies)")
         lines.append(f"  AUDIT FAILED  {'; '.join(reasons)}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Systems of record: the actions another system saw, against the receipts
+# --------------------------------------------------------------------------
+#
+# A provider's invoice is one system of record: it says what was billed. A
+# cloud's audit trail, a cluster's audit log, a code host's audit log, a
+# clinical or ERP system's access log say what was *done*. Matched against
+# the ARC1 receipts the agent's actions left, each of their lines is either
+# explained by a receipt or a phantom: an action the system saw that no
+# receipt explains, which is a shadow agent, a leaked credential, or a person
+# acting around the agent. The matching is by reference, never by guess: a
+# receipt explains a record when the record carries an identifier the
+# receipt does (its id, its stage, its commit, an idempotency key the relay
+# sent).
+
+
+@dataclass(frozen=True, slots=True)
+class ActionRecord:
+    """One action an external system of record saw.
+
+    :ivar record_id: The system's own id for the event.
+    :ivar timestamp: When the system says it happened (UTC).
+    :ivar actor: Who the system says acted: an ARN, a user, a service account.
+    :ivar action: What was done, in the system's words (``ec2:RunInstances``,
+        ``patch``, ``git.push``).
+    :ivar resource: What it was done to.
+    :ivar refs: The identifiers the event carries that a receipt may carry
+        too: idempotency tokens, stage ids, commit shas, correlation ids.
+    :ivar source: Which export the line came from.
+    """
+
+    record_id: str
+    timestamp: datetime
+    actor: str
+    action: str
+    resource: str
+    refs: tuple[str, ...]
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActionMatch:
+    """A record a receipt explains, and the identifier they share."""
+
+    record: ActionRecord
+    receipt_id: str
+    ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActionReport:
+    """The outcome of :func:`reconcile_actions`.
+
+    :ivar matched: Records a receipt explains.
+    :ivar phantom: Records of a governed actor that no receipt explains. Any
+        one fails the audit.
+    :ivar unobserved: Committed receipts no record names: the system's export
+        is incomplete for the period, or the action did not reach it.
+    :ivar ignored: Records of actors the audit does not govern.
+    """
+
+    matched: tuple[ActionMatch, ...]
+    phantom: tuple[ActionRecord, ...]
+    unobserved: tuple[str, ...]
+    ignored: int
+
+    @property
+    def passed(self) -> bool:
+        return not self.phantom
+
+
+@dataclass(frozen=True, slots=True)
+class Parser:
+    """A reader of one export format.
+
+    :ivar name: How the format is named, as ``--format``.
+    :ivar kind: ``"usage"`` for a provider's billed usage
+        (:class:`ProviderUsageRecord`), ``"actions"`` for a system of
+        record's actions (:class:`ActionRecord`).
+    :ivar parse: The export's text, and the label its records carry, to its
+        records.
+    :ivar suffixes: The file extensions ``fmt="auto"`` chooses it for.
+    """
+
+    name: str
+    kind: str
+    parse: Callable[..., tuple[ProviderUsageRecord, ...] | tuple[ActionRecord, ...]]
+    suffixes: tuple[str, ...] = ()
+
+
+PARSER_ENTRY_POINTS = "agentgov.parsers"
+"""The entry-point group a package registers its own :class:`Parser` under:
+an EHR's access log, an ERP's change log. Each entry point loads a
+:class:`Parser`."""
+
+_PARSERS: dict[str, Parser] = {}
+_PLUGINS_LOADED = False
+
+
+def register_parser(parser: Parser) -> None:
+    """Make ``parser`` available by its name.
+
+    :raises ValueError: If the name is taken, or its kind is neither.
+    """
+    if parser.kind not in ("usage", "actions"):
+        raise ValueError(f"a parser's kind is 'usage' or 'actions', not {parser.kind!r}")
+    if parser.name in _PARSERS and _PARSERS[parser.name] is not parser:
+        raise ValueError(f"a parser named {parser.name!r} is registered")
+    _PARSERS[parser.name] = parser
+
+
+def parsers(kind: str | None = None) -> dict[str, Parser]:
+    """Every registered parser, built-in and installed, by name; of ``kind`` only, if given."""
+    _load_plugins()
+    return {n: p for n, p in sorted(_PARSERS.items()) if kind is None or p.kind == kind}
+
+
+def _load_plugins() -> None:
+    global _PLUGINS_LOADED
+    if _PLUGINS_LOADED:
+        return
+    _PLUGINS_LOADED = True
+    from importlib.metadata import entry_points
+
+    for point in entry_points(group=PARSER_ENTRY_POINTS):
+        found = point.load()
+        if not isinstance(found, Parser):
+            raise UsageParseError(
+                f"entry point {point.name!r} of {PARSER_ENTRY_POINTS} loads {found!r}, not a Parser"
+            )
+        register_parser(found)
+
+
+def _json_document(text: str, source: str) -> object:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise UsageParseError(f"{source}: invalid JSON: {exc}") from exc
+
+
+def _json_lines(text: str, source: str) -> list[object]:
+    stripped = text.strip()
+    if stripped.startswith("["):
+        document = _json_document(stripped, source)
+        return list(document) if isinstance(document, list) else [document]
+    found: list[object] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.strip():
+            try:
+                found.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise UsageParseError(f"{source} line {number}: invalid JSON: {exc}") from exc
+    return found
+
+
+def _at(value: object, *path: str) -> object:
+    for key in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _texts(*values: object) -> tuple[str, ...]:
+    return tuple(sorted({str(v) for v in values if isinstance(v, str | int) and str(v)}))
+
+
+_TOKEN_KEYS = ("clientToken", "clientRequestToken", "ClientToken", "idempotencyToken")
+
+
+def parse_cloudtrail_json(
+    text: str, *, source: str = "cloudtrail-json"
+) -> tuple[ActionRecord, ...]:
+    """AWS CloudTrail: a log file (``{"Records": [...]}``) or a list of events.
+
+    Read-only events are not actions and are skipped. A record's references
+    are its request's idempotency token (``clientToken``,
+    ``clientRequestToken``), which a binding sets to the plan's idempotency
+    key or receipt id.
+    """
+    document = _json_document(text, source)
+    rows = _at(document, "Records") if isinstance(document, Mapping) else document
+    if not isinstance(rows, list):
+        raise UsageParseError(f"{source}: expected an object with a 'Records' list")
+    found = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise UsageParseError(f"{source} record {index}: expected an object")
+        if row.get("readOnly") is True:
+            continue
+        resources = row.get("resources")
+        first = resources[0] if isinstance(resources, list) and resources else {}
+        params = row.get("requestParameters")
+        found.append(
+            ActionRecord(
+                record_id=str(row.get("eventID") or f"{source}#{index}"),
+                timestamp=_parse_timestamp(row.get("eventTime")),
+                actor=str(_at(row, "userIdentity", "arn") or ""),
+                action=f"{row.get('eventSource', '')}:{row.get('eventName', '')}",
+                resource=str(_at(first, "ARN") or ""),
+                refs=_texts(*(_at(params, k) for k in _TOKEN_KEYS)),
+                source=source,
+            )
+        )
+    return tuple(found)
+
+
+_K8S_WRITES = frozenset({"create", "update", "patch", "delete", "deletecollection"})
+
+
+def parse_k8s_audit(text: str, *, source: str = "k8s-audit-jsonl") -> tuple[ActionRecord, ...]:
+    """The Kubernetes audit log: one ``audit.k8s.io`` event per line.
+
+    Only writes are actions, and only the ``ResponseComplete`` stage of each,
+    so a request logged at several stages counts once. A record's references
+    are the ``interlock.io/`` annotations its request object carries
+    (``interlock.io/stage-id``).
+    """
+    found = []
+    for index, row in enumerate(_json_lines(text, source)):
+        if not isinstance(row, Mapping):
+            raise UsageParseError(f"{source} event {index}: expected an object")
+        if row.get("verb") not in _K8S_WRITES or row.get("stage", "ResponseComplete") != (
+            "ResponseComplete"
+        ):
+            continue
+        ref = _at(row, "objectRef")
+        annotations = _at(row, "requestObject", "metadata", "annotations")
+        marked = (
+            [v for k, v in annotations.items() if str(k).startswith("interlock.io/")]
+            if isinstance(annotations, Mapping)
+            else []
+        )
+        where = [_at(ref, "resource"), _at(ref, "namespace"), _at(ref, "name")]
+        found.append(
+            ActionRecord(
+                record_id=str(row.get("auditID") or f"{source}#{index}"),
+                timestamp=_parse_timestamp(
+                    row.get("requestReceivedTimestamp") or row.get("stageTimestamp")
+                ),
+                actor=str(_at(row, "user", "username") or ""),
+                action=str(row.get("verb")),
+                resource="/".join(str(w) for w in where if w),
+                refs=_texts(*marked),
+                source=source,
+            )
+        )
+    return tuple(found)
+
+
+def parse_github_audit(text: str, *, source: str = "github-audit-json") -> tuple[ActionRecord, ...]:
+    """GitHub's audit log, as exported or streamed: a list, or one event per line.
+
+    A record's references are the commits it names (``after``, ``sha``,
+    ``head_sha``): a ref the Git substrate moved names the commit its receipt
+    committed.
+    """
+    found = []
+    for index, row in enumerate(_json_lines(text, source)):
+        if not isinstance(row, Mapping):
+            raise UsageParseError(f"{source} event {index}: expected an object")
+        moment = row.get("@timestamp", row.get("created_at"))
+        if isinstance(moment, int | float) and not isinstance(moment, bool):
+            moment = moment / 1000  # GitHub's audit log counts milliseconds
+        found.append(
+            ActionRecord(
+                record_id=str(row.get("_document_id") or f"{source}#{index}"),
+                timestamp=_parse_timestamp(moment),
+                actor=str(row.get("actor") or ""),
+                action=str(row.get("action") or ""),
+                resource=str(row.get("repo") or row.get("repository") or ""),
+                refs=_texts(row.get("after"), row.get("sha"), row.get("head_sha")),
+                source=source,
+            )
+        )
+    return tuple(found)
+
+
+_FIELDS = ("id", "timestamp", "actor", "action", "resource", "refs")
+
+
+def parse_records(
+    text: str,
+    *,
+    source: str = "records",
+    fields: Mapping[str, str] | None = None,
+    fmt: str = "auto",
+) -> tuple[ActionRecord, ...]:
+    """Any other system's log, as JSON (a list, or one object per line) or CSV.
+
+    :param fields: Which column holds each part of a record: ``id``,
+        ``timestamp``, ``actor``, ``action``, ``resource`` and ``refs`` (a
+        column whose value is one reference, or several separated by spaces
+        or commas). Each defaults to its own name.
+    :param fmt: ``"json"``, ``"csv"``, or ``"auto"`` (by the first character).
+    :raises UsageParseError: On a field name that is not one, or a row with
+        no timestamp.
+    """
+    columns = {name: name for name in _FIELDS}
+    for name, column in (fields or {}).items():
+        if name not in columns:
+            raise UsageParseError(f"no field {name!r}; the fields are {', '.join(_FIELDS)}")
+        columns[name] = column
+    if fmt == "auto":
+        fmt = "json" if text.lstrip()[:1] in "[{" else "csv"
+    if fmt == "csv":
+        rows: list[object] = list(csv.DictReader(StringIO(text)))
+    elif fmt == "json":
+        rows = _json_lines(text, source)
+    else:
+        raise UsageParseError(f"unknown format {fmt!r}; expected json, csv or auto")
+    found = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise UsageParseError(f"{source} row {index}: expected an object")
+        moment = row.get(columns["timestamp"])
+        if moment in (None, ""):
+            raise UsageParseError(f"{source} row {index}: no {columns['timestamp']!r}")
+        refs = row.get(columns["refs"])
+        listed = refs if isinstance(refs, list) else str(refs or "").replace(",", " ").split()
+        found.append(
+            ActionRecord(
+                record_id=str(row.get(columns["id"]) or f"{source}#{index}"),
+                timestamp=_parse_timestamp(moment),
+                actor=str(row.get(columns["actor"]) or ""),
+                action=str(row.get(columns["action"]) or ""),
+                resource=str(row.get(columns["resource"]) or ""),
+                refs=_texts(*listed),
+                source=source,
+            )
+        )
+    return tuple(found)
+
+
+for _parser in (
+    Parser("openai-json", "usage", parse_openai_json, (".json",)),
+    Parser("anthropic-csv", "usage", parse_anthropic_csv, (".csv", ".tsv")),
+    Parser("cloudtrail-json", "actions", parse_cloudtrail_json),
+    Parser("k8s-audit-jsonl", "actions", parse_k8s_audit),
+    Parser("github-audit-json", "actions", parse_github_audit),
+    Parser("records", "actions", parse_records, (".json", ".jsonl", ".csv")),
+):
+    register_parser(_parser)
+
+
+def load_actions(
+    path: str | Path, *, fmt: str = "records", fields: Mapping[str, str] | None = None
+) -> tuple[ActionRecord, ...]:
+    """Read a system of record's export with the parser named ``fmt``.
+
+    :param fields: For ``records`` (or a parser that takes them): which
+        column holds each part of a record.
+    :raises UsageParseError: If the file cannot be read, or no ``actions``
+        parser has that name.
+    """
+    location = Path(path)
+    try:
+        text = location.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise UsageParseError(f"cannot read {location}: {exc}") from exc
+    found = parsers("actions").get(fmt)
+    if found is None:
+        raise UsageParseError(
+            f"unknown format {fmt!r}; the actions formats are {', '.join(parsers('actions'))}"
+        )
+    if fields:
+        return found.parse(text, source=location.name, fields=fields)  # type: ignore[return-value]
+    return found.parse(text, source=location.name)  # type: ignore[return-value]
+
+
+def receipt_refs(receipt: object) -> frozenset[str]:
+    """The identifiers a receipt carries that a system of record may echo.
+
+    An action receipt: its id, its plan's hash, and its substrate's own id of
+    the commit (a Git substrate's commit). A delivery receipt: its id, the
+    message, the idempotency key the relay sent, and the remote system's own
+    id of what it created.
+    """
+    from agentgov.receipts import ActionReceipt, DeliveryReceipt
+
+    found: set[str] = set()
+    if isinstance(receipt, ActionReceipt):
+        found |= {receipt.receipt_id, receipt.intent.plan_hash}
+        txid = receipt.outcome.substrate_txid
+        if txid:
+            found.add(txid)
+            found.add(txid.rsplit(":", 1)[-1])
+    elif isinstance(receipt, DeliveryReceipt):
+        found |= {
+            receipt.receipt_id,
+            receipt.request.message_id,
+            receipt.request.idempotency_key,
+        }
+        if receipt.delivery.remote_ref:
+            found.add(receipt.delivery.remote_ref)
+    return frozenset(found)
+
+
+def reconcile_actions(
+    receipts: Iterable[object],
+    records: Iterable[ActionRecord],
+    *,
+    actors: Iterable[str] = (),
+) -> ActionReport:
+    """Match a system of record's actions against the agent's receipts.
+
+    :param receipts: ARC1 action and delivery receipts, from the agent's
+        receipt log.
+    :param records: What the system saw (:func:`load_actions`).
+    :param actors: The identities the agent acts as. A record of any other
+        actor is ignored; with none given, every record must be explained.
+    :returns: The report. A record a receipt explains is matched; one of a
+        governed actor that none explains is a phantom.
+    """
+    from agentgov.receipts import ActionReceipt, DeliveryReceipt, OutcomeStatus
+
+    owner: dict[str, str] = {}
+    committed: list[str] = []
+    for receipt in receipts:
+        if not isinstance(receipt, ActionReceipt | DeliveryReceipt):
+            raise TypeError(f"not an ARC1 receipt: {receipt!r}")
+        for ref in receipt_refs(receipt):
+            owner.setdefault(ref, receipt.receipt_id)
+        if isinstance(receipt, DeliveryReceipt) or receipt.outcome.status in (
+            OutcomeStatus.COMMITTED,
+            OutcomeStatus.RECOVERED_COMMITTED,
+        ):
+            committed.append(receipt.receipt_id)
+    governed = frozenset(actors)
+    matched: list[ActionMatch] = []
+    phantom: list[ActionRecord] = []
+    ignored = 0
+    for record in sorted(records, key=lambda r: (r.timestamp, r.record_id)):
+        if governed and record.actor not in governed:
+            ignored += 1
+            continue
+        shared = next((ref for ref in record.refs if ref in owner), None)
+        if shared is None:
+            phantom.append(record)
+        else:
+            matched.append(ActionMatch(record, owner[shared], shared))
+    seen = {m.receipt_id for m in matched}
+    return ActionReport(
+        matched=tuple(matched),
+        phantom=tuple(phantom),
+        unobserved=tuple(r for r in committed if r not in seen),
+        ignored=ignored,
+    )
+
+
+def format_action_report(report: ActionReport, *, export: str = "") -> str:
+    """Render an :class:`ActionReport` as a terminal summary, without a trailing newline."""
+    lines = ["", "RECONCILIATION  (actions)"]
+    if export:
+        lines.append(f"  system of record  {export}")
+    lines.append("")
+    for label, count in (
+        ("Matched (seen, and explained by a receipt)", len(report.matched)),
+        ("Phantom (seen, explained by NO receipt)", len(report.phantom)),
+        ("Unobserved (receipted, not seen)", len(report.unobserved)),
+        ("Ignored (another actor)", report.ignored),
+    ):
+        lines.append(f"  {label:<46}{count:>8}")
+    if report.phantom:
+        lines.append("")
+        lines.append("  PHANTOM ACTIONS - seen by the system, with no receipt")
+        for record in report.phantom[:10]:
+            lines.append(
+                f"    {record.timestamp:%Y-%m-%d %H:%M:%S}  {record.actor:<28} "
+                f"{record.action:<28} {record.resource}"
+            )
+        if len(report.phantom) > 10:
+            lines.append(f"    ... and {len(report.phantom) - 10} more")
+    lines.append("")
+    if report.passed:
+        lines.append("  AUDIT PASSED  every action seen is explained by a receipt")
+    else:
+        lines.append(f"  AUDIT FAILED  {len(report.phantom)} phantom action(s)")
     return "\n".join(lines)

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -25,9 +26,11 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from agentgov.core import (
+    USD,
     Direction,
     EntryType,
     LedgerEntry,
+    Unit,
     _decode_snapshot,
     _fixed,
     _frontier_root,
@@ -128,6 +131,31 @@ def test_every_invalid_chain_is_refused(case: dict[str, Any]) -> None:
     entries = [_entry(record) for record in case["entries"]]
     with pytest.raises(LedgerIntegrityError, match=re.escape(case["error"])):
         _replay(entries)
+
+
+def test_each_unit_has_the_genesis_its_declaration_hashes_to() -> None:
+    vector = _load("units.json")
+    for case in vector["genesis"]:
+        unit = Unit(case["unit"], case["places"])
+        assert unit.genesis == case["genesis"]
+        if case["declaration"] is None:
+            assert case["genesis"] == "0" * 64 and unit == USD
+        else:
+            assert hashlib.sha256(case["declaration"].encode("ascii")).hexdigest() == unit.genesis
+
+
+def test_a_unit_chain_replays_to_its_state_and_its_invalid_chains_are_refused() -> None:
+    vector = _load("units.json")
+    chain = vector["chain"]
+    unit = Unit(chain["unit"], chain["places"])
+    entries = [_entry(record) for record in chain["entries"]]
+    state = _replay(entries, unit=unit)
+    assert state.head == chain["state"]["head"] and state.length == chain["state"]["length"]
+    assert {s: _fixed(b) for s, b in state.balances.items()} == chain["state"]["balances"]
+    for case in vector["invalid"]:
+        broken = [_entry(record) for record in case["entries"]]
+        with pytest.raises(LedgerIntegrityError, match=re.escape(case["error"])):
+            _replay(broken, unit=Unit(case["unit"], case["places"]))
 
 
 # -- properties ----------------------------------------------------------------------

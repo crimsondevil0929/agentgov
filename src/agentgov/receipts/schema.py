@@ -85,6 +85,7 @@ __all__ = [
     "LogDocument",
     "Outcome",
     "OutcomeStatus",
+    "Quantity",
     "ReceiptBundle",
     "RowChange",
     "RowDisclosure",
@@ -131,6 +132,23 @@ _QUANTUM = Decimal("0.00000001")
 _SIGNATURE_BYTES = {ALG_ED25519: 64, ALG_HMAC_SHA256: 32}
 
 Scalar = str | int | bool | None
+
+TRANSACTIONAL = "transactional"
+"""What was measured is exactly what committed, or nothing committed: a stage
+in a SQL transaction, a Git ref's compare-and-swap. The class of every receipt
+that names none."""
+PLAN_BOUND = "plan-bound"
+"""What was measured is the plan that was applied, and the apply refuses if
+the system moved since: a saved Terraform plan, a Kubernetes dry-run applied
+under its ``resourceVersion``."""
+PREDICTED = "predicted"
+"""The before image was read, the after image predicted, the write made
+conditional on the version read, and the result read back and compared."""
+REQUEST_ONLY = "request-only"
+"""Only the request was measured: judged, and delivered at most or exactly
+once. Its effect is the remote system's word."""
+MEASUREMENTS = (TRANSACTIONAL, PLAN_BOUND, PREDICTED, REQUEST_ONLY)
+"""How strongly an action's effect was measured (ARC1 1.3), strongest first."""
 
 
 # --------------------------------------------------------------------------
@@ -205,12 +223,15 @@ class _Fields:
 
     __slots__ = ("_path", "_value")
 
-    def __init__(self, value: object, path: str, names: Iterable[str]) -> None:
+    def __init__(
+        self, value: object, path: str, names: Iterable[str], optional: Iterable[str] = ()
+    ) -> None:
         if not isinstance(value, dict):
             raise MalformedReceiptError(f"{path} must be a JSON object")
         expected = set(names)
+        allowed = expected | set(optional)
         missing = sorted(expected - value.keys())
-        unknown = sorted(value.keys() - expected)
+        unknown = sorted(value.keys() - allowed)
         if missing:
             raise MalformedReceiptError(f"{path} is missing {', '.join(missing)}")
         if unknown:
@@ -293,8 +314,8 @@ class _Fields:
             for i, v in enumerate(items)
         )
 
-    def child(self, key: str, names: Iterable[str]) -> _Fields:
-        return _Fields(self._value[key], self.path(key), names)
+    def child(self, key: str, names: Iterable[str], optional: Iterable[str] = ()) -> _Fields:
+        return _Fields(self._value[key], self.path(key), names, optional)
 
     def optional_child(self, key: str, names: Iterable[str]) -> _Fields | None:
         value = self._value[key]
@@ -622,26 +643,48 @@ class Coverage:
     cascade_closed: bool
     authorizer_on: bool
     known_gaps: tuple[str, ...] = ()
+    measurement: str = TRANSACTIONAL
+    """How strongly the effect was measured: one of :data:`MEASUREMENTS`
+    (ARC1 1.3). Written only when it is not :data:`TRANSACTIONAL`, so every
+    receipt before 1.3 keeps its bytes and reads as transactional, which each
+    of them was."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "observed_tables", _as_set(self.observed_tables))
         object.__setattr__(self, "known_gaps", _as_set(self.known_gaps))
+        if self.measurement not in MEASUREMENTS:
+            raise MalformedReceiptError(
+                f"coverage.measurement must be one of {', '.join(MEASUREMENTS)}, "
+                f"not {self.measurement!r}"
+            )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        found: dict[str, Any] = {
             "observed_tables": list(self.observed_tables),
             "cascade_closed": self.cascade_closed,
             "authorizer_on": self.authorizer_on,
             "known_gaps": list(self.known_gaps),
         }
+        if self.measurement != TRANSACTIONAL:
+            found["measurement"] = self.measurement
+        return found
 
     @classmethod
     def from_json(cls, f: _Fields) -> Coverage:
+        measurement = TRANSACTIONAL
+        if f.has("measurement"):
+            measurement = f.text("measurement")
+            if measurement == TRANSACTIONAL:
+                raise MalformedReceiptError(
+                    f"{f.path('measurement')} is written only when it is not {TRANSACTIONAL!r}: "
+                    f"a receipt that names none is transactional"
+                )
         return cls(
             observed_tables=f.texts("observed_tables"),
             cascade_closed=f.boolean("cascade_closed"),
             authorizer_on=f.boolean("authorizer_on"),
             known_gaps=f.texts("known_gaps"),
+            measurement=measurement,
         )
 
 
@@ -693,42 +736,134 @@ class Decision:
         )
 
 
+def _txn_ids(f: _Fields, key: str) -> tuple[str, ...]:
+    txn_ids = tuple(
+        _check_pattern(t, _UUID, "a canonical lowercase UUID", f"{f.path(key)}[{i}]")
+        for i, t in enumerate(f.array(key))
+    )
+    _check_set(txn_ids, f.path(key))
+    return txn_ids
+
+
+def _amount(f: _Fields, key: str) -> Decimal:
+    amount = f.pattern(key, _MONEY, "a decimal string with exactly 8 places")
+    try:
+        return Decimal(amount)
+    except InvalidOperation as exc:  # pragma: no cover - the pattern admits only decimals
+        raise MalformedReceiptError(f"{f.path(key)} is not a decimal") from exc
+
+
+_UNIT = re.compile(r"[a-z][a-z0-9_.-]{0,31}")
+"""An AgentGov ledger's unit code (``agentgov.core.Unit``)."""
+
+
+@dataclass(frozen=True)
+class Quantity:
+    """What the action consumed in a ledger of another unit (ARC1 1.3): a dose
+    in ``mme``, capacity in ``vcpu``, seats. One ledger per unit, so the unit
+    names the ledger, and ``ledger_txn_ids`` its transactions that settled it."""
+
+    unit: str
+    amount: Decimal
+    ledger_txn_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not _UNIT.fullmatch(self.unit):
+            raise MalformedReceiptError(f"{self.unit!r} is not a unit code")
+        object.__setattr__(self, "ledger_txn_ids", _as_set(self.ledger_txn_ids))
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "unit": self.unit,
+            "amount": money_text(self.amount),
+            "ledger_txn_ids": list(self.ledger_txn_ids),
+        }
+
+    @classmethod
+    def from_json(cls, f: _Fields) -> Quantity:
+        return cls(
+            unit=f.pattern("unit", _UNIT, "a unit code"),
+            amount=_amount(f, "amount"),
+            ledger_txn_ids=_txn_ids(f, "ledger_txn_ids"),
+        )
+
+
 @dataclass(frozen=True)
 class Cost:
-    """What the action cost, as the ledger recorded it."""
+    """What the action cost, as the ledgers recorded it.
+
+    :ivar settled_usd: What the AgentGov ledger of US dollars settled, in its
+        transactions ``ledger_txn_ids``: model spend and request prices.
+    :ivar served_models: The models that served the action.
+    :ivar quantities: What it consumed in ledgers of other units, by unit
+        (ARC1 1.3).
+    :ivar served_by: The systems other than models that served it: an MCP
+        server, a cloud API, a clinical system (ARC1 1.3).
+
+    ``quantities`` and ``served_by`` are written only when not empty, so every
+    receipt before 1.3 keeps its bytes.
+    """
 
     ledger_txn_ids: tuple[str, ...] = ()
     settled_usd: Decimal = Decimal("0")
     served_models: tuple[str, ...] = ()
+    quantities: tuple[Quantity, ...] = ()
+    served_by: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ledger_txn_ids", _as_set(self.ledger_txn_ids))
         object.__setattr__(self, "served_models", _as_set(self.served_models))
+        object.__setattr__(self, "served_by", _as_set(self.served_by))
+        quantities = tuple(sorted(self.quantities, key=lambda q: _utf16_order(q.unit)))
+        units = [q.unit for q in quantities]
+        if len(set(units)) != len(units):
+            raise MalformedReceiptError("cost.quantities names a unit twice")
+        if any(q.amount < 0 for q in quantities):
+            raise MalformedReceiptError("cost.quantities holds a negative amount")
+        object.__setattr__(self, "quantities", quantities)
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        found: dict[str, Any] = {
             "ledger_txn_ids": list(self.ledger_txn_ids),
             "settled_usd": money_text(self.settled_usd),
             "served_models": list(self.served_models),
         }
+        if self.quantities:
+            found["quantities"] = [q.to_json() for q in self.quantities]
+        if self.served_by:
+            found["served_by"] = list(self.served_by)
+        return found
 
     @classmethod
     def from_json(cls, f: _Fields) -> Cost:
-        txns = f.array("ledger_txn_ids")
-        txn_ids = tuple(
-            _check_pattern(
-                t, _UUID, "a canonical lowercase UUID", f"{f.path('ledger_txn_ids')}[{i}]"
-            )
-            for i, t in enumerate(txns)
-        )
-        _check_set(txn_ids, f.path("ledger_txn_ids"))
-        amount = f.pattern("settled_usd", _MONEY, "a decimal string with exactly 8 places")
-        try:
-            settled = Decimal(amount)
-        except InvalidOperation as exc:  # pragma: no cover - the pattern admits only decimals
-            raise MalformedReceiptError(f"{f.path('settled_usd')} is not a decimal") from exc
+        quantities: list[Quantity] = []
+        if f.has("quantities"):
+            items = f.array("quantities")
+            if not items:
+                raise MalformedReceiptError(
+                    f"{f.path('quantities')} is written only when it holds a quantity"
+                )
+            for index, item in enumerate(items):
+                q = _Fields(
+                    item, f"{f.path('quantities')}[{index}]", ("unit", "amount", "ledger_txn_ids")
+                )
+                quantities.append(Quantity.from_json(q))
+            units = [q.unit for q in quantities]
+            if units != sorted(units, key=_utf16_order):
+                raise MalformedReceiptError(f"{f.path('quantities')} must be sorted by unit")
+        served_by: tuple[str, ...] = ()
+        if f.has("served_by"):
+            served_by = f.texts("served_by")
+            if not served_by:
+                raise MalformedReceiptError(
+                    f"{f.path('served_by')} is written only when it names a system"
+                )
         return cls(
-            ledger_txn_ids=txn_ids, settled_usd=settled, served_models=f.texts("served_models")
+            ledger_txn_ids=_txn_ids(f, "ledger_txn_ids"),
+            settled_usd=_amount(f, "settled_usd"),
+            served_models=f.texts("served_models"),
+            quantities=tuple(quantities),
+            served_by=served_by,
         )
 
 
@@ -979,7 +1114,9 @@ class ActionReceipt:
             ),
             coverage=Coverage.from_json(
                 f.child(
-                    "coverage", ("observed_tables", "cascade_closed", "authorizer_on", "known_gaps")
+                    "coverage",
+                    ("observed_tables", "cascade_closed", "authorizer_on", "known_gaps"),
+                    ("measurement",),
                 )
             ),
             decision=Decision.from_json(
@@ -989,7 +1126,11 @@ class ActionReceipt:
                 )
             ),
             cost=Cost.from_json(
-                f.child("cost", ("ledger_txn_ids", "settled_usd", "served_models"))
+                f.child(
+                    "cost",
+                    ("ledger_txn_ids", "settled_usd", "served_models"),
+                    ("quantities", "served_by"),
+                )
             ),
             outcome=Outcome.from_json(f.child("outcome", ("status", "substrate_txid"))),
             anchors=Anchors.from_json(f.child("anchors", ("agentgov", "escrow", "log"))),
