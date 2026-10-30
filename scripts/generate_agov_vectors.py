@@ -487,7 +487,7 @@ def _units() -> dict[str, Any]:
         entry_id=_id("half a seat"),
     )
     forged = _rehashed(chain[:2], fraction)
-    cases = [
+    cases: list[dict[str, Any]] = [
         {
             "name": "the-seat-chain-as-usd",
             "unit": "usd",

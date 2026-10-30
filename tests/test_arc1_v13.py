@@ -87,6 +87,20 @@ def test_a_measurement_class_that_does_not_exist_is_refused() -> None:
         ActionReceipt.from_json(document)
 
 
+def test_a_receipt_may_name_only_its_own_tenant_and_count_the_others() -> None:
+    assert "other_tenants" not in TEMPLATE.to_json()["effect"]["summary"]
+    summary = replace(TEMPLATE.effect.summary, tenants=("acme",), other_tenants=3)
+    receipt = replace(TEMPLATE, effect=replace(TEMPLATE.effect, summary=summary))
+    found = _round_trip(receipt)["effect"]["summary"]
+    assert (found["tenants"], found["other_tenants"]) == (["acme"], 3)
+    with pytest.raises(MalformedReceiptError, match="a count"):
+        replace(summary, other_tenants=-1)
+    document = TEMPLATE.to_json()
+    document["effect"]["summary"]["other_tenants"] = 0
+    with pytest.raises(MalformedReceiptError, match="written only when"):
+        ActionReceipt.from_json(document)
+
+
 def test_quantities_and_served_by_round_trip_sorted() -> None:
     cost = Cost(
         ledger_txn_ids=TEMPLATE.cost.ledger_txn_ids,

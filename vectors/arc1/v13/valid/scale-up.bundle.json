@@ -138,22 +138,23 @@
   },
   "inclusion": {
     "leaf_index": 2,
-    "tree_size": 3,
+    "tree_size": 4,
     "audit_path": [
+      "f27f35cc0698640c24f210234ed0f8fba80d233e61c160487aeed2c5282f36a9",
       "2326eea724ffe4da8557932b6f0009831671503e3d24a4936f9c3c8974eb55f6"
     ]
   },
   "checkpoint": {
     "v": "ARC1-checkpoint",
     "log_id": "arc1-vectors-v13",
-    "tree_size": 3,
-    "root_hash": "321bc770cb12201ca57207f0ea7abf41130e19c46669bba772a72309b4c6ee82",
+    "tree_size": 4,
+    "root_hash": "c553284172c5747ff381065a62edf210cc6b31176c8bc03010c6789ad31e6a67",
     "issued_at": "2026-09-25T20:00:00.000000Z",
     "sig": {
       "alg": "ed25519",
       "key_id": "bcc542d53c8c1a1f",
       "sv": 2,
-      "signature": "93beb6a1b116e95196aec80fab17605bb234c6a4187281e8cee0d6638c348c7b9edb8272595050c6eab0e9c2661d9063626e58bc3fda68e4b1a84f013e8ac006"
+      "signature": "2cba84dcc76bee055c0cb36397ccf2849bd07bd8fdc159d73b601247a2fe349bfe9f896efc4248656e604ac5f505049bd840269a3ad678c5682b5f0162c04a02"
     }
   }
 }

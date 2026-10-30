@@ -177,7 +177,7 @@ size 5. The witness cosigns both checkpoints.
 
 ## Measurement classes, quantities and other systems (ARC1 1.3)
 
-`v13/` is a fourth log, `arc1-vectors-v13`, of three receipts. Each uses a
+`v13/` is a fourth log, `arc1-vectors-v13`, of four receipts. Each uses a
 field 1.3 adds, which is written only when it is not the default, so every
 receipt above keeps its bytes:
 
@@ -191,11 +191,16 @@ receipt above keeps its bytes:
    spend in `settled_usd`.
 2. `scale-up`: a capacity change applied from a saved plan,
    `plan-bound`, consuming 8 `vcpu`.
+3. `own-tenant`: a receipt for one tenant of a multi-tenant product. Its diff
+   reached four tenants; `summary.tenants` names only the plan's own, and
+   `summary.other_tenants` counts the three others, so the receipt can be
+   handed to that tenant without naming the rest.
 
 `invalid/` breaks the new fields one way each: `"transactional"` written out
 (a receipt that names none is transactional, so it is never written),
 a measurement class that does not exist, an empty `quantities`, quantities out
-of order, one unit twice, and an empty `served_by`.
+of order, one unit twice, an empty `served_by`, and `other_tenants` written as
+zero.
 
 ## Running the cases
 
@@ -1063,6 +1068,15 @@ def _v13_vectors(
             served_by=("terraform",),
         ),
     )
+    summary = base.effect.summary
+    own = replace(
+        base,
+        receipt_id=_uuid("receipt:v13:own-tenant"),
+        effect=replace(
+            base.effect,
+            summary=replace(summary, tenants=summary.tenants[:1], other_tenants=3),
+        ),
+    )
     with tempfile.TemporaryDirectory() as scratch:
         work = Path(scratch)
         witness = FileWitness(
@@ -1082,10 +1096,10 @@ def _v13_vectors(
             clock=_Clock(_BASE + timedelta(hours=6), timedelta(minutes=1)),
             signature_version=2,
         )
-        for draft in (write, dose, scale):
+        for draft in (write, dose, scale, own):
             log.issue(draft)
         final = log.publish()
-        bundles = [log.bundle(n, final) for n in range(3)]
+        bundles = [log.bundle(n, final) for n in range(4)]
         log.close()
         (out / "log").mkdir(parents=True)
         for name in ("receipts.jsonl", "receipts.jsonl.checkpoints"):
@@ -1094,7 +1108,8 @@ def _v13_vectors(
         shutil.copy(work / "cosignatures.jsonl", out / "witness" / "cosignatures.jsonl")
 
     valid = out / "valid"
-    for name, bundle in zip(("mcp-write", "dose-order", "scale-up"), bundles, strict=True):
+    names = ("mcp-write", "dose-order", "scale-up", "own-tenant")
+    for name, bundle in zip(names, bundles, strict=True):
         _write_json(valid / f"{name}.bundle.json", bundle.to_json())
 
     invalid = out / "invalid"
@@ -1121,6 +1136,11 @@ def _v13_vectors(
     twice = [dict(two[1]), dict(two[1])]
     broken("unit-twice", dose_json, lambda r: r["cost"].update(quantities=twice))
     broken("empty-served-by", dose_json, lambda r: r["cost"].update(served_by=[]))
+    broken(
+        "other-tenants-zero",
+        good,
+        lambda r: r["effect"]["summary"].update(other_tenants=0),
+    )
 
 
 _REFUND_PAYLOAD = {"amount": 48000, "payment_intent": "pi_3Pq1VectorCharge"}
@@ -1590,6 +1610,12 @@ def _manifest() -> dict[str, Any]:
                 ["v13/valid/scale-up.bundle.json", *v13_witnessed],
                 "a plan-bound receipt consuming vcpu",
             ),
+            case(
+                "v13-own-tenant",
+                0,
+                ["v13/valid/own-tenant.bundle.json", *v13_witnessed],
+                "a receipt naming only the plan's own tenant, and counting three others",
+            ),
             *(
                 case(f"v13-{name}", 3, [f"v13/invalid/{name}.bundle.json", *issuer], what)
                 for name, what in (
@@ -1599,6 +1625,7 @@ def _manifest() -> dict[str, Any]:
                     ("unsorted-quantities", "quantities out of order"),
                     ("unit-twice", "one unit twice"),
                     ("empty-served-by", "served_by written naming nothing"),
+                    ("other-tenants-zero", "other_tenants written as zero"),
                 )
             ),
         ],

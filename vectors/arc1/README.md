@@ -95,7 +95,7 @@ size 5. The witness cosigns both checkpoints.
 
 ## Measurement classes, quantities and other systems (ARC1 1.3)
 
-`v13/` is a fourth log, `arc1-vectors-v13`, of three receipts. Each uses a
+`v13/` is a fourth log, `arc1-vectors-v13`, of four receipts. Each uses a
 field 1.3 adds, which is written only when it is not the default, so every
 receipt above keeps its bytes:
 
@@ -109,11 +109,16 @@ receipt above keeps its bytes:
    spend in `settled_usd`.
 2. `scale-up`: a capacity change applied from a saved plan,
    `plan-bound`, consuming 8 `vcpu`.
+3. `own-tenant`: a receipt for one tenant of a multi-tenant product. Its diff
+   reached four tenants; `summary.tenants` names only the plan's own, and
+   `summary.other_tenants` counts the three others, so the receipt can be
+   handed to that tenant without naming the rest.
 
 `invalid/` breaks the new fields one way each: `"transactional"` written out
 (a receipt that names none is transactional, so it is never written),
 a measurement class that does not exist, an empty `quantities`, quantities out
-of order, one unit twice, and an empty `served_by`.
+of order, one unit twice, an empty `served_by`, and `other_tenants` written as
+zero.
 
 ## Running the cases
 

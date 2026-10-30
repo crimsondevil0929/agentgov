@@ -29,13 +29,15 @@ conserves US dollars, and a receipt that names no measurement class is transacti
   PostgreSQL the trigger that admits entry 1 requires the unit's genesis. An open naming
   another unit is refused. `docs/LEDGER_FORMAT.md` §3.8 (amended in 1.1.0);
   `vectors/agov/units.json`. `agentgov inspect` prints a unit ledger's amounts in its unit.
-- **ARC1 1.3** (`docs/RECEIPTS.md` §15), three optional fields, each written only when it
+- **ARC1 1.3** (`docs/RECEIPTS.md` §15), four optional fields, each written only when it
   is not the default: `coverage.measurement` (`transactional`, `plan-bound`, `predicted`
   or `request-only`), which the verifier reports; `cost.quantities` (`Quantity`: unit,
   amount and that ledger's transactions), which `verify_bundle(ledgers=...)` and
-  `agentgov verify-receipt --unit-ledger UNIT=DB` hold to the ledger of each unit; and
-  `cost.served_by`, the systems other than models that served the action. Writing a
-  default out is malformed. `vectors/arc1/v13/`: three receipts and six broken ones.
+  `agentgov verify-receipt --unit-ledger UNIT=DB` hold to the ledger of each unit;
+  `cost.served_by`, the systems other than models that served the action; and
+  `effect.summary.other_tenants`, how many tenants the diff touched that a receipt naming
+  only the plan's own tenant leaves unnamed. Writing a default out is malformed.
+  `vectors/arc1/v13/`: four receipts and seven broken ones.
 - **Reconciling a system of record's actions** (`agentgov.reconciliation`:
   `reconcile_actions`, `ActionRecord`, `ActionReport`, `load_actions`; and
   `agentgov reconcile-actions`). The actions a cloud's audit trail, a cluster's audit log

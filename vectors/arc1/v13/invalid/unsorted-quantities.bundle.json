@@ -141,23 +141,23 @@
   },
   "inclusion": {
     "leaf_index": 1,
-    "tree_size": 3,
+    "tree_size": 4,
     "audit_path": [
       "c800f77a10080f68a925483654ff8545760da6100bc9bfefb3491567ea161af1",
-      "1ae90abf78a25c2d4cf850e2401cf06024da92d8482d485f56c36232854051c7"
+      "1b1b33a2b15dee0e6d1991b8a22894d8759bb26881a2cfc670920cabbb23e8ad"
     ]
   },
   "checkpoint": {
     "v": "ARC1-checkpoint",
     "log_id": "arc1-vectors-v13",
-    "tree_size": 3,
-    "root_hash": "321bc770cb12201ca57207f0ea7abf41130e19c46669bba772a72309b4c6ee82",
+    "tree_size": 4,
+    "root_hash": "c553284172c5747ff381065a62edf210cc6b31176c8bc03010c6789ad31e6a67",
     "issued_at": "2026-09-25T20:00:00.000000Z",
     "sig": {
       "alg": "ed25519",
       "key_id": "bcc542d53c8c1a1f",
       "sv": 2,
-      "signature": "93beb6a1b116e95196aec80fab17605bb234c6a4187281e8cee0d6638c348c7b9edb8272595050c6eab0e9c2661d9063626e58bc3fda68e4b1a84f013e8ac006"
+      "signature": "2cba84dcc76bee055c0cb36397ccf2849bd07bd8fdc159d73b601247a2fe349bfe9f896efc4248656e604ac5f505049bd840269a3ad678c5682b5f0162c04a02"
     }
   }
 }

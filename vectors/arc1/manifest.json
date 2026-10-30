@@ -508,6 +508,20 @@
       "description": "a plan-bound receipt consuming vcpu"
     },
     {
+      "name": "v13-own-tenant",
+      "exit": 0,
+      "args": [
+        "v13/valid/own-tenant.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v13/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a receipt naming only the plan's own tenant, and counting three others"
+    },
+    {
       "name": "v13-transactional-written",
       "exit": 3,
       "args": [
@@ -566,6 +580,16 @@
         "keys/issuer.pub"
       ],
       "description": "served_by written naming nothing"
+    },
+    {
+      "name": "v13-other-tenants-zero",
+      "exit": 3,
+      "args": [
+        "v13/invalid/other-tenants-zero.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "other_tenants written as zero"
     }
   ]
 }

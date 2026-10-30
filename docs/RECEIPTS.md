@@ -794,11 +794,12 @@ Without transitions, a verifier checks each signature under any key it holds
 
 A receipt for a Kubernetes change or a write through an MCP tool is not a
 receipt for a SQL transaction priced in model spend, and must not read as
-one. Version 1.3 adds three optional fields. Each is **written only when it is
+one. Version 1.3 adds four optional fields. Each is **written only when it is
 not the default**, so every earlier receipt keeps its bytes and reads as what
-it was: a transactional action, priced in dollars, served by models. A field
-written with its default (`"measurement": "transactional"`, an empty
-`quantities` or `served_by`) is malformed: one action has one encoding.
+it was: a transactional action, priced in dollars, served by models, naming
+every tenant it touched. A field written with its default (`"measurement":
+"transactional"`, an empty `quantities` or `served_by`, an `other_tenants` of
+zero) is malformed: one action has one encoding.
 
 ### 15.1 `coverage.measurement`
 
@@ -838,4 +839,13 @@ A *set* of the systems other than models that served the action, in the
 issuer's words: `mcp:crm-server`, `terraform`, `fhir:epic`. It names, and
 claims nothing about what they did; `coverage.measurement` says how much of
 that was measured.
+
+### 15.4 `effect.summary.other_tenants`
+
+How many tenants the measured diff touched that `effect.summary.tenants` does
+not name: an integer, one or more. An issuer that serves many tenants from one
+store may name only the plan's own tenant, so that a receipt handed to that
+tenant, in its own audit bundle, names no other. The count keeps what the
+receipt says about the action's reach: a plan refused for crossing into three
+other tenants says so, and does not say which.
 

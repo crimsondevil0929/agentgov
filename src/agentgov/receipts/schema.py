@@ -552,17 +552,26 @@ class Intent:
 
 @dataclass(frozen=True)
 class EffectSummary:
-    """Counts of what the measured diff did, and where."""
+    """Counts of what the measured diff did, and where.
+
+    :ivar other_tenants: How many tenants the diff touched that ``tenants``
+        does not name: an issuer that names only the plan's own tenant, so a
+        receipt handed to one tenant names no other (ARC1 1.3). Written only
+        when more than zero.
+    """
 
     inserted: int = 0
     updated: int = 0
     deleted: int = 0
     tables: tuple[str, ...] = ()
     tenants: tuple[str, ...] = ()
+    other_tenants: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tables", _as_set(self.tables))
         object.__setattr__(self, "tenants", _as_set(self.tenants))
+        if type(self.other_tenants) is not int or self.other_tenants < 0:
+            raise MalformedReceiptError("summary.other_tenants is a count, zero or more")
 
     @property
     def total(self) -> int:
@@ -575,16 +584,26 @@ class EffectSummary:
             "del": self.deleted,
             "tables": list(self.tables),
             "tenants": list(self.tenants),
+            **({"other_tenants": self.other_tenants} if self.other_tenants else {}),
         }
 
     @classmethod
     def from_json(cls, f: _Fields) -> EffectSummary:
+        other = 0
+        if f.has("other_tenants"):
+            other = f.integer("other_tenants")
+            if other < 1:
+                raise MalformedReceiptError(
+                    f"{f.path('other_tenants')} is written only when the diff touched a tenant "
+                    "the receipt does not name"
+                )
         return cls(
             inserted=f.integer("ins"),
             updated=f.integer("upd"),
             deleted=f.integer("del"),
             tables=f.texts("tables"),
             tenants=f.texts("tenants"),
+            other_tenants=other,
         )
 
 
@@ -628,7 +647,7 @@ class Effect:
             row_root=f.hex64("row_root"),
             row_count=f.integer("row_count"),
             summary=EffectSummary.from_json(
-                f.child("summary", ("ins", "upd", "del", "tables", "tenants"))
+                f.child("summary", ("ins", "upd", "del", "tables", "tenants"), ("other_tenants",))
             ),
             truncated=f.boolean("truncated"),
         )
