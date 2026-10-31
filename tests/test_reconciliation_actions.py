@@ -124,6 +124,32 @@ def test_the_kubernetes_audit_log_counts_each_write_once() -> None:
     assert record.action == "patch"
 
 
+def test_a_dry_run_and_a_refused_write_are_no_actions() -> None:
+    def event(uri: str, code: int) -> dict[str, object]:
+        return {
+            "auditID": f"a-{uri}-{code}",
+            "stage": "ResponseComplete",
+            "verb": "update",
+            "requestURI": uri,
+            "user": {"username": "system:serviceaccount:ops:remediator"},
+            "objectRef": {"resource": "deployments", "namespace": "prod", "name": "api"},
+            "responseStatus": {"code": code},
+            "requestReceivedTimestamp": "2026-10-30T10:00:00.000000Z",
+        }
+
+    path = "/apis/apps/v1/namespaces/prod/deployments/api"
+    text = "\n".join(
+        json.dumps(e)
+        for e in (
+            event(path + "?dryRun=All", 200),
+            event(path, 409),
+            event(path, 200),
+        )
+    )
+    (record,) = parse_k8s_audit(text)
+    assert record.record_id == f"a-{path}-200"
+
+
 def test_githubs_audit_log_names_the_commits_it_moved() -> None:
     events = [
         {
