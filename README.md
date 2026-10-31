@@ -525,6 +525,39 @@ Token counts come from a `MeteringJournal`, an additive sidecar. The ledger
 records money and structure and deliberately not token metadata. Without a
 journal reconciliation still runs on cost and time, and says so.
 
+### Reconciling what another system saw
+
+An invoice says what was billed. A cloud's audit trail, a cluster's audit log,
+a code host's audit log, or a clinical or ERP system's access log says what was
+*done*. `agentgov reconcile-actions` matches one of those against the agent's
+receipts. Every action the system saw is either explained by a receipt, because
+both carry the same identifier (the receipt's id, its stage, the commit it
+made, or the idempotency key the relay sent), or it is a phantom: something
+acted that no receipt accounts for. That is a shadow agent, a leaked
+credential, or a person working around the agent.
+
+```console
+$ agentgov reconcile-actions receipts.jsonl cloudtrail.json --format cloudtrail-json \
+      --actor arn:aws:sts::111122223333:assumed-role/sre-remediator/agent
+
+  Matched (seen, and explained by a receipt)           41
+  Phantom (seen, explained by NO receipt)               1
+  Unobserved (receipted, not seen)                      0
+  Ignored (another actor)                             312
+
+  PHANTOM ACTIONS - seen by the system, with no receipt
+    2026-10-30 03:12:09  arn:aws:sts::...:agent   ec2.amazonaws.com:RunInstances
+
+  AUDIT FAILED  1 phantom action(s)
+```
+
+It reads AWS CloudTrail, the Kubernetes audit log and GitHub's audit log, and
+any other log as JSON or CSV, given which column is which (`--field
+actor=user --field refs=correlation_id`). Matching is by identifier only,
+never by a guess at time and resource, so a phantom is never a near miss. Each
+format is a parser in a registry that also holds the invoice formats, and a
+package can add its own through the `agentgov.parsers` entry point.
+
 ## Reading a ledger
 
 ```
@@ -586,8 +619,19 @@ PASS  valid/committed-refund.bundle.json  (receipt f87ad35e-c540-5f93-8c5a-62d30
 
 `--ledger governor.db` also checks the receipt's cost against the AgentGov
 ledger that paid for the action. The ledger must have settled exactly that
-amount, in transactions recorded before the receipt was anchored. The exit
-code says what failed, so a pipeline can gate on it:
+amount, in transactions recorded before the receipt was anchored.
+
+Not every action is a SQL transaction priced in model spend, and a receipt
+says so rather than overclaiming. Since 1.1 a receipt can say how strongly its
+action was measured: in a transaction (the default), from a plan applied only
+if nothing moved since, from a prediction checked by reading back, or only as
+the request that was sent. It can say what the action consumed in other units,
+such as morphine milligram equivalents or vCPUs, which
+`--unit-ledger mme=dose.db` checks against the ledger of that unit; and which
+systems other than models served it. A receipt that uses none of these is
+byte for byte what it was.
+
+The exit code says what failed, so a pipeline can gate on it:
 
 | Exit | Meaning |
 |---|---|
@@ -875,6 +919,15 @@ See [`tests/test_postgres_joined.py`](tests/test_postgres_joined.py).
   whole operation instead of leaving memory ahead of disk or half of it on disk. A
   corrupted or tampered file refuses to load rather than being trusted. See
   [Durability](#durability) above.
+- **Any unit.** A ledger conserves one declared unit: dollars by default, or
+  `Unit("mme")`, `Unit("vcpu", 0)`, `Unit("seats", 0)` (a unit of no places
+  counts whole things). The unit is fixed before the first entry and baked into
+  the ledger's genesis hash, so a ledger cannot later be read as counting
+  something else; every dollar ledger keeps the genesis it always had. Run one
+  ledger per unit: `BudgetManager.open_sqlite("dose.db", unit=Unit("mme"))`.
+  Every amount rounds to the unit (holds up, grants down), and `quantity()` and
+  `BudgetExhaustedError` are the neutral names of `money()` and
+  `DenialOfWalletError`.
 - **Anchors.** `anchor(scope_id, memo)` commits an external record, typically another
   hash chain's head, into this chain as a zero-value entry. It moves no money, and
   editing the memo afterwards breaks verification. This is how
@@ -993,7 +1046,6 @@ raw API payload to disk as evidence. See [Live API metering](#live-api-metering)
 - **A server.** AgentGov is a library; the database is the point of coordination.
 - **Holds that expire on their own.** Voiding a hold asserts its call will never settle,
   which AgentGov cannot know: `void_stale()` is an operator's decision.
-- **Units other than USD.**
 - **Deleting history.** Nothing is pruned, and on PostgreSQL the triggers refuse deletion.
 
 ## Roadmap

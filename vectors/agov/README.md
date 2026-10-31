@@ -14,6 +14,11 @@ committed file differs. The format they exercise is specified in
   root of the entry hashes, and a checkpoint's snapshot and digest.
 - `invalid.json`: chains that each break exactly one rule; a replay must
   refuse every one (`error` is part of agentgov's own message, for reference).
+- `units.json` (1.1): each unit's genesis, the SHA-256 of its `declaration`
+  (US dollars at eight places keep the 64 zeros, and declare nothing); a
+  chain of a ledger of whole seats, whose entry 1 links to the seats genesis,
+  with the state it implies; and chains that ledger, or a dollar ledger,
+  refuses.
 
 Every value in `entry` objects is a string, as `LedgerEntry.to_audit_record()`
 renders it; an empty `counterparty_id` or `ref` means none.

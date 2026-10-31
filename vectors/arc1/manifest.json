@@ -464,6 +464,132 @@
         "v12/log/receipts.jsonl.transitions"
       ],
       "description": "the outgoing key signs a checkpoint past the size it handed over"
+    },
+    {
+      "name": "v13-mcp-write",
+      "exit": 0,
+      "args": [
+        "v13/valid/mcp-write.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v13/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "ARC1 1.3: a request-only receipt, served by an MCP server"
+    },
+    {
+      "name": "v13-dose-order",
+      "exit": 0,
+      "args": [
+        "v13/valid/dose-order.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v13/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a transactional receipt with a quantity in a ledger of mme"
+    },
+    {
+      "name": "v13-scale-up",
+      "exit": 0,
+      "args": [
+        "v13/valid/scale-up.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v13/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a plan-bound receipt consuming vcpu"
+    },
+    {
+      "name": "v13-own-tenant",
+      "exit": 0,
+      "args": [
+        "v13/valid/own-tenant.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v13/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a receipt naming only the plan's own tenant, and counting three others"
+    },
+    {
+      "name": "v13-transactional-written",
+      "exit": 3,
+      "args": [
+        "v13/invalid/transactional-written.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "the default measurement, written out"
+    },
+    {
+      "name": "v13-unknown-measurement",
+      "exit": 3,
+      "args": [
+        "v13/invalid/unknown-measurement.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "a measurement class that does not exist"
+    },
+    {
+      "name": "v13-empty-quantities",
+      "exit": 3,
+      "args": [
+        "v13/invalid/empty-quantities.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "quantities written with none in it"
+    },
+    {
+      "name": "v13-unsorted-quantities",
+      "exit": 3,
+      "args": [
+        "v13/invalid/unsorted-quantities.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "quantities out of order"
+    },
+    {
+      "name": "v13-unit-twice",
+      "exit": 3,
+      "args": [
+        "v13/invalid/unit-twice.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "one unit twice"
+    },
+    {
+      "name": "v13-empty-served-by",
+      "exit": 3,
+      "args": [
+        "v13/invalid/empty-served-by.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "served_by written naming nothing"
+    },
+    {
+      "name": "v13-other-tenants-zero",
+      "exit": 3,
+      "args": [
+        "v13/invalid/other-tenants-zero.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "other_tenants written as zero"
     }
   ]
 }

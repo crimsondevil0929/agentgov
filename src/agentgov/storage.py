@@ -56,7 +56,7 @@ from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar, runtime_check
 
 from agentgov.core import (
     _CHECKPOINT_MEMO,
-    GENESIS_HASH,
+    USD,
     Authorization,
     BudgetNode,
     ControlEvent,
@@ -64,6 +64,7 @@ from agentgov.core import (
     IdempotencyRecord,
     LedgerEntry,
     SettlementClaim,
+    Unit,
     WriteBatch,
     _amount_text,
     _direction,
@@ -197,6 +198,8 @@ class StoreImage:
         ``control_events`` the rows for those entries and any a pre-0.1.2
         governor kept outside the chain.
     :ivar base: The sequence ``entries`` follow: the snapshot's, or 0.
+    :ivar unit: What the ledger conserves: the unit the store declares, or
+        :data:`~agentgov.core.USD` for one that declares none.
     """
 
     schema_version: str
@@ -207,6 +210,7 @@ class StoreImage:
     control_high_water: int
     snapshot: Snapshot | None = None
     base: int = 0
+    unit: Unit = USD
 
 
 @dataclass(frozen=True, slots=True)
@@ -1111,6 +1115,7 @@ class SqliteStore:
                 rows = self._select_control_rows(after=0)
             authorizations = self._select_authorizations()
             high_water = self._control_high_water()
+            declared = self._read_unit()
         return StoreImage(
             schema_version=version,
             entries=entries,
@@ -1120,7 +1125,47 @@ class SqliteStore:
             control_high_water=high_water,
             snapshot=snapshot,
             base=base,
+            unit=USD if declared is None else declared,
         )
+
+    # -- the unit ---------------------------------------------------------
+
+    def _read_unit(self) -> Unit | None:
+        row = self._conn.execute("SELECT value FROM schema_meta WHERE key = 'unit'").fetchone()
+        if row is None:
+            return None
+        try:
+            return Unit.parse(str(row[0]))
+        except ValueError as exc:
+            raise LedgerIntegrityError(f"the database declares no unit it can read: {exc}") from exc
+
+    @_guarded
+    def declared_unit(self) -> Unit | None:
+        """The unit this database declares, or ``None`` (it conserves
+        :data:`~agentgov.core.USD`)."""
+        with self._read_transaction():
+            return self._read_unit()
+
+    @_guarded
+    def declare_unit(self, unit: Unit) -> None:
+        """Record that this database conserves ``unit``, before its first entry.
+
+        :raises LedgerIntegrityError: If it holds an entry, or declares a unit.
+        """
+        self._require_writable("declare_unit")
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if conn.execute("SELECT 1 FROM entries LIMIT 1").fetchone() is not None:
+                raise LedgerIntegrityError("a ledger's unit is declared before its first entry")
+            if self._read_unit() is not None:
+                raise LedgerIntegrityError("this database already declares its unit")
+            conn.execute("INSERT INTO schema_meta (key, value) VALUES ('unit', ?)", (unit.text(),))
+            conn.commit()
+        except BaseException:
+            with suppress(sqlite3.Error):
+                conn.rollback()
+            raise
 
     @_guarded
     def snapshot(
@@ -1258,7 +1303,10 @@ class SqliteStore:
             row = self._conn.execute(
                 "SELECT sequence, entry_hash FROM entries ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
-        return (0, GENESIS_HASH) if row is None else (int(row[0]), str(row[1]))
+            declared = self._read_unit() if row is None else None
+        if row is None:
+            return 0, (USD if declared is None else declared).genesis
+        return int(row[0]), str(row[1])
 
     def entry_at(self, sequence: int) -> LedgerEntry | None:
         """The entry at ``sequence``, if there is one."""

@@ -33,7 +33,7 @@ the key in force for its position, followed from the key the caller trusts.
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import IntEnum
@@ -49,6 +49,7 @@ from agentgov.exceptions import (
 from agentgov.receipts.merkle import verify_inclusion
 from agentgov.receipts.rows import verify_disclosure
 from agentgov.receipts.schema import (
+    TRANSACTIONAL,
     ActionReceipt,
     Checkpoint,
     Cosignature,
@@ -145,6 +146,7 @@ def verify_bundle(
     relay_keys: Iterable[Verifier] | None = None,
     action: ReceiptBundle | str | bytes | None = None,
     transitions: Sequence[KeyTransition] | None = None,
+    ledgers: Mapping[str, BudgetManager] | None = None,
 ) -> VerificationReport:
     """Verify a receipt bundle against the keys and records the caller trusts.
 
@@ -167,6 +169,9 @@ def verify_bundle(
     :param transitions: The log's key transitions (ARC1 1.2). The first must
         be signed by ``log_key`` (or ``issuer_key``); then the receipt and the
         checkpoint must each be signed by the key in force for its position.
+    :param ledgers: AgentGov ledgers of other units, by unit code: each
+        quantity the receipt's cost names (ARC1 1.3) must be what its
+        transactions in the ledger of its unit settled.
     """
     checks: list[Check] = []
     if isinstance(bundle, (str, bytes)):
@@ -182,12 +187,15 @@ def verify_bundle(
         return _verify_delivery(
             bundle, receipt, keys, followed, cosignatures, witness_key, relay_keys, action
         )
+    measured = receipt.coverage.measurement
     checks.append(
         Check(
             "ARC1 schema",
             "pass",
             f"receipt {receipt.receipt_id} ({receipt.outcome.status.value}, issued "
-            f"{receipt.body()['issued_at']} by {receipt.issuer})",
+            f"{receipt.body()['issued_at']} by {receipt.issuer}"
+            + ("" if measured == TRANSACTIONAL else f"; measured {measured}")
+            + ")",
         )
     )
     if followed is not None:
@@ -196,6 +204,8 @@ def verify_bundle(
     checks.append(_check_inclusion(bundle, keys))
     checks.append(_check_witness(bundle, cosignatures, witness_key))
     checks.append(_check_ledger(receipt, ledger))
+    if receipt.cost.quantities or ledgers:
+        checks.append(_check_quantities(receipt, ledgers or {}))
     checks.append(_check_rows(receipt, rows))
     return VerificationReport(tuple(checks), receipt)
 
@@ -467,7 +477,7 @@ def _check_ledger(receipt: ActionReceipt, ledger: BudgetManager | None) -> Check
         entries = ledger.audit_trail()
     except AgentGovError as exc:  # pragma: no cover - a verified ledger reads cleanly
         return Check(name, "fail", f"the ledger cannot be read: {exc}", Failure.LEDGER)
-    from agentgov.core import GENESIS_HASH, EntryType
+    from agentgov.core import EntryType
 
     if anchor.seq > len(entries):
         return Check(
@@ -476,7 +486,7 @@ def _check_ledger(receipt: ActionReceipt, ledger: BudgetManager | None) -> Check
             f"the receipt anchors to entry {anchor.seq}; the ledger has {len(entries)}",
             Failure.LEDGER,
         )
-    head = entries[anchor.seq - 1].entry_hash if anchor.seq else GENESIS_HASH
+    head = entries[anchor.seq - 1].entry_hash if anchor.seq else ledger.unit.genesis
     if head != anchor.head:
         return Check(
             name,
@@ -512,6 +522,64 @@ def _check_ledger(receipt: ActionReceipt, ledger: BudgetManager | None) -> Check
         f"anchored at entry {anchor.seq}; {len(receipt.cost.ledger_txn_ids)} settlement "
         f"transaction(s) totalling ${money_text(settled)}",
     )
+
+
+def _check_quantities(receipt: ActionReceipt, ledgers: Mapping[str, BudgetManager]) -> Check:
+    """Each quantity the receipt names, against the ledger of its unit."""
+    name = "unit ledgers"
+    quantities = receipt.cost.quantities
+    if not quantities:
+        return Check(name, "pass", "the receipt names no quantity in another unit")
+    unchecked = [q.unit for q in quantities if q.unit not in ledgers]
+    if len(unchecked) == len(quantities):
+        return Check(name, "skip", f"no ledger given of {', '.join(unchecked)}")
+    from agentgov.core import EntryType
+
+    for quantity in quantities:
+        ledger = ledgers.get(quantity.unit)
+        if ledger is None:
+            continue
+        if ledger.unit.code != quantity.unit:
+            return Check(
+                name,
+                "fail",
+                f"the ledger given for {quantity.unit} conserves {ledger.unit.code}",
+                Failure.LEDGER,
+            )
+        try:
+            entries = ledger.audit_trail()
+        except AgentGovError as exc:  # pragma: no cover - a verified ledger reads cleanly
+            return Check(
+                name, "fail", f"the {quantity.unit} ledger cannot be read: {exc}", Failure.LEDGER
+            )
+        settled: dict[str, Decimal] = {}
+        for entry in entries:
+            txn = str(entry.transaction_id)
+            if txn in quantity.ledger_txn_ids:
+                spent = entry.amount if entry.entry_type is EntryType.SPEND else Decimal(0)
+                settled[txn] = settled.get(txn, Decimal(0)) + spent
+        missing = [txn for txn in quantity.ledger_txn_ids if txn not in settled]
+        if missing:
+            return Check(
+                name,
+                "fail",
+                f"transaction {missing[0]} is not in the {quantity.unit} ledger",
+                Failure.LEDGER,
+            )
+        total = sum(settled.values(), Decimal(0))
+        if total != quantity.amount:
+            return Check(
+                name,
+                "fail",
+                f"the receipt's {quantity.unit} transactions settled {money_text(total)}; it "
+                f"claims {money_text(quantity.amount)}",
+                Failure.LEDGER,
+            )
+    shown = ", ".join(f"{money_text(q.amount)} {q.unit}" for q in quantities)
+    detail = f"settled {shown}"
+    if unchecked:
+        detail += f"; no ledger given of {', '.join(unchecked)}"
+    return Check(name, "pass", detail)
 
 
 def _check_rows(receipt: ActionReceipt, rows: RowDisclosure | None) -> Check:

@@ -33,6 +33,7 @@ __all__ = [
     "AgentThrashingError",
     "BudgetError",
     "BudgetExceededError",
+    "BudgetExhaustedError",
     "CircuitBreakerError",
     "CircuitOpenError",
     "ConcurrentGovernorError",
@@ -169,6 +170,11 @@ class DenialOfWalletError(BudgetExceededError):
             f"Denial-of-wallet backstop tripped for scope {scope_id!r} ({verb}): "
             f"requested {requested}, available {available}",
         )
+
+
+BudgetExhaustedError = DenialOfWalletError
+"""The neutral name of :class:`DenialOfWalletError`, for a ledger of any unit:
+a scope asked for more than its envelope holds, and its breaker latched."""
 
 
 class SubBudgetAllocationError(BudgetError):

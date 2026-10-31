@@ -20,6 +20,12 @@ The commands, and the readers each is for:
     on any phantom line — billed spend with no local authorization — so it too
     belongs in a pipeline.
 
+``agentgov reconcile-actions <receipts> <export> --format F``
+    For security: matches a system of record's actions (CloudTrail, the
+    Kubernetes audit log, GitHub's audit log, any other log as JSON or CSV)
+    against the agent's ARC1 receipts, and reports every action the system
+    saw that no receipt explains. Exits ``1`` on any such phantom.
+
 ``agentgov repair <ledger>``
     For an operator whose governor refused to open because a cache table
     (topology, control events, open authorizations) disagrees with the chain:
@@ -69,10 +75,12 @@ from typing import Any, TextIO
 
 from agentgov.audit import Auditor
 from agentgov.core import (
+    USD,
     BudgetManager,
     BudgetNode,
     CheckpointSigning,
     EntryType,
+    Unit,
     format_audit_line,
 )
 from agentgov.exceptions import (
@@ -90,17 +98,23 @@ from agentgov.receipts import (
     RowDisclosure,
     VerificationReport,
     Verifier,
+    document_from_json,
     load_cosignatures,
+    loads_strict,
     parse_key,
     verify_bundle,
 )
 from agentgov.reconciliation import (
     MeteringJournal,
     ReconciliationPolicy,
+    format_action_report,
     format_report,
+    load_actions,
     load_provider_export,
     metered_records,
+    parsers,
     reconcile,
+    reconcile_actions,
 )
 
 __all__ = ["main"]
@@ -115,8 +129,10 @@ def _open(path: str) -> BudgetManager:
     return open_url(path, read_only=True, verify="full", auditor=False)
 
 
-def _money(amount: Decimal) -> str:
-    return f"${amount:,.8f}"
+def _money(amount: Decimal, unit: Unit = USD) -> str:
+    if unit == USD:
+        return f"${amount:,.8f}"
+    return f"{amount:,.{unit.places}f} {unit.code}"
 
 
 def _render_tree(
@@ -132,8 +148,8 @@ def _render_tree(
     halted = manager.halted_by(node.scope_id)
     status = "" if halted is None else f"   [HALTED by {halted}]"
     label = (
-        f"{node.scope_id}  available {_money(manager.available(node.scope_id))}"
-        f"  of {_money(node.allocated)}{status}"
+        f"{node.scope_id}  available {_money(manager.available(node.scope_id), manager.unit)}"
+        f"  of {_money(node.allocated, manager.unit)}{status}"
     )
     if is_root:
         out.write(f"  {label}\n")
@@ -161,11 +177,14 @@ def _command_inspect(args: argparse.Namespace, out: TextIO) -> int:
         entries = manager.audit_trail()
         scopes = manager.scopes()
 
+        unit = manager.unit
         out.write(f"\nLEDGER  {args.path}\n")
         out.write(
             f"  {len(entries):,} hash-chained entries across {len(scopes)} scopes; "
             f"head {manager.ledger.head_hash[:16]}\n"
         )
+        if unit != USD:
+            out.write(f"  conserves {unit.code}, counted to {unit.places} places\n")
 
         out.write("\nBALANCE TREE\n")
         if not scopes:
@@ -186,10 +205,10 @@ def _command_inspect(args: argparse.Namespace, out: TextIO) -> int:
             ),
             Decimal(0),
         )
-        out.write(f"  funded          {_money(funded)}\n")
-        out.write(f"  settled spend   {_money(spent)}\n")
-        out.write(f"  holds open      {_money(-held)}\n")
-        out.write(f"  unspent         {_money(funded - spent + held)}\n")
+        out.write(f"  funded          {_money(funded, unit)}\n")
+        out.write(f"  settled spend   {_money(spent, unit)}\n")
+        out.write(f"  holds open      {_money(-held, unit)}\n")
+        out.write(f"  unspent         {_money(funded - spent + held, unit)}\n")
 
         events = manager.control_events
         out.write(f"\nCIRCUIT BREAKER  ({len(events)} control events)\n")
@@ -399,6 +418,34 @@ def _command_reconcile(args: argparse.Namespace, out: TextIO) -> int:
     return 0 if report.passed else 1
 
 
+def _command_reconcile_actions(args: argparse.Namespace, out: TextIO) -> int:
+    """Match a system of record's actions against the receipts that explain them."""
+    fields: dict[str, str] = {}
+    for item in args.field or ():
+        name, sep, column = item.partition("=")
+        if not sep:
+            out.write(f"FAIL  --field is NAME=COLUMN, not {item!r}\n")
+            return 1
+        fields[name] = column
+    try:
+        records = load_actions(args.export, fmt=args.format, fields=fields)
+        receipts = []
+        lines = Path(args.receipts).read_bytes().splitlines()
+        for number, line in enumerate(lines, 1):
+            if line.strip():
+                try:
+                    receipts.append(document_from_json(loads_strict(line)))
+                except MalformedReceiptError as exc:
+                    raise AgentGovError(f"{args.receipts} line {number}: {exc}") from exc
+    except (AgentGovError, OSError) as exc:
+        out.write(f"FAIL  could not read the evidence\n  {exc}\n")
+        return 1
+    report = reconcile_actions(receipts, records, actors=args.actor or ())
+    out.write(format_action_report(report, export=args.export))
+    out.write("\n")
+    return 0 if report.passed else 1
+
+
 def _command_repair(args: argparse.Namespace, out: TextIO) -> int:
     """Rebuild the cache tables from the chain, and report what changed."""
     manager = open_url(args.path, repair=True, auditor=False)
@@ -460,6 +507,16 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
     if args.ledger and not Path(args.ledger).is_file():
         out.write(f"error: no ledger at {args.ledger}\n")
         return 2
+    unit_paths: dict[str, str] = {}
+    for item in args.unit_ledger or ():
+        code, sep, path = item.partition("=")
+        if not sep or not code or not path:
+            out.write(f"error: --unit-ledger is UNIT=PATH, not {item!r}\n")
+            return 2
+        if not Path(path).is_file():
+            out.write(f"error: no ledger at {path}\n")
+            return 2
+        unit_paths[code] = path
 
     # An input that exists but does not decode fails the check it feeds, in
     # that check's place, so the exit code stays the first failure in order.
@@ -499,6 +556,14 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
             unreadable["agentgov ledger"] = Check(
                 "agentgov ledger", "fail", f"the ledger does not verify: {exc}", Failure.LEDGER
             )
+    ledgers: dict[str, BudgetManager] = {}
+    for code, path in unit_paths.items():
+        try:
+            ledgers[code] = open_url(path, read_only=True, auditor=False)
+        except AgentGovError as exc:
+            unreadable["unit ledgers"] = Check(
+                "unit ledgers", "fail", f"the {code} ledger does not verify: {exc}", Failure.LEDGER
+            )
     try:
         report = verify_bundle(
             bundle,
@@ -511,10 +576,13 @@ def _command_verify_receipt(args: argparse.Namespace, out: TextIO) -> int:
             relay_keys=relay_keys,
             action=action,
             transitions=transitions,
+            ledgers=ledgers,
         )
     finally:
         if ledger is not None:
             ledger.close()
+        for opened in ledgers.values():
+            opened.close()
     if unreadable:
         placed = [unreadable.pop(check.name, check) for check in report.checks]
         report = VerificationReport((*placed, *unreadable.values()), report.receipt)
@@ -598,7 +666,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_cmd.add_argument(
         "--format",
         default="auto",
-        choices=("auto", "openai-json", "anthropic-csv"),
+        choices=("auto", *parsers("usage")),
         help="export format (default: auto-detect by extension)",
     )
     reconcile_cmd.add_argument(
@@ -620,6 +688,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="percent of cost drift before a match is a discrepancy (default: 1.0)",
     )
     reconcile_cmd.set_defaults(handler=_command_reconcile)
+
+    actions_cmd = subcommands.add_parser(
+        "reconcile-actions",
+        help="match a system of record's actions against the agent's receipts; exit 1 on "
+        "any action no receipt explains",
+    )
+    actions_cmd.add_argument("receipts", help="an ARC1 receipt log (one receipt per line)")
+    actions_cmd.add_argument("export", help="the system of record's export")
+    actions_cmd.add_argument(
+        "--format",
+        default="records",
+        choices=tuple(parsers("actions")),
+        help="the export's format (default: records, any JSON or CSV log, with --field)",
+    )
+    actions_cmd.add_argument(
+        "--actor",
+        action="append",
+        help="an identity the agent acts as; other actors' actions are ignored (default: "
+        "every action must be explained). Repeat for each",
+    )
+    actions_cmd.add_argument(
+        "--field",
+        action="append",
+        metavar="NAME=COLUMN",
+        help="for --format records: the column holding a record's id, timestamp, actor, "
+        "action, resource or refs",
+    )
+    actions_cmd.set_defaults(handler=_command_reconcile_actions)
 
     repair = subcommands.add_parser(
         "repair",
@@ -695,6 +791,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--ledger",
         default="",
         help="an AgentGov ledger the receipt's anchor and settled cost must agree with",
+    )
+    receipt.add_argument(
+        "--unit-ledger",
+        action="append",
+        metavar="UNIT=PATH",
+        help="an AgentGov ledger of another unit, which the receipt's quantity in that unit "
+        "must agree with (ARC1 1.3); repeat for each unit",
     )
     receipt.add_argument(
         "--rows", default="", help="a row disclosure to check against the row commitment"
