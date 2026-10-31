@@ -8,11 +8,12 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
-### 1.1.0: any unit, and honest receipts
+## [1.1.0] - 2026-10-31
 
-Upgrades from 1.0.1 in place, with nothing to do. Every ledger, receipt, snapshot and
-vector written before keeps its bytes and its meaning: a ledger that declares no unit
-conserves US dollars, and a receipt that names no measurement class is transactional.
+Any unit, and honest receipts. Upgrades from 1.0.1 in place, with nothing to do. Every
+ledger, receipt, snapshot and vector written before keeps its bytes and its meaning: a
+ledger that declares no unit conserves US dollars, and a receipt that names no
+measurement class is transactional.
 
 ### Added
 
