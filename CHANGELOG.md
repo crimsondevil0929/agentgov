@@ -8,6 +8,17 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+### 1.1.1: a Kubernetes dry run is no action
+
+### Fixed
+
+- **`agentgov reconcile-actions --format k8s-audit-jsonl`** counted every audited write as
+  an action, as a real API server logs it: a dry run (`dryRun=All` in its `requestURI`) and
+  a write the API server refused (a `responseStatus.code` of 400 or more) too. Neither
+  changed anything, so neither is an action a receipt must explain. A plan-bound stage
+  dry-runs every object before it writes it (interlock 1.3.0), and a refused plan's dry
+  runs were reported as phantoms.
+
 ## [1.1.0] - 2026-10-31
 
 Any unit, and honest receipts. Upgrades from 1.0.1 in place, with nothing to do. Every

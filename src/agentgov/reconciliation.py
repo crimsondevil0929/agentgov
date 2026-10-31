@@ -1219,8 +1219,11 @@ def parse_k8s_audit(text: str, *, source: str = "k8s-audit-jsonl") -> tuple[Acti
     """The Kubernetes audit log: one ``audit.k8s.io`` event per line.
 
     Only writes are actions, and only the ``ResponseComplete`` stage of each,
-    so a request logged at several stages counts once. A record's references
-    are the ``interlock.io/`` annotations its request object carries
+    so a request logged at several stages counts once. A dry run
+    (``dryRun=All`` in its ``requestURI``) changes nothing, and neither does a
+    write the API server refused (a ``responseStatus.code`` of 400 or more):
+    neither is an action (1.1.1). A record's references are the
+    ``interlock.io/`` annotations its request object carries
     (``interlock.io/stage-id``).
     """
     found = []
@@ -1230,6 +1233,11 @@ def parse_k8s_audit(text: str, *, source: str = "k8s-audit-jsonl") -> tuple[Acti
         if row.get("verb") not in _K8S_WRITES or row.get("stage", "ResponseComplete") != (
             "ResponseComplete"
         ):
+            continue
+        if "dryRun=All" in str(row.get("requestURI") or ""):
+            continue
+        code = _at(row, "responseStatus", "code")
+        if isinstance(code, int) and not isinstance(code, bool) and code >= 400:
             continue
         ref = _at(row, "objectRef")
         annotations = _at(row, "requestObject", "metadata", "annotations")
