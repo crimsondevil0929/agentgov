@@ -1164,6 +1164,11 @@ def _json_lines(text: str, source: str) -> list[object]:
     if stripped.startswith("["):
         document = _json_document(stripped, source)
         return list(document) if isinstance(document, list) else [document]
+    if stripped.startswith("{"):
+        try:
+            return [json.loads(stripped)]
+        except json.JSONDecodeError:
+            pass
     found: list[object] = []
     for number, line in enumerate(text.splitlines(), 1):
         if line.strip():
@@ -1330,7 +1335,15 @@ def parse_fhir_audit(text: str, *, source: str = "fhir-auditevent") -> tuple[Act
     rows = _json_lines(text, source)
     if len(rows) == 1 and isinstance(rows[0], Mapping) and rows[0].get("resourceType") == "Bundle":
         entries = rows[0].get("entry")
-        rows = [_at(e, "resource") for e in entries] if isinstance(entries, list) else []
+        if entries is not None and not isinstance(entries, list):
+            raise UsageParseError(f"{source}: Bundle 'entry' must be a list")
+        unpacked: list[object] = []
+        for index, entry in enumerate(entries or ()):
+            if not isinstance(entry, Mapping):
+                raise UsageParseError(f"{source} entry {index}: expected an object")
+            if entry.get("resource") is not None:
+                unpacked.append(entry["resource"])
+        rows = unpacked
     found = []
     for index, row in enumerate(rows):
         if not isinstance(row, Mapping):
@@ -1540,15 +1553,16 @@ def reconcile_actions(
     for receipt in receipts:
         if not isinstance(receipt, ActionReceipt | DeliveryReceipt):
             raise TypeError(f"not an ARC1 receipt: {receipt!r}")
-        for ref in receipt_refs(receipt):
-            owner.setdefault(ref, receipt.receipt_id)
         # A compensated plan was written, then put back (ARC1 1.4): the
         # system saw both, so its log should name it as it names a commit.
+        # A refused or rolled-back plan never wrote, so it explains nothing.
         if isinstance(receipt, DeliveryReceipt) or receipt.outcome.status in (
             OutcomeStatus.COMMITTED,
             OutcomeStatus.RECOVERED_COMMITTED,
             OutcomeStatus.COMPENSATED,
         ):
+            for ref in receipt_refs(receipt):
+                owner.setdefault(ref, receipt.receipt_id)
             if in_scope(receipt):
                 expected.append(receipt.receipt_id)
             else:

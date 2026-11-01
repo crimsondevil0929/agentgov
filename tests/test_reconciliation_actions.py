@@ -390,9 +390,16 @@ def test_a_fhir_servers_audit_events_are_its_writes() -> None:
         ("ae-4", "create", "Task/t-9", ()),
     ]
     assert found[0].actor == "Device/med-rec-agent"
-    bundle = {"resourceType": "Bundle", "entry": [{"resource": events[0]}]}
-    assert len(parse_fhir_audit(json.dumps(bundle))) == 1
-    assert parse_fhir_audit(json.dumps({"resourceType": "Bundle"})) == ()
+    bundle = {
+        "resourceType": "Bundle",
+        "entry": [{"resource": events[0]}, {"response": {"status": "200"}}],
+    }
+    assert len(parse_fhir_audit(json.dumps(bundle, indent=2))) == 1
+    assert parse_fhir_audit(json.dumps({"resourceType": "Bundle"}, indent=2)) == ()
+    with pytest.raises(UsageParseError, match="Bundle 'entry' must be a list"):
+        parse_fhir_audit(json.dumps({"resourceType": "Bundle", "entry": 1}))
+    with pytest.raises(UsageParseError, match="entry 0: expected an object"):
+        parse_fhir_audit(json.dumps({"resourceType": "Bundle", "entry": [1]}))
     bare = {"resourceType": "AuditEvent", "action": "D", "recorded": "2026-10-31T10:00:00Z"}
     (deleted,) = parse_fhir_audit(json.dumps([bare]))
     assert (deleted.action, deleted.actor, deleted.resource) == ("delete", "", "")
@@ -422,6 +429,12 @@ def test_a_compensated_write_is_explained_and_expected() -> None:
     assert report.passed and report.unobserved == ()
     unseen = reconcile_actions([undone], [], actors=[AGENT])
     assert unseen.unobserved == (undone.receipt_id,), "its writes reached the system"
+    refused = replace(
+        _predicted("2", "", OutcomeStatus.REFUSED),
+        outcome=Outcome(status=OutcomeStatus.REFUSED, substrate_txid=None),
+    )
+    rogue = _record("rogue", AGENT, refused.receipt_id)
+    assert reconcile_actions([refused], [rogue], actors=[AGENT]).phantom == (rogue,)
 
 
 def test_the_audit_expects_only_receipts_of_writes_to_its_system() -> None:
