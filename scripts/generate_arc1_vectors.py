@@ -68,12 +68,13 @@ from agentgov.receipts import (
     commit_rows,
 )
 from agentgov.receipts.merkle import leaf_hash
-from agentgov.receipts.schema import PLAN_BOUND, REQUEST_ONLY, Signature
+from agentgov.receipts.schema import PLAN_BOUND, PREDICTED, REQUEST_ONLY, Signature
 
 LOG_ID = "arc1-vectors"
 DELIVERY_LOG_ID = "arc1-vectors-delivery"
 V12_LOG_ID = "arc1-vectors-v12"
 V13_LOG_ID = "arc1-vectors-v13"
+V14_LOG_ID = "arc1-vectors-v14"
 WITNESS_ID = "arc1-vectors-witness"
 _NAMESPACE = uuid.UUID("5f3c9b1e-0a4d-4e6b-9c2f-7d1e8a0b3c4d")
 _BASE = datetime(2026, 9, 25, 14, 0, 0, tzinfo=UTC)
@@ -118,6 +119,7 @@ format is specified in [`docs/RECEIPTS.md`](../../docs/RECEIPTS.md).
   their own (below).
 - `v13/`: ARC1 1.3, measurement classes, quantities in other units and the
   systems that served, in a log of their own (below).
+- `v14/`: ARC1 1.4, the `compensated` outcome, in a log of its own (below).
 - `manifest.json`: every command-line case, and the exit code it must produce.
 
 ## The receipts
@@ -201,6 +203,24 @@ receipt above keeps its bytes:
 a measurement class that does not exist, an empty `quantities`, quantities out
 of order, one unit twice, an empty `served_by`, and `other_tenants` written as
 zero.
+
+## A write put back (ARC1 1.4)
+
+`v14/` is a fifth log, `arc1-vectors-v14`, of two receipts of a medication
+order written to a FHIR server, each `predicted`: the before image read, the
+after image predicted, the write made conditional on the version read, and
+the result read back.
+
+0. `order-predicted`: the read-back matched the prediction: `committed`, its
+   `substrate_txid` the stage id every write carried.
+1. `order-compensated`: the read-back did not match (a rule on the server
+   changed more than the write did), so what was written was put back from
+   the undo recorded before the first write. The outcome is `compensated`,
+   and its `substrate_txid` is the id the writes and their put-back carried,
+   which the server's audit log echoes.
+
+`invalid/` breaks the new outcome one way each: compensated with a decision
+that did not admit the plan, and compensated naming no `substrate_txid`.
 
 ## Running the cases
 
@@ -938,6 +958,7 @@ def generate(out: Path) -> None:
     _delivery_vectors(out / "delivery", issuer, witness_key, attacker)
     _v12_vectors(out / "v12", issuer, witness_key, attacker, scenarios)
     _v13_vectors(out / "v13", issuer, witness_key, scenarios)
+    _v14_vectors(out / "v14", issuer, witness_key, scenarios)
     _write_json(out / "manifest.json", _manifest())
 
 
@@ -1143,6 +1164,72 @@ def _v13_vectors(
     )
 
 
+def _v14_vectors(
+    out: Path,
+    issuer: Ed25519Signer,
+    witness_key: Ed25519Signer,
+    scenarios: list[tuple[str, ActionReceipt, RowCommitment]],
+) -> None:
+    """ARC1 1.4: a predicted write that stood, and one put back."""
+    base = scenarios[0][1]
+    stood = replace(
+        base,
+        receipt_id=_uuid("receipt:v14:order-predicted"),
+        coverage=replace(base.coverage, measurement=PREDICTED),
+        cost=Cost(served_by=("fhir:ehr",)),
+        outcome=Outcome(OutcomeStatus.COMMITTED, f"fhir:{_uuid('stage:v14:order-predicted')}"),
+    )
+    undone = replace(
+        stood,
+        receipt_id=_uuid("receipt:v14:order-compensated"),
+        outcome=Outcome(OutcomeStatus.COMPENSATED, f"fhir:{_uuid('stage:v14:order-compensated')}"),
+    )
+    with tempfile.TemporaryDirectory() as scratch:
+        work = Path(scratch)
+        witness = FileWitness(
+            work / "cosignatures.jsonl",
+            witness_key,
+            witness_id=WITNESS_ID,
+            logs={V14_LOG_ID: issuer.public_key()},
+            clock=_Clock(_BASE + timedelta(hours=9), timedelta(minutes=5)),
+            signature_version=2,
+        )
+        log = ReceiptLog(
+            V14_LOG_ID,
+            issuer,
+            path=work / "receipts.jsonl",
+            witnesses=[witness],
+            policy=CheckpointPolicy(every_receipts=10**6, every_seconds=10**9, background=False),
+            clock=_Clock(_BASE + timedelta(hours=8), timedelta(minutes=1)),
+            signature_version=2,
+        )
+        for draft in (stood, undone):
+            log.issue(draft)
+        final = log.publish()
+        bundles = [log.bundle(n, final) for n in range(2)]
+        log.close()
+        (out / "log").mkdir(parents=True)
+        for name in ("receipts.jsonl", "receipts.jsonl.checkpoints"):
+            shutil.copy(work / name, out / "log" / name)
+        (out / "witness").mkdir()
+        shutil.copy(work / "cosignatures.jsonl", out / "witness" / "cosignatures.jsonl")
+
+    valid = out / "valid"
+    for name, bundle in zip(("order-predicted", "order-compensated"), bundles, strict=True):
+        _write_json(valid / f"{name}.bundle.json", bundle.to_json())
+
+    invalid = out / "invalid"
+    undone_json = bundles[1].to_json()
+
+    def broken(name: str, change: Any) -> None:
+        copy = json.loads(json.dumps(undone_json))
+        change(copy["receipt"])
+        _write_json(invalid / f"{name}.bundle.json", copy)
+
+    broken("compensated-refused", lambda r: r["decision"].update(admitted=False))
+    broken("compensated-no-txid", lambda r: r["outcome"].update(substrate_txid=None))
+
+
 _REFUND_PAYLOAD = {"amount": 48000, "payment_intent": "pi_3Pq1VectorCharge"}
 
 
@@ -1315,6 +1402,13 @@ def _manifest() -> dict[str, Any]:
         *issuer,
         "--witness",
         "v13/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub",
+    ]
+    v14_witnessed = [
+        *issuer,
+        "--witness",
+        "v14/witness/cosignatures.jsonl",
         "--witness-pubkey",
         "keys/witness.pub",
     ]
@@ -1626,6 +1720,25 @@ def _manifest() -> dict[str, Any]:
                     ("unit-twice", "one unit twice"),
                     ("empty-served-by", "served_by written naming nothing"),
                     ("other-tenants-zero", "other_tenants written as zero"),
+                )
+            ),
+            case(
+                "v14-order-predicted",
+                0,
+                ["v14/valid/order-predicted.bundle.json", *v14_witnessed],
+                "ARC1 1.4: a predicted write to a FHIR server, read back as predicted",
+            ),
+            case(
+                "v14-order-compensated",
+                0,
+                ["v14/valid/order-compensated.bundle.json", *v14_witnessed],
+                "a predicted write that did not read back as predicted, put back: compensated",
+            ),
+            *(
+                case(f"v14-{name}", 3, [f"v14/invalid/{name}.bundle.json", *issuer], what)
+                for name, what in (
+                    ("compensated-refused", "compensated, of a plan the decision did not admit"),
+                    ("compensated-no-txid", "compensated, naming no substrate_txid"),
                 )
             ),
         ],

@@ -8,6 +8,47 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [1.2.0] - unreleased
+
+A write put back, and a reconciliation that knows which system it audits.
+Upgrades from 1.1.1 in place, with nothing to do. Every ledger, receipt,
+snapshot and vector written before keeps its bytes and its meaning.
+
+### Added
+
+- **ARC1 1.4: the `compensated` outcome** (`OutcomeStatus.COMPENSATED`,
+  `docs/RECEIPTS.md` §16). A plan admitted and written whose writes did not
+  stand (a later write failed, or the read-back was not what was measured) is
+  put back from the undo recorded before its first write. Its receipt now says
+  so, and names the id its writes and their put-back carried. It requires an
+  admitted decision and a `substrate_txid`. New vectors in `vectors/arc1/v14/`:
+  a predicted write that stood, one put back, and the outcome's rule broken
+  each way. A verifier older than 1.4 refuses such a receipt as malformed.
+- **`agentgov reconcile-actions --format fhir-auditevent`**: a FHIR R4
+  server's `AuditEvent` resources, as NDJSON, a list or a `Bundle`. Writes
+  only (`C`, `U`, `D`), and only those that succeeded; references are the
+  request ids the server logged with each entity (`X-Request-Id`,
+  `X-Correlation-Id`). Interlock's FHIR substrate sends its stage id there on
+  every write.
+- **A reconciliation's scope.** `reconcile_actions(..., substrates=,
+  measurements=)` expects in the log only the receipts of writes to the systems
+  named, and of the classes named. An action receipt writes to its
+  `effect.substrate_id`, unless only its request was measured (`request-only`);
+  a delivery receipt is of its sink. A receipt outside the scope still explains
+  a record that names it, and is counted in `ActionReport.out_of_scope`, never
+  as unobserved. `Parser.system` names the substrate an action log records
+  (`kubernetes`, `git`, `fhir`); the command line expects that one by default
+  (`--substrate`, `--measurement`, `--all-receipts`).
+
+### Changed
+
+- **`agentgov reconcile-actions`** no longer counts, by default, a receipt of
+  another system's action as unobserved in a log of one system: a cluster's
+  audit log is not expected to name a request to a cloud API, or a code host's
+  log a request to a CI service. Pass `--all-receipts` for the 1.1 count. A
+  compensated receipt is expected in the log, as a committed one is. Phantoms,
+  and whether the audit passes, are unchanged.
+
 ## [1.1.1] - 2026-10-31
 
 A Kubernetes dry run is no action. Upgrades from 1.1.0 in place, with nothing to do.

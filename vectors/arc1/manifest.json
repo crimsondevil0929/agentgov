@@ -590,6 +590,54 @@
         "keys/issuer.pub"
       ],
       "description": "other_tenants written as zero"
+    },
+    {
+      "name": "v14-order-predicted",
+      "exit": 0,
+      "args": [
+        "v14/valid/order-predicted.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v14/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "ARC1 1.4: a predicted write to a FHIR server, read back as predicted"
+    },
+    {
+      "name": "v14-order-compensated",
+      "exit": 0,
+      "args": [
+        "v14/valid/order-compensated.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub",
+        "--witness",
+        "v14/witness/cosignatures.jsonl",
+        "--witness-pubkey",
+        "keys/witness.pub"
+      ],
+      "description": "a predicted write that did not read back as predicted, put back: compensated"
+    },
+    {
+      "name": "v14-compensated-refused",
+      "exit": 3,
+      "args": [
+        "v14/invalid/compensated-refused.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "compensated, of a plan the decision did not admit"
+    },
+    {
+      "name": "v14-compensated-no-txid",
+      "exit": 3,
+      "args": [
+        "v14/invalid/compensated-no-txid.bundle.json",
+        "--pubkey",
+        "keys/issuer.pub"
+      ],
+      "description": "compensated, naming no substrate_txid"
     }
   ]
 }

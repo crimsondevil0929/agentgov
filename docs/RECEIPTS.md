@@ -1,12 +1,14 @@
 # ARC1: verifiable action receipts
 
-**Status:** draft 1.3 (`agentgov.receipts`, from agentgov 1.0; 1.3 from
-agentgov 1.1). Version 1.3 says how strongly each action was measured, and
-what it cost in any unit (section 15). Version 1.2 added signature version 2,
-which signs a digest (section 4.5), and key transitions, by which a log
-outlives its key (section 14). Version 1.1 added delivery receipts and relay
-attestations (section 13). Every version 1.0, 1.1 and 1.2 document,
-signature, leaf and root is unchanged, and means what it meant.
+**Status:** draft 1.4 (`agentgov.receipts`, from agentgov 1.0; 1.3 from
+agentgov 1.1; 1.4 from agentgov 1.2). Version 1.4 adds one outcome,
+`compensated`: a write that did not stand and was put back (section 16).
+Version 1.3 says how strongly each action was measured, and what it cost in
+any unit (section 15). Version 1.2 added signature version 2, which signs a
+digest (section 4.5), and key transitions, by which a log outlives its key
+(section 14). Version 1.1 added delivery receipts and relay attestations
+(section 13). Every version 1.0 to 1.3 document, signature, leaf and root is
+unchanged, and means what it meant.
 Every ARC1 document names its version in its `v` field, and every signature
 names its document type in a domain string. A breaking change will get a new
 version. ARC1 documents will never be reinterpreted.
@@ -47,6 +49,7 @@ against them.
 - [13. Delivery receipts (1.1)](#13-delivery-receipts-11)
 - [14. Key transitions (1.2)](#14-key-transitions-12)
 - [15. Measurement, units and other systems (1.3)](#15-measurement-units-and-other-systems-13)
+- [16. A write put back (1.4)](#16-a-write-put-back-14)
 
 ## 1. What a receipt proves
 
@@ -328,11 +331,12 @@ part of what is signed.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `status` | `committed`, `refused`, `recovered_committed` or `recovered_aborted` | whether the effects are durable. The `recovered_*` values are settled after a crash, from the escrow chain's commit marker. |
+| `status` | `committed`, `refused`, `recovered_committed`, `recovered_aborted` or (1.4) `compensated` | whether the effects are durable. The `recovered_*` values are settled after a crash, from the escrow chain's commit marker. `compensated`: written, and put back (section 16). |
 | `substrate_txid` | *text* or `null` | the substrate's own id for the transaction |
 
-**Rule:** a `committed` or `recovered_committed` status requires `decision.admitted = true`.
-A refused plan cannot have committed.
+**Rule:** a `committed`, `recovered_committed` or `compensated` status requires
+`decision.admitted = true`. A refused plan cannot have written anything. A
+`compensated` status requires a `substrate_txid` (section 16).
 
 ### 5.9 `anchors`
 
@@ -566,7 +570,9 @@ conformance suite for any other verifier. `v12/` holds the 1.2 cases: a log
 signed at version 2 throughout, whose key hands it to a successor at size 3.
 `v13/` holds the 1.3 cases: a request-only receipt served by an MCP server, a
 transactional one with a quantity in `mme`, a plan-bound one consuming `vcpu`,
-and each new field broken one way.
+and each new field broken one way. `v14/` holds the 1.4 cases: a predicted
+write that stood, one put back (`compensated`), and the new outcome broken
+each way its rule forbids.
 
 ## 12. Security considerations
 
@@ -849,3 +855,28 @@ tenant, in its own audit bundle, names no other. The count keeps what the
 receipt says about the action's reach: a plan refused for crossing into three
 other tenants says so, and does not say which.
 
+## 16. A write put back (1.4)
+
+A substrate that cannot roll back (a Kubernetes cluster, a FHIR server, a
+SaaS API) writes an admitted plan for real, and only then can it learn that
+the write did not stand: a later write of the plan failed, or what it read
+back was not what it had measured (a rule on the server changed more than the
+plan did). Its issuer records the undo before the first write, and puts back
+what was written. Nothing of the plan is left; but the system saw the writes,
+and their put-back, and its audit log names both.
+
+Version 1.4 adds the outcome `compensated` for that action. It requires:
+
+- `decision.admitted = true`: only an admitted plan is written;
+- a `substrate_txid`: the id every write of the plan, and every write of its
+  put-back, carried (a stage id the server logs with each request), so a
+  system of record's log ties both to this receipt.
+
+`coverage.measurement` is the class of the measurement that was put back,
+`plan-bound` or `predicted`. Its effect section is what was measured before
+the write, as for any receipt. A `compensated` receipt is evidence of a
+write that happened and was undone: a reconciliation against the system's log
+expects to find it there, as it expects a committed one.
+
+A verifier older than 1.4 refuses a receipt with this outcome as malformed,
+and verifies every other receipt as before.

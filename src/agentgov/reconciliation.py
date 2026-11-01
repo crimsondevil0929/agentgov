@@ -44,7 +44,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from io import StringIO
 from pathlib import Path
-from typing import ParamSpec, TypeVar
+from typing import Final, ParamSpec, TypeVar
 
 from agentgov.core import _ROUNDING, BudgetManager, EntryType
 from agentgov.exceptions import AgentGovError
@@ -71,6 +71,7 @@ __all__ = [
     "metered_records",
     "parse_anthropic_csv",
     "parse_cloudtrail_json",
+    "parse_fhir_audit",
     "parse_github_audit",
     "parse_k8s_audit",
     "parse_openai_json",
@@ -1061,15 +1062,22 @@ class ActionReport:
     :ivar matched: Records a receipt explains.
     :ivar phantom: Records of a governed actor that no receipt explains. Any
         one fails the audit.
-    :ivar unobserved: Committed receipts no record names: the system's export
-        is incomplete for the period, or the action did not reach it.
+    :ivar unobserved: Receipts of writes the system should have seen that no
+        record names: the system's export is incomplete for the period, or the
+        action did not reach it. Only receipts in the audit's scope are
+        expected (:func:`reconcile_actions`).
     :ivar ignored: Records of actors the audit does not govern.
+    :ivar out_of_scope: Receipts of actions on another system (a request to
+        another vendor, a write to another substrate), which this export
+        cannot have seen (1.2.0). They still explain any record that names
+        them.
     """
 
     matched: tuple[ActionMatch, ...]
     phantom: tuple[ActionRecord, ...]
     unobserved: tuple[str, ...]
     ignored: int
+    out_of_scope: int = 0
 
     @property
     def passed(self) -> bool:
@@ -1087,12 +1095,18 @@ class Parser:
     :ivar parse: The export's text, and the label its records carry, to its
         records.
     :ivar suffixes: The file extensions ``fmt="auto"`` chooses it for.
+    :ivar system: For an ``actions`` parser that reads one kind of system,
+        the substrate whose writes its log records (``kubernetes``, ``git``,
+        ``fhir``), as receipts name it in ``effect.substrate_id``: the
+        receipts ``agentgov reconcile-actions`` expects it to have seen by
+        default (1.2.0). Empty for a log of any system.
     """
 
     name: str
     kind: str
     parse: Callable[..., tuple[ProviderUsageRecord, ...] | tuple[ActionRecord, ...]]
     suffixes: tuple[str, ...] = ()
+    system: str = ""
 
 
 PARSER_ENTRY_POINTS = "agentgov.parsers"
@@ -1291,6 +1305,71 @@ def parse_github_audit(text: str, *, source: str = "github-audit-json") -> tuple
     return tuple(found)
 
 
+_FHIR_WRITES: Final = {"C": "create", "U": "update", "D": "delete"}
+_FHIR_REFS: Final = frozenset({"X-Request-Id", "X-Correlation-Id"})
+
+
+def _list(value: object) -> list[object]:
+    return list(value) if isinstance(value, list) else []
+
+
+def parse_fhir_audit(text: str, *, source: str = "fhir-auditevent") -> tuple[ActionRecord, ...]:
+    """A FHIR R4 server's ``AuditEvent`` resources (1.2.0): NDJSON, as bulk
+    export writes them, a JSON list, or a ``Bundle``.
+
+    Only writes are actions (``action`` ``C``, ``U`` or ``D``; a read or an
+    operation is not), and only those that succeeded (``outcome`` ``0``, or
+    none recorded): a write the server refused, a ``412 Precondition
+    Failed`` among them, changed nothing. The actor is the requesting agent
+    (``who.identifier.value``, else its reference or display), the resource
+    the first entity's ``what`` without its version. A record's references
+    are the request identifiers the server logged with each entity
+    (``detail`` of type ``X-Request-Id`` or ``X-Correlation-Id``): Interlock's
+    FHIR substrate sends its stage's id in ``X-Request-Id`` on every write.
+    """
+    rows = _json_lines(text, source)
+    if len(rows) == 1 and isinstance(rows[0], Mapping) and rows[0].get("resourceType") == "Bundle":
+        entries = rows[0].get("entry")
+        rows = [_at(e, "resource") for e in entries] if isinstance(entries, list) else []
+    found = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise UsageParseError(f"{source} entry {index}: expected an object")
+        if row.get("resourceType") != "AuditEvent":
+            continue
+        verb = _FHIR_WRITES.get(str(row.get("action") or ""))
+        if verb is None or str(row.get("outcome") or "0") != "0":
+            continue
+        agents = _list(row.get("agent"))
+        agent = next((a for a in agents if _at(a, "requestor") is True), None)
+        if agent is None and agents:
+            agent = agents[0]
+        who = _at(agent, "who")
+        actor = _at(who, "identifier", "value") or _at(who, "reference") or _at(who, "display")
+        entities = _list(row.get("entity"))
+        what = str(_at(entities[0], "what", "reference") or "") if entities else ""
+        refs = [
+            _at(d, "valueString")
+            for e in entities
+            for d in _list(_at(e, "detail"))
+            if _at(d, "type") in _FHIR_REFS
+        ]
+        subtype = _list(row.get("subtype"))
+        named = next((str(_at(c, "code")) for c in subtype if _at(c, "code")), verb)
+        found.append(
+            ActionRecord(
+                record_id=str(row.get("id") or f"{source}#{index}"),
+                timestamp=_parse_timestamp(row.get("recorded")),
+                actor=str(actor or ""),
+                action=named,
+                resource=what.split("/_history/", 1)[0],
+                refs=_texts(*refs),
+                source=source,
+            )
+        )
+    return tuple(found)
+
+
 _FIELDS = ("id", "timestamp", "actor", "action", "resource", "refs")
 
 
@@ -1351,8 +1430,9 @@ for _parser in (
     Parser("openai-json", "usage", parse_openai_json, (".json",)),
     Parser("anthropic-csv", "usage", parse_anthropic_csv, (".csv", ".tsv")),
     Parser("cloudtrail-json", "actions", parse_cloudtrail_json),
-    Parser("k8s-audit-jsonl", "actions", parse_k8s_audit),
-    Parser("github-audit-json", "actions", parse_github_audit),
+    Parser("k8s-audit-jsonl", "actions", parse_k8s_audit, system="kubernetes"),
+    Parser("github-audit-json", "actions", parse_github_audit, system="git"),
+    Parser("fhir-auditevent", "actions", parse_fhir_audit, (".ndjson",), system="fhir"),
     Parser("records", "actions", parse_records, (".json", ".jsonl", ".csv")),
 ):
     register_parser(_parser)
@@ -1416,6 +1496,8 @@ def reconcile_actions(
     records: Iterable[ActionRecord],
     *,
     actors: Iterable[str] = (),
+    substrates: Iterable[str] = (),
+    measurements: Iterable[str] = (),
 ) -> ActionReport:
     """Match a system of record's actions against the agent's receipts.
 
@@ -1424,23 +1506,53 @@ def reconcile_actions(
     :param records: What the system saw (:func:`load_actions`).
     :param actors: The identities the agent acts as. A record of any other
         actor is ignored; with none given, every record must be explained.
+    :param substrates: The systems the export is of (1.2.0): the receipts
+        it should have seen are those of writes to one of them. An action
+        receipt writes to its ``effect.substrate_id`` unless only a request
+        was measured (``request-only``: its effect went to a sink); a
+        delivery receipt is of its sink. With none given, every committed
+        receipt is expected.
+    :param measurements: Likewise, the measurement classes it should have
+        seen (``plan-bound``, ``predicted``...); a delivery receipt is
+        ``request-only``.
     :returns: The report. A record a receipt explains is matched; one of a
-        governed actor that none explains is a phantom.
+        governed actor that none explains is a phantom. Every receipt
+        explains what names it, in scope or not; only one in scope that
+        nothing names is unobserved.
     """
     from agentgov.receipts import ActionReceipt, DeliveryReceipt, OutcomeStatus
+    from agentgov.receipts.schema import REQUEST_ONLY
+
+    systems = frozenset(substrates)
+    classes = frozenset(measurements)
+
+    def in_scope(receipt: ActionReceipt | DeliveryReceipt) -> bool:
+        if isinstance(receipt, DeliveryReceipt):
+            system, measured = receipt.request.sink, REQUEST_ONLY
+        else:
+            measured = receipt.coverage.measurement
+            system = "" if measured == REQUEST_ONLY else receipt.effect.substrate_id
+        return (not systems or system in systems) and (not classes or measured in classes)
 
     owner: dict[str, str] = {}
-    committed: list[str] = []
+    expected: list[str] = []
+    elsewhere = 0
     for receipt in receipts:
         if not isinstance(receipt, ActionReceipt | DeliveryReceipt):
             raise TypeError(f"not an ARC1 receipt: {receipt!r}")
         for ref in receipt_refs(receipt):
             owner.setdefault(ref, receipt.receipt_id)
+        # A compensated plan was written, then put back (ARC1 1.4): the
+        # system saw both, so its log should name it as it names a commit.
         if isinstance(receipt, DeliveryReceipt) or receipt.outcome.status in (
             OutcomeStatus.COMMITTED,
             OutcomeStatus.RECOVERED_COMMITTED,
+            OutcomeStatus.COMPENSATED,
         ):
-            committed.append(receipt.receipt_id)
+            if in_scope(receipt):
+                expected.append(receipt.receipt_id)
+            else:
+                elsewhere += 1
     governed = frozenset(actors)
     matched: list[ActionMatch] = []
     phantom: list[ActionRecord] = []
@@ -1458,23 +1570,33 @@ def reconcile_actions(
     return ActionReport(
         matched=tuple(matched),
         phantom=tuple(phantom),
-        unobserved=tuple(r for r in committed if r not in seen),
+        unobserved=tuple(r for r in expected if r not in seen),
         ignored=ignored,
+        out_of_scope=elsewhere,
     )
 
 
-def format_action_report(report: ActionReport, *, export: str = "") -> str:
-    """Render an :class:`ActionReport` as a terminal summary, without a trailing newline."""
+def format_action_report(report: ActionReport, *, export: str = "", scope: str = "") -> str:
+    """Render an :class:`ActionReport` as a terminal summary, without a trailing newline.
+
+    :param scope: The receipts the export should have seen, in words, when
+        the audit was scoped (1.2.0).
+    """
     lines = ["", "RECONCILIATION  (actions)"]
     if export:
         lines.append(f"  system of record  {export}")
+    if scope:
+        lines.append(f"  receipts expected {scope}")
     lines.append("")
-    for label, count in (
+    rows = [
         ("Matched (seen, and explained by a receipt)", len(report.matched)),
         ("Phantom (seen, explained by NO receipt)", len(report.phantom)),
         ("Unobserved (receipted, not seen)", len(report.unobserved)),
         ("Ignored (another actor)", report.ignored),
-    ):
+    ]
+    if report.out_of_scope:
+        rows.append(("Out of scope (receipted for another system)", report.out_of_scope))
+    for label, count in rows:
         lines.append(f"  {label:<46}{count:>8}")
     if report.phantom:
         lines.append("")
