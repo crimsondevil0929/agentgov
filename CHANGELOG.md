@@ -8,7 +8,7 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
-## [1.2.0] - unreleased
+## [1.2.0] - 2026-11-01
 
 A write put back, and a reconciliation that knows which system it audits.
 Upgrades from 1.1.1 in place, with nothing to do. Every ledger, receipt,
