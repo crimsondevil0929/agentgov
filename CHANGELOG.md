@@ -8,7 +8,9 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
-### 1.1.1: a Kubernetes dry run is no action
+## [1.1.1] - 2026-10-31
+
+A Kubernetes dry run is no action. Upgrades from 1.1.0 in place, with nothing to do.
 
 ### Fixed
 
