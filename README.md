@@ -551,12 +551,24 @@ $ agentgov reconcile-actions receipts.jsonl cloudtrail.json --format cloudtrail-
   AUDIT FAILED  1 phantom action(s)
 ```
 
-It reads AWS CloudTrail, the Kubernetes audit log and GitHub's audit log, and
-any other log as JSON or CSV, given which column is which (`--field
-actor=user --field refs=correlation_id`). Matching is by identifier only,
-never by a guess at time and resource, so a phantom is never a near miss. Each
-format is a parser in a registry that also holds the invoice formats, and a
-package can add its own through the `agentgov.parsers` entry point.
+It reads AWS CloudTrail, the Kubernetes audit log, GitHub's audit log and a
+FHIR server's `AuditEvent` resources (`--format fhir-auditevent`), and any
+other log as JSON or CSV, given which column is which (`--field actor=user
+--field refs=correlation_id`). Matching is by identifier only, never by a
+guess at time and resource, so a phantom is never a near miss. Each format is
+a parser in a registry that also holds the invoice formats, and a package can
+add its own through the `agentgov.parsers` entry point.
+
+A log sees only its own system. A cluster's audit log never sees a request the
+agent sent a cloud API, so it expects only the receipts of writes to the
+cluster: by default, the receipts of writes to the system its format reads
+(`kubernetes`, `git` or `fhir`). Name the scope yourself with `--substrate`
+(a substrate, or a delivery receipt's sink) and `--measurement`, or expect
+every receipt with `--all-receipts`. A receipt outside the scope still
+explains any line that names it, and is counted as out of scope, not as
+unobserved. A write that was put back (a `compensated` receipt, ARC1 1.4) is
+expected in the log like a committed one: the system saw the write and its
+undo.
 
 ## Reading a ledger
 

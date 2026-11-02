@@ -22,9 +22,11 @@ The commands, and the readers each is for:
 
 ``agentgov reconcile-actions <receipts> <export> --format F``
     For security: matches a system of record's actions (CloudTrail, the
-    Kubernetes audit log, GitHub's audit log, any other log as JSON or CSV)
-    against the agent's ARC1 receipts, and reports every action the system
-    saw that no receipt explains. Exits ``1`` on any such phantom.
+    Kubernetes audit log, GitHub's audit log, a FHIR server's AuditEvents, any
+    other log as JSON or CSV) against the agent's ARC1 receipts, and reports
+    every action the system saw that no receipt explains. Exits ``1`` on any
+    such phantom. Only receipts of writes to the system the log records are
+    expected in it (``--substrate``, ``--measurement``, ``--all-receipts``).
 
 ``agentgov repair <ledger>``
     For an operator whose governor refused to open because a cache table
@@ -91,6 +93,7 @@ from agentgov.exceptions import (
 )
 from agentgov.opening import open_url
 from agentgov.receipts import (
+    MEASUREMENTS,
     Check,
     Failure,
     Keyring,
@@ -440,8 +443,30 @@ def _command_reconcile_actions(args: argparse.Namespace, out: TextIO) -> int:
     except (AgentGovError, OSError) as exc:
         out.write(f"FAIL  could not read the evidence\n  {exc}\n")
         return 1
-    report = reconcile_actions(receipts, records, actors=args.actor or ())
-    out.write(format_action_report(report, export=args.export))
+    # The receipts the export should have seen: those of writes to the system
+    # its format reads (a cluster's audit log sees no request to a cloud API),
+    # unless the audit names its scope or asks for every receipt (1.2.0).
+    substrates = list(args.substrate or ())
+    if not substrates and not args.all_receipts:
+        system = parsers("actions")[args.format].system
+        substrates = [system] if system else []
+    measurements = list(args.measurement or ())
+    report = reconcile_actions(
+        receipts,
+        records,
+        actors=args.actor or (),
+        substrates=substrates,
+        measurements=measurements,
+    )
+    scope = " and ".join(
+        part
+        for part in (
+            f"writes to {', '.join(substrates)}" if substrates else "",
+            f"measured {', '.join(measurements)}" if measurements else "",
+        )
+        if part
+    )
+    out.write(format_action_report(report, export=args.export, scope=scope))
     out.write("\n")
     return 0 if report.passed else 1
 
@@ -714,6 +739,26 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME=COLUMN",
         help="for --format records: the column holding a record's id, timestamp, actor, "
         "action, resource or refs",
+    )
+    actions_cmd.add_argument(
+        "--substrate",
+        action="append",
+        metavar="SYSTEM",
+        help="a system the export records writes to (a receipt's effect.substrate_id, or a "
+        "delivery receipt's sink): only receipts of writes to it are expected in the export. "
+        "Default: the system the format reads (kubernetes, git, fhir). Repeat for each",
+    )
+    actions_cmd.add_argument(
+        "--measurement",
+        action="append",
+        choices=MEASUREMENTS,
+        help="a measurement class the export should have seen; receipts of others are not "
+        "expected in it. Repeat for each",
+    )
+    actions_cmd.add_argument(
+        "--all-receipts",
+        action="store_true",
+        help="expect every committed receipt in the export, whatever system it wrote to",
     )
     actions_cmd.set_defaults(handler=_command_reconcile_actions)
 

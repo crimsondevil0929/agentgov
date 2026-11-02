@@ -36,6 +36,7 @@ format is specified in [`docs/RECEIPTS.md`](../../docs/RECEIPTS.md).
   their own (below).
 - `v13/`: ARC1 1.3, measurement classes, quantities in other units and the
   systems that served, in a log of their own (below).
+- `v14/`: ARC1 1.4, the `compensated` outcome, in a log of its own (below).
 - `manifest.json`: every command-line case, and the exit code it must produce.
 
 ## The receipts
@@ -119,6 +120,24 @@ receipt above keeps its bytes:
 a measurement class that does not exist, an empty `quantities`, quantities out
 of order, one unit twice, an empty `served_by`, and `other_tenants` written as
 zero.
+
+## A write put back (ARC1 1.4)
+
+`v14/` is a fifth log, `arc1-vectors-v14`, of two receipts of a medication
+order written to a FHIR server, each `predicted`: the before image read, the
+after image predicted, the write made conditional on the version read, and
+the result read back.
+
+0. `order-predicted`: the read-back matched the prediction: `committed`, its
+   `substrate_txid` the stage id every write carried.
+1. `order-compensated`: the read-back did not match (a rule on the server
+   changed more than the write did), so what was written was put back from
+   the undo recorded before the first write. The outcome is `compensated`,
+   and its `substrate_txid` is the id the writes and their put-back carried,
+   which the server's audit log echoes.
+
+`invalid/` breaks the new outcome one way each: compensated with a decision
+that did not admit the plan, and compensated naming no `substrate_txid`.
 
 ## Running the cases
 

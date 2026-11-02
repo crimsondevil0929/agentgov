@@ -893,6 +893,13 @@ class OutcomeStatus(StrEnum):
     REFUSED = "refused"
     RECOVERED_COMMITTED = "recovered_committed"
     RECOVERED_ABORTED = "recovered_aborted"
+    COMPENSATED = "compensated"
+    """ARC1 1.4: the plan was admitted and written, and did not stand: a write
+    failed part way, or what was read back was not what was measured. What
+    it had written was put back from the undo recorded before the first
+    write, so nothing of it is left. Its ``substrate_txid`` is the id the
+    writes and their put-back carried, so a system of record that logged
+    both ties them to this receipt."""
 
 
 @dataclass(frozen=True)
@@ -1030,11 +1037,25 @@ class ActionReceipt:
                 f"effect.row_count is {self.effect.row_count} but the summary counts "
                 f"{self.effect.summary.total} row changes"
             )
-        committed = (OutcomeStatus.COMMITTED, OutcomeStatus.RECOVERED_COMMITTED)
-        if self.outcome.status in committed and not self.decision.admitted:
+        written = (
+            OutcomeStatus.COMMITTED,
+            OutcomeStatus.RECOVERED_COMMITTED,
+            OutcomeStatus.COMPENSATED,
+        )
+        if self.outcome.status in written and not self.decision.admitted:
             raise MalformedReceiptError(
                 f"outcome is {self.outcome.status.value} but the decision did not admit "
-                f"the plan; a refused plan cannot have committed"
+                f"the plan; a refused plan cannot have "
+                + (
+                    "been written"
+                    if self.outcome.status is OutcomeStatus.COMPENSATED
+                    else "committed"
+                )
+            )
+        if self.outcome.status is OutcomeStatus.COMPENSATED and not self.outcome.substrate_txid:
+            raise MalformedReceiptError(
+                "outcome is compensated but names no substrate_txid: the writes and their "
+                "put-back carried one, and the receipt must name it (ARC1 1.4)"
             )
 
     # -- encoding ---------------------------------------------------------
