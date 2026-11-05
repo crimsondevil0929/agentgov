@@ -746,7 +746,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SYSTEM",
         help="a system the export records writes to (a receipt's effect.substrate_id, or a "
         "delivery receipt's sink): only receipts of writes to it are expected in the export. "
-        "Default: the system the format reads (kubernetes, git, fhir). Repeat for each",
+        "Default: the system the format reads (kubernetes, git, fhir, stripe, sendgrid). "
+        "Repeat for each",
     )
     actions_cmd.add_argument(
         "--measurement",

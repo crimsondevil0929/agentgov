@@ -76,6 +76,8 @@ __all__ = [
     "parse_k8s_audit",
     "parse_openai_json",
     "parse_records",
+    "parse_sendgrid_events",
+    "parse_stripe_events",
     "parsers",
     "receipt_refs",
     "reconcile",
@@ -1383,6 +1385,97 @@ def parse_fhir_audit(text: str, *, source: str = "fhir-auditevent") -> tuple[Act
     return tuple(found)
 
 
+def parse_stripe_events(text: str, *, source: str = "stripe-events") -> tuple[ActionRecord, ...]:
+    """Stripe events (1.3.0): a page of ``GET /v1/events`` (``{"object": "list",
+    "data": [...]}``), a JSON list of events, or one event per line.
+
+    Each event is one record. Its action is the event type (``refund.created``)
+    and its resource is the id of the object in ``data.object``.
+
+    Stripe notes the API request behind most events. When ``request.id`` is
+    set, someone called the API with the account's keys or used the Dashboard,
+    and the actor is ``api``. When it is empty, Stripe acted on its own (a
+    payout, a dispute) and the actor is ``stripe``. To audit an agent's calls,
+    pass ``--actor api``.
+
+    The references are the request's ``idempotency_key``, the request id and
+    the object id. Interlock's ``stripe`` sink sends an idempotency key derived
+    from the plan with every call, and a delivery receipt carries both that key
+    and the object id (``remote_ref``).
+    """
+    rows = _json_lines(text, source)
+    if len(rows) == 1 and isinstance(rows[0], Mapping) and rows[0].get("object") == "list":
+        page = rows[0].get("data")
+        if not isinstance(page, list):
+            raise UsageParseError(f"{source}: a list object's 'data' must be a list")
+        rows = list(page)
+    found = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise UsageParseError(f"{source} event {index}: expected an object")
+        request = row.get("request")
+        if isinstance(request, str):  # API versions before 2017-05-25: the id alone
+            request = {"id": request}
+        request_id = _at(request, "id")
+        obj = _at(row, "data", "object")
+        found.append(
+            ActionRecord(
+                record_id=str(row.get("id") or f"{source}#{index}"),
+                timestamp=_parse_timestamp(row.get("created")),
+                actor="api" if request_id else "stripe",
+                action=str(row.get("type") or ""),
+                resource=str(_at(obj, "id") or ""),
+                refs=_texts(request_id, _at(request, "idempotency_key"), _at(obj, "id")),
+                source=source,
+            )
+        )
+    return tuple(found)
+
+
+_SENDGRID_REFS: Final = ("interlock_idempotency_key", "interlock_message_id")
+
+
+def parse_sendgrid_events(
+    text: str, *, source: str = "sendgrid-events"
+) -> tuple[ActionRecord, ...]:
+    """SendGrid's Event Webhook (1.3.0): the JSON list of events it posts, or one
+    event per line.
+
+    Only ``processed`` events are records: each is one message SendGrid
+    accepted to send. Deliveries, bounces, opens and clicks follow from that
+    same send, so they are not counted again.
+
+    The actor is ``marketing`` for a campaign send (``marketing_campaign_id``)
+    and ``api`` for anything else sent through the API. The resource is the
+    recipient.
+
+    The references are the message id SendGrid returned in ``X-Message-Id`` (the
+    part of ``sg_message_id`` before its first dot), which a delivery receipt
+    carries as its ``remote_ref``, and the ``custom_args`` Interlock's
+    ``sendgrid`` sink adds to every message: ``interlock_idempotency_key`` and
+    ``interlock_message_id``. SendGrid echoes custom args in each event.
+    """
+    found = []
+    for index, row in enumerate(_json_lines(text, source)):
+        if not isinstance(row, Mapping):
+            raise UsageParseError(f"{source} event {index}: expected an object")
+        if row.get("event") != "processed":
+            continue
+        message = str(row.get("sg_message_id") or "")
+        found.append(
+            ActionRecord(
+                record_id=str(row.get("sg_event_id") or f"{source}#{index}"),
+                timestamp=_parse_timestamp(row.get("timestamp")),
+                actor="marketing" if row.get("marketing_campaign_id") else "api",
+                action="mail.send",
+                resource=str(row.get("email") or ""),
+                refs=_texts(message.split(".", 1)[0], *(row.get(k) for k in _SENDGRID_REFS)),
+                source=source,
+            )
+        )
+    return tuple(found)
+
+
 _FIELDS = ("id", "timestamp", "actor", "action", "resource", "refs")
 
 
@@ -1446,6 +1539,8 @@ for _parser in (
     Parser("k8s-audit-jsonl", "actions", parse_k8s_audit, system="kubernetes"),
     Parser("github-audit-json", "actions", parse_github_audit, system="git"),
     Parser("fhir-auditevent", "actions", parse_fhir_audit, (".ndjson",), system="fhir"),
+    Parser("stripe-events", "actions", parse_stripe_events, system="stripe"),
+    Parser("sendgrid-events", "actions", parse_sendgrid_events, system="sendgrid"),
     Parser("records", "actions", parse_records, (".json", ".jsonl", ".csv")),
 ):
     register_parser(_parser)

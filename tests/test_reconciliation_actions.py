@@ -37,6 +37,8 @@ from agentgov.reconciliation import (
     parse_github_audit,
     parse_k8s_audit,
     parse_records,
+    parse_sendgrid_events,
+    parse_stripe_events,
     parsers,
     receipt_refs,
     reconcile_actions,
@@ -485,3 +487,117 @@ def test_reconcile_actions_scopes_to_the_system_its_format_reads(tmp_path: Path)
     out = io.StringIO()
     assert main([*base, "--measurement", "predicted", "--substrate", "fhir"], out=out) == 0
     assert "writes to fhir and measured predicted" in out.getvalue()
+
+
+def _stripe_event(n: int, kind: str, request: object, obj: str) -> dict[str, Any]:
+    return {
+        "id": f"evt_{n}",
+        "object": "event",
+        "type": kind,
+        "created": 1793700000 + n,
+        "data": {"object": {"id": obj, "object": kind.split(".", 1)[0]}},
+        "request": request,
+    }
+
+
+def test_stripe_events_carry_the_relays_idempotency_key() -> None:
+    key = DELIVERY.request.idempotency_key
+    events = [
+        _stripe_event(1, "refund.created", {"id": "req_1", "idempotency_key": key}, "re_9"),
+        _stripe_event(2, "charge.refunded", {"id": "req_1", "idempotency_key": key}, "ch_1"),
+        _stripe_event(3, "refund.created", {"id": "req_2", "idempotency_key": None}, "re_8"),
+        _stripe_event(4, "payout.paid", {"id": None, "idempotency_key": None}, "po_1"),
+        _stripe_event(5, "refund.created", "req_old", str(DELIVERY.delivery.remote_ref)),
+    ]
+    page = {"object": "list", "data": events, "has_more": False}
+    found = parse_stripe_events(json.dumps(page))
+    assert [(r.record_id, r.actor, r.action, r.resource) for r in found] == [
+        ("evt_1", "api", "refund.created", "re_9"),
+        ("evt_2", "api", "charge.refunded", "ch_1"),
+        ("evt_3", "api", "refund.created", "re_8"),
+        ("evt_4", "stripe", "payout.paid", "po_1"),
+        ("evt_5", "api", "refund.created", DELIVERY.delivery.remote_ref),
+    ]
+    assert found[0].refs == tuple(sorted((key, "re_9", "req_1")))
+    assert found[0].timestamp == datetime.fromtimestamp(1793700001, tz=UTC)
+    report = reconcile_actions([DELIVERY], found, actors=["api"], substrates=["payments"])
+    assert [r.record_id for r in report.phantom] == ["evt_3"], "a refund no receipt explains"
+    assert {m.record.record_id for m in report.matched} == {"evt_1", "evt_2", "evt_5"}
+    assert report.unobserved == () and report.ignored == 1
+    lines = "\n".join(json.dumps(e) for e in events[:2])
+    assert len(parse_stripe_events(lines)) == 2
+    with pytest.raises(UsageParseError, match="'data' must be a list"):
+        parse_stripe_events(json.dumps({"object": "list", "data": 1}))
+    with pytest.raises(UsageParseError, match="event 0: expected an object"):
+        parse_stripe_events("[1]")
+    assert parsers("actions")["stripe-events"].system == "stripe"
+
+
+def _sendgrid_event(n: int, event: str, message: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "email": f"user{n}@example.com",
+        "timestamp": 1793700000 + n,
+        "event": event,
+        "sg_event_id": f"sg-{n}",
+        "sg_message_id": f"{message}.filterdrecv-1.0",
+        **extra,
+    }
+
+
+def test_sendgrid_processed_events_carry_the_relays_custom_args() -> None:
+    key = DELIVERY.request.idempotency_key
+    ours = {"interlock_idempotency_key": key, "interlock_message_id": "m-1"}
+    events = [
+        _sendgrid_event(1, "processed", "msg-a", **ours),
+        _sendgrid_event(2, "delivered", "msg-a", **ours),  # the same send, not a new action
+        _sendgrid_event(3, "processed", "msg-b"),  # sent around the relay
+        _sendgrid_event(4, "processed", "msg-c", marketing_campaign_id=7),
+        _sendgrid_event(5, "processed", str(DELIVERY.delivery.remote_ref)),
+    ]
+    found = parse_sendgrid_events(json.dumps(events))
+    assert [(r.record_id, r.actor, r.action, r.resource) for r in found] == [
+        ("sg-1", "api", "mail.send", "user1@example.com"),
+        ("sg-3", "api", "mail.send", "user3@example.com"),
+        ("sg-4", "marketing", "mail.send", "user4@example.com"),
+        ("sg-5", "api", "mail.send", "user5@example.com"),
+    ]
+    assert found[0].refs == tuple(sorted((key, "m-1", "msg-a")))
+    report = reconcile_actions([DELIVERY], found, actors=["api"])
+    assert [r.record_id for r in report.phantom] == ["sg-3"]
+    assert [m.record.record_id for m in report.matched] == ["sg-1", "sg-5"]
+    assert report.ignored == 1
+    with pytest.raises(UsageParseError, match="event 0: expected an object"):
+        parse_sendgrid_events("[1]")
+    assert parsers("actions")["sendgrid-events"].system == "sendgrid"
+
+
+def test_the_cli_reads_a_stripe_export(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    receipts = tmp_path / "receipts.jsonl"
+    receipts.write_bytes(canonical_bytes(DELIVERY.to_json()) + b"\n")
+    key = DELIVERY.request.idempotency_key
+    export = tmp_path / "events.json"
+    export.write_text(
+        json.dumps(
+            {
+                "object": "list",
+                "data": [
+                    _stripe_event(1, "refund.created", {"id": "r1", "idempotency_key": key}, "x"),
+                    _stripe_event(2, "refund.created", {"id": "r2"}, "y"),
+                ],
+            }
+        )
+    )
+    argv = [
+        "reconcile-actions",
+        str(receipts),
+        str(export),
+        "--format",
+        "stripe-events",
+        "--actor",
+        "api",
+        "--substrate",
+        "payments",
+    ]
+    assert main(argv) == 1
+    out = capsys.readouterr().out
+    assert "AUDIT FAILED  1 phantom action(s)" in out and "refund.created" in out

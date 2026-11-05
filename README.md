@@ -551,24 +551,43 @@ $ agentgov reconcile-actions receipts.jsonl cloudtrail.json --format cloudtrail-
   AUDIT FAILED  1 phantom action(s)
 ```
 
-It reads AWS CloudTrail, the Kubernetes audit log, GitHub's audit log and a
-FHIR server's `AuditEvent` resources (`--format fhir-auditevent`), and any
-other log as JSON or CSV, given which column is which (`--field actor=user
---field refs=correlation_id`). Matching is by identifier only, never by a
-guess at time and resource, so a phantom is never a near miss. Each format is
-a parser in a registry that also holds the invoice formats, and a package can
-add its own through the `agentgov.parsers` entry point.
+Supported formats:
 
-A log sees only its own system. A cluster's audit log never sees a request the
-agent sent a cloud API, so it expects only the receipts of writes to the
-cluster: by default, the receipts of writes to the system its format reads
-(`kubernetes`, `git` or `fhir`). Name the scope yourself with `--substrate`
-(a substrate, or a delivery receipt's sink) and `--measurement`, or expect
-every receipt with `--all-receipts`. A receipt outside the scope still
-explains any line that names it, and is counted as out of scope, not as
-unobserved. A write that was put back (a `compensated` receipt, ARC1 1.4) is
-expected in the log like a committed one: the system saw the write and its
-undo.
+| `--format` | Source | What counts as an action |
+|---|---|---|
+| `cloudtrail-json` | AWS CloudTrail | every recorded API call |
+| `k8s-audit-jsonl` | Kubernetes audit log | writes to the API server |
+| `github-audit-json` | GitHub audit log | pushes, merges and settings changes |
+| `fhir-auditevent` | a FHIR server's `AuditEvent` resources | successful creates, updates and deletes |
+| `stripe-events` | Stripe's Events API | every event; `api` when a request caused it |
+| `sendgrid-events` | SendGrid's Event Webhook | each `processed` message |
+| `records` | any JSON or CSV log | every row; map the columns with `--field` |
+
+Matching uses identifiers only. The tool never guesses from timestamps or
+resource names, so a phantom is never a near miss. Stripe and SendGrid are
+matched through the delivery receipts Interlock's relay writes: Stripe logs
+the `Idempotency-Key` the relay sends with each call, and SendGrid echoes the
+`custom_args` the relay adds to each message. Each format is a parser in a
+registry. A package can add its own through the `agentgov.parsers` entry
+point.
+
+Each export only covers one system. A cluster's audit log can't see a request
+the agent sent to Stripe, so by default it is only checked against receipts
+for writes to the cluster. The default system comes from the format
+(`kubernetes`, `git`, `fhir`, `stripe` or `sendgrid`). To set it yourself,
+pass `--substrate`, which takes a substrate or the sink a delivery receipt
+names, and `--measurement`. To check against every receipt, pass
+`--all-receipts`. A receipt for another system still explains any line that
+names it; the report counts it as out of scope rather than unobserved. A
+write that was put back (a `compensated` receipt, ARC1 1.4) is expected in the
+log like a committed one, because the system saw both the write and its undo.
+
+For example, the refunds an agent made through Stripe:
+
+```
+$ agentgov reconcile-actions receipts.jsonl events.json --format stripe-events \
+      --actor api --substrate payments
+```
 
 ## Reading a ledger
 
