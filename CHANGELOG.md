@@ -8,7 +8,7 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
-## [1.3.0] - unreleased
+## [1.3.0] - 2026-11-05
 
 Two vendor logs that `reconcile-actions` can read. Upgrades from 1.2.0 in place,
 with nothing to do.
