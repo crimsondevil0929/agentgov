@@ -8,6 +8,27 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-05
+
+Two vendor logs that `reconcile-actions` can read. Upgrades from 1.2.0 in place,
+with nothing to do.
+
+### Added
+
+- **`--format stripe-events`** (`parse_stripe_events`) reads Stripe's Events API:
+  a `GET /v1/events` page, a JSON list, or one event per line.
+  - Each event is one action.
+  - The actor is `api` when a request caused the event, and `stripe` when Stripe
+    acted on its own.
+  - Its references are the request's idempotency key, the request id and the
+    object id. These match a delivery receipt's idempotency key and `remote_ref`.
+- **`--format sendgrid-events`** (`parse_sendgrid_events`) reads SendGrid's Event
+  Webhook.
+  - Each `processed` event is one sent message.
+  - Its references are the message id and the `custom_args` Interlock's
+    `sendgrid` sink adds to every message.
+- The README lists every action format in one table, and reads in plain sentences.
+
 ## [1.2.0] - 2026-11-01
 
 A write put back, and a reconciliation that knows which system it audits.
