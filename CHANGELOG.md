@@ -27,7 +27,7 @@ with nothing to do.
   - Each `processed` event is one sent message.
   - Its references are the message id and the `custom_args` Interlock's
     `sendgrid` sink adds to every message.
-- The README lists every action format in one table.
+- The README lists every action format in one table, and reads in plain sentences.
 
 ## [1.2.0] - 2026-11-01
 
