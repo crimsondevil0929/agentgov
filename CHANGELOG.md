@@ -8,6 +8,24 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-06
+
+Documentation and package metadata only. No code changes, and nothing to do to upgrade.
+
+### Changed
+
+- **The README is the front door.** It opens with how AgentGov, Interlock and Fiduciary fit
+  together, and links to the live console. It keeps the problem, the benchmark, the quickstart
+  and an index of the docs, and is down from 1,150 lines to under 200.
+- **The rest moved, verbatim, to `docs/GUIDE.md`**: live API metering, the cognitive breaker,
+  the adapters, reconciliation, ARC1 receipts, durability, the core primitives, the known
+  limitations and the roadmap. `test_readme_snippets` now runs every Python block in both
+  files, all 16 of them, as it ran the README's before.
+- **The development status is "4 - Beta",** not "5 - Production/Stable". AgentGov has a full
+  test suite and a stable API, but no external production deployment yet.
+- **The PyPI page links to** the live console, the guide, the repository, the issue tracker
+  and the changelog.
+
 ## [1.3.0] - 2026-11-05
 
 Two vendor logs that `reconcile-actions` can read. Upgrades from 1.2.0 in place,

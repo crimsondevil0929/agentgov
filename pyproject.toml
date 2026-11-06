@@ -1,6 +1,6 @@
 [project]
 name = "interlock-agentgov"
-version = "1.3.0"
+version = "1.3.1"
 description = "Runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,7 +18,7 @@ keywords = [
     "governance",
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
@@ -58,7 +58,8 @@ otel = ["opentelemetry-api>=1.27"]
 agentgov = "agentgov.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/crimsondevil0929/agentgov"
+Homepage = "https://crimsondevil0929.github.io/fiduciary/"
+Documentation = "https://github.com/crimsondevil0929/agentgov/blob/main/docs/GUIDE.md"
 Repository = "https://github.com/crimsondevil0929/agentgov"
 Issues = "https://github.com/crimsondevil0929/agentgov/issues"
 Changelog = "https://github.com/crimsondevil0929/agentgov/blob/main/CHANGELOG.md"
