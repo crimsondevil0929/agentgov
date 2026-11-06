@@ -1,0 +1,977 @@
+# The AgentGov guide
+
+Everything about using AgentGov that the [README](../../README.md) leaves out: live API metering, the cognitive breaker, putting it into an agent, the framework adapters, reconciliation, ARC1 receipts, durability and PostgreSQL, the core primitives, and the known limitations. Every Python block here runs in CI, as the README's do.
+
+## Live API metering
+
+The benchmark above runs against a deterministic stub. That's the right harness for
+proving accounting invariants, and the wrong one for proving anything about a real
+provider. [`scripts/generate_real_usage.py`](../scripts/generate_real_usage.py) covers the
+real provider. It runs four governed workloads across four Anthropic model tiers through
+the official `anthropic` SDK, and writes every raw response payload to disk as evidence.
+
+```
++-----------+---------------------------+-------+--------+---------+-------------+-----------+
+| TIER      | MODEL SERVED              | CALLS | IN TOK | OUT TOK | COST        | HALTED BY |
++-----------+---------------------------+-------+--------+---------+-------------+-----------+
+| runaway   | claude-haiku-4-5-20251001 | 3     | 54     | 384     | $0.00197400 | cognitive |
+| workhorse | claude-sonnet-5           | 3     | 112    | 426     | $0.00448400 | -         |
+| analyst   | claude-opus-5             | 1     | 124    | 900     | $0.02312000 | -         |
+| heavy     | claude-fable-5-1          | 1     | 155    | 407     | $0.02190000 | -         |
++-----------+---------------------------+-------+--------+---------+-------------+-----------+
+| TOTAL     |                           | 8     | 445    | 2,117   | $0.05147800 |           |
++-----------+---------------------------+-------+--------+---------+-------------+-----------+
+
+  ledger settled total      $0.05147800
+  independent re-price      $0.05147800
+  drift                     $0E-8  (MATCH)
+  verify_integrity()        PASS - 33 entries chained
+```
+
+Recorded with v0.1.1. From v0.1.2 the runaway tier's halt is itself a zero-value entry
+in the chain, so the same run chains one entry more.
+
+**Pricing is exact.** Every settled call is priced a second time, straight from the
+published rates, and compared with what the ledger captured.
+Across 445 input and 2,117 output tokens on four different price tiers the drift is
+**$0.00000000**. The metering path reads a real `usage` object and turns it into the
+same number twice, independently. `anthropic` 1.6.0; `claude-fable-5-1` served natively.
+
+**The cognitive breaker fires on live traffic.** Tier 1 drives a thrashing loop: four
+cosmetically edited restatements of one request. It halted after **3 executed calls and
+$0.001974**, then refused 5 retries with no balance movement at all. Tier 2, a three-step
+workflow that does make progress, ran to completion untouched. The detector tells the two
+apart rather than halting whatever runs longest.
+
+**This run found two real bugs.** Against the live API the
+breaker initially did *not* fire, despite the loop being obvious. Two defects, both
+invisible to a stub-backed test suite:
+
+1. **The result comparison was measuring the SDK envelope, not the answer.** Rendering an
+   `anthropic.types.Message` through `repr` meant most of the compared characters were
+   `Message(id=…`, `TextBlock(citations=None, type='text'…`, `usage=Usage(…)`:
+   boilerplate every response from that SDK shares. Two *completely unrelated* answers
+   scored 0.42 while two genuinely progressing ones scored 0.48: no usable signal.
+   `extract_result_text()` now pulls the prose out first, which roughly doubled the
+   separation between thrashing and progress (1.20x → 1.81x).
+2. **`result_similarity_threshold` was calibrated on templated stub output.** Real prose
+   that means the same thing shares far fewer character trigrams than two renderings of
+   one template. The inherited `0.70` detected **0 of 4** thrashing trajectories against
+   live traffic.
+
+[`scripts/calibrate_result_threshold.py`](../scripts/calibrate_result_threshold.py) is the
+reproducible recalibration: 36 measured pairs across thrashing, pagination, and traffic
+that makes progress. The main finding is that **the per-pair distributions overlap**
+(thrashing 0.32–0.66, pagination 0.13–0.88), so no single-pair threshold separates them.
+The *streak* requirement does. Pagination's similarity jumps around, while thrashing's
+stays high. Sweeping the real rule, `0.25`–`0.30` catches 4 of 4 thrashing trajectories
+with no false positives in either control family, and `0.20` starts to flag pagination.
+The shipped default is **`0.30`**, the conservative end of that range.
+
+Reproduce it. This spends real money, so rehearse first:
+
+```bash
+export BENCHMARK_API_KEY=sk-ant-...        # never falls back to ANTHROPIC_API_KEY
+uv run python scripts/generate_real_usage.py --dry-run   # free rehearsal, no network
+uv run python scripts/generate_real_usage.py             # ~$0.05
+uv run python scripts/calibrate_result_threshold.py      # ~$0.03
+```
+
+The full write-up is in [`ARCHITECTURE.md`, Part A](../ARCHITECTURE.md#part-a-the-simulation-gap),
+which covers envelope dominance, prose entropy, and why no constant separates the per-pair
+distributions.
+
+Every call carries an explicit `max_tokens`, the whole run executes inside a $1.50
+AgentGov envelope, and the runaway loop has a hardcoded counter that breaks at four
+iterations, so even a regression in the breaker can't run away. Raw payloads, the cost
+summary, the ledger and the metering journal are written to timestamped files under
+`benchmarks/live_data/`, which is gitignored because those files are evidence, not
+repository content.
+
+---
+
+## The cognitive circuit breaker
+
+The financial breaker reacts after the fact. It fires when the money is already gone. The
+cognitive breaker targets the cause, an agent repeating itself without progress. Attach one
+and every call is checked for thrashing *before* its hold is placed:
+
+<!-- readme-test: skip reason="calls a live model provider" -->
+```python
+from agentgov import BudgetManager, CognitiveBreaker, Interceptor, money
+
+gov = BudgetManager()
+gov.open_root("researcher", money("5.00"))
+breaker = CognitiveBreaker(manager=gov)  # trips latch the financial breaker too
+
+metered = Interceptor(gov, "researcher", model="claude-opus-5", cognitive=breaker)
+metered.invoke(client.messages.create, model="claude-opus-5", messages=[...])
+# agentgov.exceptions.AgentThrashingError: Agent thrashing halted for scope 'researcher'
+#   after 4 calls [deterministic/near_duplicate, confidence 0.78]: 4 consecutive
+#   near-identical calls with no semantic progress
+```
+
+**Two tiers, one actuator.**
+
+*Tier 1 runs inline and is deterministic.* Three stateless detectors over a bounded
+ring buffer: `ExactRepeatDetector` (identical fingerprints), `NearDuplicateDetector`
+(character-shingle Jaccard between consecutive calls, the soft loop), and
+`CallCycleDetector` (an A→B→A→B oscillation that no pairwise check can see). Measured
+overhead is **77µs mean / 122µs p99** even with pathological 8KB arguments, roughly
+0.005% of a real model call. Arguments are truncated before shingling and comparisons
+are window-capped, so the cost is bounded rather than merely small.
+
+*Tier 2 runs off-thread and looks at meaning.* A daemon worker drains a bounded queue and
+runs a `SemanticObserver`. The shipped `TrajectoryEntropyObserver` tracks novelty decay,
+the fraction of each call made of vocabulary the trajectory hasn't produced before. An
+agent cycling through six phrasings of one idea has low pairwise similarity but almost no
+novelty. **The agent thread never waits for it.** A verdict is latched and enforced on the
+*next* call, so detection is one call late instead of blocking, and a full queue drops
+samples instead of applying backpressure. An LLM-judge observer plugs in here: implement
+`evaluate()` and change nothing else.
+
+A cognitive trip calls `BudgetManager.trip()`, so it inherits latching, subtree
+propagation, hash-anchored control events and durable persistence from the existing
+machinery. There's one halt mechanism, with two kinds of sensor feeding it. The verdict is
+computed under the cognitive lock, and the financial lock is taken only after that lock is
+released, so the two are never held together and lock ordering can't deadlock.
+
+**Extending it.** `LoopDetector` and `SemanticObserver` are Protocols. A detector that knows
+your tool schema will beat any generic text heuristic. Pass `detectors=[...]` to extend or
+replace the built-ins. A detector that raises is logged and skipped, so one bad custom
+heuristic weakens detection instead of breaking production traffic.
+
+**What it keeps.** Nothing readable, by default. Each observed call is reduced to a
+*salted* BLAKE2b digest (the salt is per-instance, so a digest is not a lookup key for a
+known prompt) plus a bounded set of character trigrams. Readable text is retained only
+under an explicit `CognitivePolicy(retain_arguments=True)`, and is truncated even then.
+For regulated data, install a `Redactor`. It runs at the single ingress every argument
+and result passes through, before anything is fingerprinted or stored, and a redactor
+that raises causes the text to be dropped entirely rather than retained unredacted.
+[`SECURITY.md`](../SECURITY.md) is the full data map: what lands in SQLite, in memory, and
+in logs, and what encryption at rest AgentGov does *not* provide.
+
+**Where it falls short.** Legitimate iteration (pagination, mapping over a list) looks like
+a soft loop if you only compare *inputs*. The result tells them apart. Near-identical
+inputs that produce near-identical outputs are thrashing. Near-identical inputs that
+produce different outputs are progress. The `Interceptor` feeds results back
+automatically, which handles the common case. It still can't see through a *templated*
+result whose only variation is an index (`record-1-0`, `record-2-0`). Those look nearly
+identical in trigram space even though the agent is advancing. A
+[test pins that limitation](../tests/test_cognitive_breaker.py), along with the fixes:
+`CognitivePolicy(exempt_tools={"fetch"})`, a higher threshold, or a custom detector.
+
+## Dropping it in
+
+`invoke()` is the primitive, and it stays the contract. But adopting it in an
+existing codebase means editing every call site, so there is a wrapper that
+governs the calls already written:
+
+<!-- readme-test: skip reason="calls a live model provider" -->
+```python
+import anthropic
+
+from agentgov import govern
+
+client = govern(anthropic.Anthropic(), gov, "researcher", model="claude-opus-5")
+
+response = client.messages.create(model="claude-opus-5", messages=[...])  # unchanged
+print(client.agentgov.last_call.cost)
+```
+
+The proxy returns exactly what the SDK returns, because anything else would not
+be a drop-in, and forwards everything that is not a model call untouched. It is
+sugar over `client.agentgov.interceptor`, which hands the primitive back.
+
+**Streaming**, the shape most real agents use, is governed as a context manager:
+
+<!-- readme-test: skip reason="calls a live model provider" -->
+```python
+with client.messages.stream(model="claude-opus-5", messages=[...]) as events:
+    for event in events:
+        render(event)
+print(events.cost)
+```
+
+The hold is resolved on *every* path out of that block: clean exhaustion, `break`, an
+exception, or a timeout. An abandoned stream never strands funds. When a stream is
+abandoned, it settles at whatever usage was actually observed rather than voiding the
+hold, because those tokens were generated and billed, and a spend governor that forgot them
+would under-report. Only a stream that produced no usage at all is voided. `astream()` is
+the async equivalent.
+
+**Holds are sized from the payload.** A static worst-case hold is wrong in both
+directions, and *too small* is the dangerous one. An under-reserved hold doesn't
+encumber enough, so concurrent callers all pass the pre-flight check and then settle for
+more than they reserved. Measured on a
+150K-character prompt with ten concurrent callers, static holds **breached a
+$1.00 envelope by 2.3x**; payload-derived holds bounded it. Input tokens are
+estimated from character length, the output bound is taken from the call's
+own `max_tokens`, and a configurable `safety_buffer` (1.5x by default)
+absorbs the heuristic's error. Unrecognised payloads fall back to the static
+ceiling rather than under-reserving.
+
+### When the cost is only known part-way through
+
+`invoke()` covers a call that returns once. When the cost emerges as you
+consume something — a stream you must settle whatever it produced before
+re-raising, or a vendor call that reports usage out of band — `SpendGuard` is
+the same authorize/settle pair as a context manager:
+
+```python
+from decimal import Decimal
+
+from agentgov import BudgetManager, SpendGuard, money
+
+gov = BudgetManager()
+gov.open_root("researcher", money("5.00"))
+
+with SpendGuard(gov, "researcher", money("0.25"), memo="batch") as guard:
+    consumed = sum(len(chunk) for chunk in ["alpha", "beta", "gamma"])
+    guard.settle(Decimal(consumed) / 1000)
+
+print(guard.cost, gov.available("researcher"))
+# 0.013 4.987
+```
+
+The hold is placed on entry and resolved on every path out, including an exception, so an
+abandoned block never strands funds. Settling twice raises instead of double-booking.
+
+### Verifying a ledger
+
+Three checks, all on the manager:
+
+```python
+from agentgov import BudgetManager, money
+
+gov = BudgetManager()
+gov.open_root("orchestrator", money("5.00"))
+gov.delegate("orchestrator", "researcher", money("1.00"))
+
+gov.verify_chain()  # every SHA-256 link, running balance and hold release
+gov.verify_conservation()  # no money created, destroyed or double-counted
+gov.verify_integrity()  # both, plus the tree and breaker state the chain implies
+print("ok")
+```
+
+Each hold release names the hold it releases (its `ref`, inside the hash), so
+`verify_chain()` proves no hold was released twice, into the wrong scope, or for the
+wrong amount. Breaker trips, resets and every delegation are entries in the chain too,
+so `verify_integrity()` re-derives the tree and the breakers from the chain instead of
+trusting the tables that cache them.
+
+`verify_conservation()` checks
+
+```
+Σ(scope balances) + outstanding_holds + settled_spend − reversals == funded
+```
+
+across every scope in the tree.
+
+## Framework adapters
+
+Two lines on an agent you have already written. Neither adapter imports its
+framework. Every object is duck-typed, so they load without LangChain or
+CrewAI installed and keep working when those libraries reshuffle internals.
+
+<!-- readme-test: skip reason="needs langchain installed; agentgov does not depend on it" -->
+```python
+from agentgov.adapters.langchain import GovernedChatModel
+
+model = GovernedChatModel(ChatAnthropic(model="claude-opus-5"), gov, "researcher")
+answer = model.invoke(messages)  # unchanged call site, now metered
+```
+
+For **LangGraph**, or any chain deep enough that you never touch the model
+object, use the callback handler instead. Callbacks propagate down the whole
+run tree, so one handler governs every model call in a graph, keyed by
+`run_id` so concurrent branches settle independently:
+
+<!-- readme-test: skip reason="needs langgraph installed; agentgov does not depend on it" -->
+```python
+from agentgov.adapters.langchain import GovernedCallbackHandler
+
+graph.invoke(state, config={"callbacks": [GovernedCallbackHandler(gov, "researcher")]})
+```
+
+**CrewAI** settles per run, because CrewAI reports usage per run:
+
+<!-- readme-test: skip reason="needs crewai installed; agentgov does not depend on it" -->
+```python
+from agentgov.adapters.crewai import GovernedCrew
+
+crew = GovernedCrew(Crew(agents=[...], tasks=[...]), gov, "research-crew")
+result = crew.kickoff()
+```
+
+Two details these get right that are easy to get wrong. LangChain **swallows
+exceptions raised inside callbacks** unless the handler sets
+`raise_error = True`. Without it a denial-of-wallet halt would be logged and
+the graph would keep spending. And CrewAI's `usage_metrics` are **cumulative across
+kickoffs**, so settling the reported total on every run would bill run one again on run
+two. `GovernedCrew` charges only the difference.
+
+For a framework with no adapter, `govern_agent` wraps any function that runs a
+unit of agent work, given a callable that reads usage off its return value.
+
+## Reconciling the invoice
+
+The question a finance or security team actually asks is not "what did we
+budget?" but *"the provider billed us $40,000. Which agent caused it, and is
+there anything on there we never authorized?"*
+
+```bash
+$ agentgov reconcile governor.db provider_invoice.json --journal tokens.jsonl
+
+  CATEGORY                             COUNT             SPEND
+  ------------------------------------------------------------
+  Matched (billed and metered)             6         $0.034423
+  Discrepant (cost mismatch)               0         $0.000000
+  Phantom (billed, NOT metered)            1         $2.470000
+  Unsettled (metered, not billed)          0         $0.000000
+
+  PHANTOM CALLS - billed with no local authorization
+    2026-09-14 06:42:29  claude-opus-5   $2.470000  req_LEAKED_KEY_7f3a
+
+  AUDIT FAILED  1 phantom call(s) worth $2.470000
+```
+
+A **phantom** is the finding that matters: spend the provider billed that AgentGov never
+authorized, such as a leaked key or a service calling the model outside the governor. Any
+phantom line makes the command exit `1`, so it belongs in a pipeline.
+
+Matching is fuzzy on purpose. Timestamps drift with network latency, and token counts
+drift because pre-flight sizing is a `chars/4` heuristic, so exact matching would report a
+healthy ledger as broken. The tolerances are configurable (`--time-tolerance`,
+`--token-tolerance`, `--cost-tolerance`).
+
+Token counts come from a `MeteringJournal`, an additive sidecar. The ledger
+records money and structure and deliberately not token metadata. Without a
+journal reconciliation still runs on cost and time, and says so.
+
+### Reconciling what another system saw
+
+An invoice says what was billed. A cloud's audit trail, a cluster's audit log,
+a code host's audit log, or a clinical or ERP system's access log says what was
+*done*. `agentgov reconcile-actions` matches one of those against the agent's
+receipts. Every action the system saw is either explained by a receipt, because
+both carry the same identifier (the receipt's id, its stage, the commit it
+made, or the idempotency key the relay sent), or it's a phantom, an action no
+receipt accounts for. A phantom means a shadow agent, a leaked credential, or a
+person working around the agent.
+
+```console
+$ agentgov reconcile-actions receipts.jsonl cloudtrail.json --format cloudtrail-json \
+      --actor arn:aws:sts::111122223333:assumed-role/sre-remediator/agent
+
+  Matched (seen, and explained by a receipt)           41
+  Phantom (seen, explained by NO receipt)               1
+  Unobserved (receipted, not seen)                      0
+  Ignored (another actor)                             312
+
+  PHANTOM ACTIONS - seen by the system, with no receipt
+    2026-10-30 03:12:09  arn:aws:sts::...:agent   ec2.amazonaws.com:RunInstances
+
+  AUDIT FAILED  1 phantom action(s)
+```
+
+Supported formats:
+
+| `--format` | Source | What counts as an action |
+|---|---|---|
+| `cloudtrail-json` | AWS CloudTrail | every recorded API call |
+| `k8s-audit-jsonl` | Kubernetes audit log | writes to the API server |
+| `github-audit-json` | GitHub audit log | pushes, merges and settings changes |
+| `fhir-auditevent` | a FHIR server's `AuditEvent` resources | successful creates, updates and deletes |
+| `stripe-events` | Stripe's Events API | every event; `api` when a request caused it |
+| `sendgrid-events` | SendGrid's Event Webhook | each `processed` message |
+| `records` | any JSON or CSV log | every row; map the columns with `--field` |
+
+Matching uses identifiers only. The tool never guesses from timestamps or
+resource names, so a phantom is never a near miss. Stripe and SendGrid are
+matched through the delivery receipts Interlock's relay writes: Stripe logs
+the `Idempotency-Key` the relay sends with each call, and SendGrid echoes the
+`custom_args` the relay adds to each message. Each format is a parser in a
+registry. A package can add its own through the `agentgov.parsers` entry
+point.
+
+Each export only covers one system. A cluster's audit log can't see a request
+the agent sent to Stripe, so by default it is only checked against receipts
+for writes to the cluster. The default system comes from the format
+(`kubernetes`, `git`, `fhir`, `stripe` or `sendgrid`). To set it yourself,
+pass `--substrate`, which takes a substrate or the sink a delivery receipt
+names, and `--measurement`. To check against every receipt, pass
+`--all-receipts`. A receipt for another system still explains any line that
+names it, and the report counts it as out of scope rather than unobserved. A
+write that was put back (a `compensated` receipt, ARC1 1.4) is expected in the
+log like a committed one, because the system saw both the write and its undo.
+
+For example, the refunds an agent made through Stripe:
+
+```
+$ agentgov reconcile-actions receipts.jsonl events.json --format stripe-events \
+      --actor api --substrate payments
+```
+
+## Reading a ledger
+
+```
+$ agentgov inspect governor.db
+BALANCE TREE
+  orchestrator  available $3.00000000  of $5.00000000
+  `- researcher  available $1.48349000  of $2.00000000
+     `- scraper  available $0.49248500  of $0.50000000   [HALTED by scraper]
+
+$ agentgov verify governor.db
+  ok    hash chain, balances + hold pairing
+  ok    conservation identity
+  ok    topology + breakers, derived from the chain
+
+PASS  governor.db  (14 entries verified; head 56d879d72557ec6e)
+```
+
+`verify` exits `0` on PASS and `1` on FAIL, so it drops straight into a pipeline to check
+that an archived ledger is intact. Both commands open the database **read-only**, so
+they're safe to run against a live governor that holds the write claim. `agentgov repair
+governor.db` is the only command that writes (see [Durability](#durability)).
+
+## Action receipts (ARC1)
+
+*Unreleased, on the v0.2 line: `agentgov.receipts` and `agentgov verify-receipt`.*
+
+A ledger proves what an agent **spent**. A receipt proves what it **did**.
+Every governed action against a system of record can leave an ARC1 receipt,
+including refused ones. A receipt is a signed record of:
+- who authorized the action;
+- what the agent said it would do;
+- what the action measurably did, and what the measurement could not see;
+- what was decided, and by which checks;
+- what it cost;
+- how it ended.
+
+Receipts go into an append-only [RFC 9162](https://www.rfc-editor.org/rfc/rfc9162)
+Merkle log, and a witness cosigns the log's checkpoints. A receipt therefore
+cannot be edited, moved, dropped from history, or shown differently to
+different people without it showing. Row data stays out of the receipt. A
+salted Merkle root commits to every changed row, and the issuer can later
+disclose any subset to an auditor, with proofs, while the rest stay hidden.
+
+```console
+$ cd vectors/arc1
+$ agentgov verify-receipt valid/committed-refund.bundle.json --pubkey keys/issuer.pub \
+      --witness witness/cosignatures.jsonl --witness-pubkey keys/witness.pub \
+      --rows valid/committed-refund.rows.json
+  ok    ARC1 schema        receipt f87ad35e-c540-5f93-8c5a-62d3006db353 (committed, ...)
+  ok    receipt signature  ed25519, key bcc542d53c8c1a1f
+  ok    log inclusion      leaf 0 of 7 in log 'arc1-vectors' (root 5b025750f43bc1be)
+  ok    witnessed          by 'arc1-vectors-witness' (key ac51d42df2b0ebbd) at 2026-09-25T15:05:00.000000Z
+  --    agentgov ledger    no ledger given
+  ok    disclosed rows     2 of 3 committed rows verify under row_root 9ab84da7294fe5de
+
+PASS  valid/committed-refund.bundle.json  (receipt f87ad35e-c540-5f93-8c5a-62d3006db353)
+```
+
+`--ledger governor.db` also checks the receipt's cost against the AgentGov
+ledger that paid for the action. The ledger must have settled exactly that
+amount, in transactions recorded before the receipt was anchored.
+
+Not every action is a SQL transaction priced in model spend, and a receipt says so instead
+of overclaiming. Since 1.1, a receipt can say how strongly its action was measured: in a
+transaction (the default), from a plan applied only if nothing changed in between, from a
+prediction checked by reading back, or only as the request that was sent. It can say what
+the action consumed in other units, such as morphine milligram equivalents or vCPUs, which
+`--unit-ledger mme=dose.db` checks against the ledger of that unit. It can also say which
+systems other than models served it. A receipt that uses none of these is byte for byte
+what it was before.
+
+The exit code says what failed, so a pipeline can gate on it:
+
+| Exit | Meaning |
+|---|---|
+| `0` | every check you gave evidence for passed |
+| `2` | usage error, or a file that cannot be read |
+| `3` | not a well-formed ARC1 document |
+| `4` | the receipt's signature does not verify |
+| `5` | the log checkpoint's signature, or the audit path to it, fails |
+| `6` | the checkpoint was never witnessed, or the witness saw a different history (a split view) |
+| `7` | the receipt disagrees with the AgentGov ledger |
+| `8` | a disclosed row is not one the receipt committed to |
+
+The same checks are available in code:
+
+<!-- readme-test: skip reason="reads vectors/arc1 from a checkout of this repository" -->
+```python
+from pathlib import Path
+
+from agentgov.receipts import load_cosignatures, parse_key, verify_bundle
+
+vectors = Path("vectors/arc1")
+report = verify_bundle(
+    (vectors / "valid" / "committed-refund.bundle.json").read_bytes(),
+    issuer_key=parse_key((vectors / "keys" / "issuer.pub").read_text()),
+    cosignatures=load_cosignatures(vectors / "witness" / "cosignatures.jsonl"),
+    witness_key=parse_key((vectors / "keys" / "witness.pub").read_text()),
+)
+print(report.exit_code, [check.status for check in report.checks])
+# 0 ['pass', 'pass', 'pass', 'pass', 'skip', 'skip']
+```
+
+Verifying needs only the standard library, including a built-in RFC 8032
+Ed25519 verifier. Issuing receipts with Ed25519 keys needs
+`pip install 'agentgov[sign]'`. HMAC-SHA256 keys, for internal use, need
+nothing. `receipts.ReceiptLog.issue()` places, signs and logs a receipt in one
+step, and `receipts.verify_bundle()` is the verifier behind the command.
+
+[`docs/RECEIPTS.md`](RECEIPTS.md) is the specification. It covers the
+canonical encoding, the signed bytes, the log, witnesses, row commitments,
+the verification order, and what a receipt does *not* prove.
+[`vectors/arc1/`](../vectors/arc1/) holds deterministic reference vectors,
+regenerated and byte-compared on every CI run. Its `manifest.json` lists each
+case with the exit code a conforming verifier must produce.
+
+## Durability
+
+An in-memory ledger isn't an audit trail, because restarting the process loses it. Swap
+`BudgetManager()` for `BudgetManager.open_sqlite(path)` and every operation goes to disk
+first, before it touches memory, as **one SQLite transaction**. A capture's release and
+spend, the hold it closes and the breaker trip it causes are all written, or none of them:
+
+```python
+from agentgov import BudgetManager, money
+
+with BudgetManager.open_sqlite("governor.db") as gov:
+    gov.open_root("orchestrator", money("5.00"))
+    ...  # identical API; every write is durable before it's visible in memory
+```
+
+Reopen that file in a brand new process and the ledger, the delegation tree, every
+circuit-breaker trip, and any authorization left mid-call are restored exactly.
+[`examples/persistence_demo.py`](../examples/persistence_demo.py) proves this with two
+genuinely separate `python` subprocesses, not just a discarded object:
+
+```bash
+uv run python examples/persistence_demo.py
+```
+
+```
+--- process 1: writes state, then exits completely ---
+WRITER  balance(researcher)=0.65000000
+WRITER  halted(scraper)=True
+WRITER  chain_length=16
+WRITER  open_authorization_id=24b1af62-e7ac-4b54-b2fb-2475f6c40006
+
+--- process 2: independent interpreter, same file ---
+READER  verify_integrity() = PASS
+READER  balance(researcher)=0.65000000
+READER  halted(scraper)=True
+READER  chain_length=16
+READER  open_authorizations=1
+READER  scraper still refuses calls: Scope 'scraper' is halted by its own breaker: ...
+```
+
+A database that has been tampered with, or merely corrupted by a crash mid-write, is
+refused at open time, not served with a wrong balance: `open_sqlite()` re-runs
+`verify_chain()` and `verify_integrity()` before handing back a governor at all. This
+uses only `sqlite3` from the standard library, so durability adds zero runtime
+dependencies.
+
+**The chain is the record, and the other tables are caches of it.** The delegation tree,
+the breaker events and the open authorizations are also kept in their own tables for fast
+reads. At open they have to agree exactly with what the chain implies. A ledger where they
+don't, such as the half-finished capture a v0.1.1 crash could leave behind, is refused with
+a message saying which rows disagree. `agentgov repair governor.db` (or
+`open_sqlite(path, repair=True)`) rebuilds those tables from the chain. No money moves,
+and `BudgetManager.repairs` lists what was rebuilt.
+
+**Upgrading from an earlier release.** A ledger written by any release since 0.1.0 is
+upgraded in place the first time 1.0 opens it for writing (SQLite schema 3, PostgreSQL
+layout `pg2`). Opened read-only, it's served as it is. Entries keep the audit version they
+were written with (`AGOV1` or `AGOV2`), and each verifies under its own rules. New entries
+are `AGOV3` ([docs/LEDGER_FORMAT.md](LEDGER_FORMAT.md)). A ledger from before 0.1.2
+also gains a migration seal, a zero-value entry carrying a digest of its old breaker
+events, which commits those events into the chain. 0.x can't open an upgraded ledger, so
+back it up first ([docs/MIGRATING_TO_1.0.md](MIGRATING_TO_1.0.md)).
+
+**One writer, enforced.** A governor takes an exclusive advisory lock on its database.
+A second process, a second gunicorn worker or a second replica, is refused *at open*
+with a `ConcurrentGovernorError` naming the PID that holds it, because two writers would
+each cache authoritative balances in memory and diverge. The lock is an open file
+descriptor, so the kernel releases it even on `SIGKILL`: a crashed governor leaves a
+stale file but never a stale lock, and there is no timeout heuristic to get wrong.
+(Windows releases a dead process's lock a moment after it exits, so an open in that
+moment is refused, and a retry opens.) To
+inspect a ledger another process is governing, open it read-only:
+
+<!-- readme-test: continue -->
+```python
+audit = BudgetManager.open_sqlite("governor.db", read_only=True)
+audit.verify_integrity()  # reads and verifies; every write is refused
+audit.refresh()  # catch up with the writer, verifying every new entry
+```
+
+A read-only view is a snapshot taken at open, until it's refreshed. `refresh()` reads
+everything committed since in one consistent read, verifies it against the head the view
+already trusts, and applies all of it or none of it, so balances, tree and breaker state
+move forward together. If the ledger was rewritten under the view, `refresh()` raises and
+the view stops following it.
+
+**Dangling holds are findable.** A hold left open by a process that died between
+`authorize()` and `capture()` encumbers funds with nothing left to settle it.
+`stale_authorizations(older_than)` surveys them without touching anything, and
+`void_stale(older_than)` releases them. That's an operator action on purpose, not a
+background timer, because voiding asserts the call will never settle and AgentGov can't
+know that. If such a call *does* complete later, its capture raises `DoubleSpendError`.
+The ledger refuses to book the same encumbrance twice, and since v0.1.2 that's a rule of
+the chain itself: a release that names a hold that was already released is rejected before
+it's written.
+
+See [`tests/test_persistence.py`](../tests/test_persistence.py) and
+[`tests/test_hardening.py`](../tests/test_hardening.py) for the restart, corruption,
+lock-contention, and durable-write-failure matrices.
+
+### A ledger shared by a fleet (PostgreSQL)
+
+SQLite gives a ledger one writer. When N workers on N hosts need one authoritative
+balance, put the ledger in PostgreSQL and open a governor in each of them:
+
+```bash
+pip install 'agentgov[postgres]'
+```
+
+<!-- readme-test: skip reason="needs a live PostgreSQL server" -->
+```python
+from agentgov import BudgetManager, money
+
+# In every worker, on every host: the same database, the same schema.
+gov = BudgetManager.open_postgres("postgresql://governor@db/fleet", schema="agentgov")
+gov.open_root("orchestrator", money("5.00"))  # once, anywhere in the fleet
+auth = gov.authorize("orchestrator", money("0.02"))  # a dollar held here is held fleet-wide
+gov.capture(auth, money("0.013"))
+```
+
+Every governor keeps a verified copy of the ledger in memory, but the database is the
+ledger, not any one copy. So every mutation is one database transaction that:
+
+1. takes a fleet-wide writer lock (`pg_advisory_xact_lock` on the ledger's schema);
+2. reads everything the other governors committed since this one last looked, and
+   verifies it entry by entry, hash links, balances and hold pairing, exactly as a
+   fresh open would;
+3. only then checks the balance or the breaker and builds its entries on the head it
+   just verified;
+4. commits, which releases the lock.
+
+A hold one governor places is visible to every other, because they all check against the
+same balance. A breaker one of them trips halts the subtree for all of them, and latches
+once however many raced into it. A hold placed on one host can be captured on another. The
+first governor to open a database creates the ledger's tables. After that, a role granted
+only DML on them can run a governor, and can't edit history or lift the triggers.
+
+**The lock keeps things moving, and the chain keeps them correct.** Two triggers keep the
+chain linear by themselves. An entry is admitted only if it links, by sequence and hash,
+to the committed head, and entries refuse `UPDATE`, `DELETE` and `TRUNCATE`. A governor
+whose view went stale, or one that never took the lock, is refused instead of being
+allowed to fork the chain. `tests/test_fleet_concurrency.py` removes the lock from every governor
+and races them: writes get refused, and the ledger still balances to the cent.
+
+**What happens when something fails.**
+
+- A governor that cannot get the lock within `lock_timeout` (30s) raises `StorageError`
+  and changes nothing.
+- A governor that stalls while holding the lock (a paused process, a hung host) is cut
+  off by the server after `idle_timeout` (60s), its writes rolled back and the lock
+  freed. One that is killed outright frees it at once.
+- A write whose commit fails, or whose answer is lost with the connection, is reported
+  as a `StorageError`, and the governor reads the whole ledger again, under the lock,
+  before it acts. A lost answer is never retried blind, so the ledger holds the write once
+  or not at all.
+- A governor that reads an entry that doesn't verify stops writing. Every later write
+  raises `LedgerIntegrityError`, and reads keep serving what it last verified.
+- A ledger cut back under a governor, to exactly the chain it verified (a failover to a
+  replica that had not received the last commits), raises `LedgerRollbackError`, and the
+  governor stops writing as above. [docs/OPERATIONS.md](OPERATIONS.md) has the
+  runbook, and recommends synchronous replication.
+
+**What to know before relying on it.**
+
+- **Reads are as of this governor's last write**, unless asked otherwise.
+  `available()`, `is_halted()` and the rest are served from memory. Pass `fresh=True` to
+  catch up first, or read inside `transaction()`, where reads are current and the check
+  and the action it decides are one atomic step across the fleet.
+- **The runaway-loop velocity window is per governor** by default: eight governors with
+  a 1000/s limit admit up to 8000/s between them.
+  `GovernancePolicy(fleet_velocity=True)` counts the holds of every governor instead.
+- **One global chain serializes every write in the fleet.** Concurrent callers of one
+  governor share units of work (one lock, one catch-up, one commit), and a unit costs
+  two round trips. Measured on one laptop against PostgreSQL 16 in Docker, eight callers
+  ran about 2,100 operations a second through one governor, five times 0.4.0, and eight
+  governors with eight callers each about 1,700 a second in total, nine times 0.4.0, at
+  a p99 latency near 105 ms ([Known limitations](#known-limitations) has the table).
+  That's the cost of one authoritative balance. A chain per root scope is how it would
+  scale out further.
+- **Tested on PostgreSQL 14, 16, 17 and 18,** connected directly and, the whole suite,
+  behind PgBouncer in transaction mode ([docs/OPERATIONS.md](OPERATIONS.md)).
+- **The CLI reads PostgreSQL by URL**: `agentgov verify 'postgresql://...?schema=agentgov'`,
+  and `inspect`, `audit`, `export`, `checkpoint` and `repair` the same way.
+
+[`tests/test_postgres_store.py`](../tests/test_postgres_store.py) pins the store's contract:
+install, restart, tamper evidence, least privilege, and every failure above.
+[`tests/test_fleet_concurrency.py`](../tests/test_fleet_concurrency.py) races 64 workers
+across 8 governors, and 8 separate processes, against one envelope.
+
+**Settling with someone else's commit.** When the ledger shares a database with what an
+agent changes, a governor can make what the change owes the ledger commit exactly when the
+change does. It places a hold first, joins the transaction that makes the change, records
+a settlement claim there, and books the claim into the chain after the commit. This is how
+Interlock settles a plan's cost with the plan's effects:
+
+<!-- readme-test: skip reason="needs a live PostgreSQL server" -->
+```python
+gov.store.grant_join("app_writer")  # once, as the ledger's owner
+hold = gov.authorize("orchestrator", money("0.02"))  # before the caller's transaction
+# ... app_writer opens a transaction on conn and makes its own writes, then:
+with gov.joined(conn) as txn:  # the writer lock is taken inside conn's transaction
+    claim = txn.claim("orchestrator", money("0.013"), memo="order 42", hold=hold)
+    conn.execute("COMMIT")  # the claim commits with the caller's writes, or not at all
+gov.redeem(claim)  # the hold's release and the spend, booked into the chain
+```
+
+The claim doesn't read the chain, so a `REPEATABLE READ` transaction whose snapshot is
+older than other governors' commits can still claim. However busy the ledger, nothing
+conflicts. Any governor's `redeem()` books a claim left pending by a process that died. The
+joined role gets no privilege on the ledger's tables. Its one function admits a claim only
+with a token derived from a secret the role can't read and from that transaction's own id,
+so nothing else running in the transaction can claim anything.
+See [`tests/test_postgres_joined.py`](../tests/test_postgres_joined.py).
+
+## Core primitives
+
+- **Authorize → Hold → Settle.** `BudgetManager.authorize()` places an encumbering hold
+  before a call is made, and `capture()` releases it and posts the true cost as one atomic
+  ledger transaction. Funds are unavailable to siblings for the *whole* time a call is in
+  flight, not just at the moment of debit. That's why a double spend can't happen under
+  load, rather than merely being unlikely.
+- **Latching circuit breaker.** A trip on `overdraft`, `runaway-loop velocity`, or
+  `budget exhaustion` halts the scope *and every descendant beneath it*, and stays
+  halted until an operator calls `reset()`. A `DenialOfWalletError` on overdraw and a
+  `RunawayLoopDetectedError` on call-frequency abuse both trip it. Every later attempt
+  then fails fast with `CircuitOpenError` without touching the ledger. The trip and the
+  reset are themselves zero-value entries in the chain, so a halt can't be deleted without
+  breaking verification.
+- **Cryptographic double-entry ledger.** Every line is a DEBIT or CREDIT against exactly
+  one scope, and internal transfers post balanced pairs in a single transaction. Entries
+  are hash-chained with SHA-256 and never modified. Corrections are compensating entries,
+  never edits, so `verify_chain()` can prove the history is exactly what it claims to be,
+  and `verify_conservation()` can prove no money was created along the way.
+- **A cognitive breaker on the same actuator.** Deterministic loop detection inline
+  (77µs mean) plus a semantic observer off-thread, halting a thrashing agent for cents
+  instead of dollars and recording the verdict in the same hash-anchored audit trail as
+  every financial event. See [The cognitive circuit breaker](#the-cognitive-circuit-breaker).
+- **Write-through durability.** `BudgetManager.open_sqlite()` writes each operation, its
+  ledger entries, topology change, breaker trip and open authorization, to disk as one
+  transaction *before* committing it to memory, so a store failure or a crash aborts the
+  whole operation instead of leaving memory ahead of disk or half of it on disk. A
+  corrupted or tampered file refuses to load rather than being trusted. See
+  [Durability](#durability) above.
+- **Any unit.** A ledger conserves one declared unit: dollars by default, or
+  `Unit("mme")`, `Unit("vcpu", 0)`, `Unit("seats", 0)` (a unit of no places
+  counts whole things). The unit is fixed before the first entry and baked into the
+  ledger's genesis hash, so a ledger can't later be read as counting something else. Every
+  dollar ledger keeps the genesis it always had. Run one ledger per unit, for example
+  `BudgetManager.open_sqlite("dose.db", unit=Unit("mme"))`.
+  Every amount rounds to the unit (holds up, grants down), and `quantity()` and
+  `BudgetExhaustedError` are the neutral names of `money()` and
+  `DenialOfWalletError`.
+- **Anchors.** `anchor(scope_id, memo)` commits an external record, typically another
+  hash chain's head, into this chain as a zero-value entry. It moves no money, and
+  editing the memo afterwards breaks verification. This is how
+  [interlock](https://github.com/crimsondevil0929/interlock) binds its record of
+  database writes to this ledger, and how
+  [fiduciary](https://github.com/crimsondevil0929/fiduciary), the mandate layer above
+  both, binds its decision log. Fiduciary also names, in each reset's memo
+  (`reset(scope_id, memo=...)`), the signed warrant that authorized the reset.
+
+## Known limitations
+
+Every claim on this page is measured, and the boundaries of what was measured matter as
+much as the numbers. This section states them plainly rather than leaving them to be
+discovered in production.
+
+### One chain serializes every write
+
+A ledger is one hash chain, so writes take one lock in turn: a SQLite governor's own, or
+on PostgreSQL the fleet's. Concurrent callers of one governor share units of work
+(one lock, one catch-up, one commit), which is most of what 1.0 gained. Measured on one
+laptop (Apple Silicon, 10 cores, PostgreSQL 16 in Docker), `authorize()` and `capture()`
+in a loop, 10-second runs, the median of three, each interleaved with 0.4.0 on the same
+machine ([benchmarks](../benchmarks/README.md#throughput)):
+
+| Configuration | 0.4.0 | 1.0 |
+|---|---:|---:|
+| SQLite, one caller | 5,907 a second, p99 0.7 ms | 4,208 a second, p99 1.7 ms |
+| SQLite, eight callers | 5,850 a second, p99 9.7 ms | 5,428 a second, p99 11.9 ms |
+| PostgreSQL, one governor with eight callers | 425 a second, p99 66 ms | 2,126 a second, p99 9 ms |
+| PostgreSQL, eight governors with eight callers each | 188 a second, p99 1,944 ms | 1,684 a second, p99 105 ms |
+
+Absolute rates move with whatever else the machine is doing, and the ratios move less.
+With one caller, SQLite is slower in 1.0. AGOV3's canonical hashing, the rule engine's
+checks and the history indexes cost about 70 µs an operation. Callers that arrive together
+share one commit, which nearly closes the gap at eight.
+
+That is the price of one authoritative balance, and two limits follow from it:
+
+- **Latency rises with callers.** In a closed loop each caller waits for the others' work,
+  so mean latency is at least callers / throughput: 64 callers at 1,700 operations a second
+  wait 38 ms on average. The 1.0 target of a 25 ms p99 for eight governors with eight
+  callers each was not met.
+- **A fleet's throughput is one chain's.** A chain per root scope, so that unrelated
+  envelopes stop contending for one lock, is planned for 1.1 if measurements call for it.
+  Until then, a fleet that needs more splits its budgets across ledgers.
+
+**SQLite is one process, by design.** `BudgetManager.open_sqlite()` takes an exclusive
+advisory lock on the database, and a second process is refused at open with
+`ConcurrentGovernorError` naming the holding PID, instead of being allowed to diverge
+silently. `pip install agentgov`, with no runtime dependencies and a local file, is what
+lets you adopt the governor in an afternoon. A fleet opts into PostgreSQL
+([A ledger shared by a fleet](#a-ledger-shared-by-a-fleet-postgresql)).
+
+### A guardrail inside a process, not a sandbox around it
+
+AgentGov enforces at the call site, in your process. Anything that can `import agentgov`
+can also call the provider SDK directly and spend unmetered. The ledger is
+**tamper-evident, not tamper-resistant**: verification proves an edit happened, and
+nothing stops a writer with access to the database from making one. Signed checkpoints
+make rewriting checkpointed history take a key as well as the database, and witnesses
+catch a ledger cut back, forked or replaced, but only once they are configured, and the
+entries after the newest checkpoint are only hash-chained. [SECURITY.md](../SECURITY.md)
+states what each layer detects, and what none of them does. The
+[reconciliation engine](#reconciling-the-invoice) is the backstop for out-of-band spend,
+and it is *detection after the fact*, not prevention. Treat AgentGov as a budget
+guardrail against runaway and accident, the failure mode that actually burns money today.
+It is not a security boundary against a hostile agent.
+
+### Published rates are a snapshot
+
+`agentgov.interceptor.PRICING` is a hardcoded table of published list rates, current as
+of the date in its docstring. Vendors change prices, and partner platforms (Bedrock,
+Vertex) bill differently. Pass an explicit `ModelPricing` for anything not in the table,
+and treat reconciliation against the real invoice as a production requirement rather than
+a nicety. That is precisely why the reconciliation engine exists.
+
+**Settlement follows the model that served.** The provider can run a different model than
+the one requested — a server-side refusal fallback substitutes one mid-request, and an
+undated alias resolves to a dated snapshot (`claude-haiku-4-5` → `claude-haiku-4-5-20251001`).
+`invoke()` reads `response.model`, folds any dated suffix with `normalize_model_id()`
+(exported from the package, so a caller pricing its own calls folds the same way), and
+settles at those rates, so the ledger books what will actually be invoiced.
+`MeteredCall.model_id` reports what served. Two gaps remain: the **hold** is sized before
+the call and can only use the configured model, and **streamed** calls keep the configured
+rates because a stream has no single response object to read the served model from.
+
+### What has been proven deterministically, and what has been proven live
+
+These are different claims and this project keeps them separate.
+
+**Proven deterministically.** The accounting invariants are verified against `DummyLLM`, a
+deterministic offline stub, under 64 contending threads and 100 concurrent asyncio tasks:
+no double spend under concurrency, conservation of value, an unbroken SHA-256 chain, and a
+latching breaker. Beyond that:
+
+- A model-based test (Hypothesis) runs random sequences of every operation, with injected
+  write failures and reopens, against a reference model.
+- A mutation pass makes 3,762 small changes to the rule engine, checkpoints, the auditor,
+  both stores and the receipts code, and a test catches every one that changes what the
+  code does. The 185 that change nothing a test can observe are listed in
+  `mutation/*.json`, each with its reason.
+- The fleet tests race 64 workers across 8 governors and 8 separate processes.
+- The whole suite runs against PostgreSQL 14, 16, 17 and 18, and behind PgBouncer.
+- [`scripts/soak.py`](../scripts/soak.py) runs a fleet for half an hour while killing
+  governors and cutting their connections, then checks that every operation a worker saw
+  succeed is in the ledger exactly once, and nothing else is.
+
+A deterministic harness is the right one for these properties. A governor that's only
+*probably* correct under load isn't correct, and a nondeterministic backend can't prove a
+race is absent.
+
+**Proven against the live API.** Correct accounting says nothing about whether the
+metering layer reads a *real* provider response. That gap is closed by
+[`scripts/generate_real_usage.py`](../scripts/generate_real_usage.py), which drives four
+governed workloads across four Anthropic model tiers through the official `anthropic`
+SDK, re-prices every settled call independently from the published rates, and writes every
+raw API payload to disk as evidence. See [Live API metering](#live-api-metering) below.
+
+### Not in 1.0
+
+- **A server.** AgentGov is a library, and the database is where coordination happens.
+- **Holds that expire on their own.** Voiding a hold asserts its call will never settle,
+  which AgentGov cannot know: `void_stale()` is an operator's decision.
+- **Deleting history.** Nothing is pruned, and on PostgreSQL the triggers refuse deletion.
+
+## Roadmap
+
+1.0 governs a process or a fleet: one ledger per budget, verified from a checkpoint at
+every open and audited from genesis, with signed checkpoints and witnesses for anyone who
+can't trust whoever writes the database. Beyond that:
+
+- **A chain per root scope (1.1, if measured necessary).** Unrelated envelopes would stop
+  contending for one lock, for a fleet's throughput beyond one chain's and latency that
+  does not grow with the fleet.
+- **Key eras for checkpoint keys.** A governor trusts a checkpoint key at any sequence.
+  ARC1 receipt logs already hand a log from one key to the next at a given size, and
+  checkpoints should too, so a retired or compromised key can't sign anything that counts
+  after it.
+- **Inclusion proofs for ledger entries**, from the Merkle frontier every checkpoint
+  already carries, and **public witness networks** (C2SP `tlog-witness`).
+- **More key services:** Google Cloud KMS and PKCS#11 beside AWS KMS, and ECDSA P-256 for
+  hardware that has no Ed25519.
+- **State recovery after a trip.** A halt protects the budget and leaves the task
+  unfinished, and a human then has to notice, diagnose and restart it. The design brief
+  covers cryptographic state checkpointing over a Merkle prefix tree, an append-only
+  intervention ladder ordered by prompt-cache invalidation cost, and a budgeted stopping
+  rule over the breaker's own novelty signal. See
+  [`ARCHITECTURE.md`, Part B](../ARCHITECTURE.md#part-b-the-what-then-protocol-v02-state-recovery-roadmap).
+- **x402 / AP2 settlement integration.** Use AgentGov's authorize/capture holds as the
+  enforcement point those protocols gesture at but don't enforce at runtime, settling
+  real sub-cent agent transactions through a payment rail instead of a simulated ledger.
+- **A shipped LLM-judge observer.** Tier 2's `SemanticObserver` interface already accepts
+  one. What's missing is a ready-made implementation with its own cost accounting, so the
+  observer watching for waste can't become a source of waste itself.
+- **Enterprise SecOps control plane.** Centralized policy management, breaker-trip
+  alerting, and per-tenant audit export, so the hash-chained trail this library already
+  produces plugs into an org's existing compliance and incident-response tooling.
+
+## Code quality & packaging
+
+```bash
+uv sync                              # install (zero runtime dependencies)
+uv run pytest -v
+uv run pytest --cov=agentgov         # CI fails the build below 95%
+uv run ruff check . && uv run ruff format --check .
+uv run mypy src/                     # strict, zero errors
+uv run python examples/denial_of_wallet_benchmark.py
+uv run python examples/persistence_demo.py
+```
+
+Every gate above runs in CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) on
+Python 3.11 to 3.14 on Linux, on macOS, on free-threaded 3.14t, and on Windows; against
+PostgreSQL 14, 16, 17 and 18, and behind PgBouncer, with a 95% coverage floor and a build
+that fails on packaging warnings. Interlock's whole suite runs against every change. Both
+example scripts run end to end, so a broken demo can't merge. The nightly run
+([`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml)) covers the absolute
+scale gates, a deep model-based run, and the mutation pass. Releases are
+published from CI by trusted publishing, every file with a PEP 740 attestation and build
+provenance, and an SBOM of the extras' dependencies
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
+
+[`docs/DEMO_RUNBOOK.md`](DEMO_RUNBOOK.md) walks the four commands end to
+end (adopt, halt a runaway, read the chain, catch unmetered spend); start with
+`uv run python examples/live_demo.py`. [`demo.tape`](../demo.tape) renders that
+same walkthrough as a terminal recording with [VHS](https://github.com/charmbracelet/vhs)
+(`vhs demo.tape`), and [`examples/streamlit_dashboard.py`](../examples/streamlit_dashboard.py)
+gives the resulting ledger a web UI (balance tree, hash chain, and a
+reconciliation button) via `uv sync --extra ui && uv run streamlit run
+examples/streamlit_dashboard.py`.
+
+Packaged with [uv](https://docs.astral.sh/uv/). Metadata, license and classifiers live in
+[`pyproject.toml`](../pyproject.toml). Security policy and data map:
+[`SECURITY.md`](../SECURITY.md). Contributing guide: [`CONTRIBUTING.md`](../CONTRIBUTING.md).
+Release notes: [`CHANGELOG.md`](../CHANGELOG.md). Licensed under [Apache 2.0](../LICENSE).
