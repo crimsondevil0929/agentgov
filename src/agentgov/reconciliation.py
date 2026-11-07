@@ -46,6 +46,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Final, ParamSpec, TypeVar
 
+from agentgov._text import tally
 from agentgov.core import _ROUNDING, BudgetManager, EntryType
 from agentgov.exceptions import AgentGovError
 from agentgov.interceptor import PRICING, MeteredCall, TokenUsage, normalize_model_id
@@ -1000,10 +1001,10 @@ def format_report(report: ReconciliationReport, *, path: str = "", export: str =
         reasons = []
         if report.phantom:
             reasons.append(
-                f"{len(report.phantom)} phantom call(s) worth {money(report.phantom_total)}"
+                f"{tally(len(report.phantom), 'phantom call')} worth {money(report.phantom_total)}"
             )
         if report.discrepant:
-            reasons.append(f"{len(report.discrepant)} cost discrepancy(ies)")
+            reasons.append(tally(len(report.discrepant), "cost discrepancy"))
         lines.append(f"  AUDIT FAILED  {'; '.join(reasons)}")
     return "\n".join(lines)
 
@@ -1721,5 +1722,5 @@ def format_action_report(report: ActionReport, *, export: str = "", scope: str =
     if report.passed:
         lines.append("  AUDIT PASSED  every action seen is explained by a receipt")
     else:
-        lines.append(f"  AUDIT FAILED  {len(report.phantom)} phantom action(s)")
+        lines.append(f"  AUDIT FAILED  {tally(len(report.phantom), 'phantom action')}")
     return "\n".join(lines)

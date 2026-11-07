@@ -152,7 +152,7 @@ RECONCILIATION
   PHANTOM CALLS - billed with no local authorization
     2026-09-14 06:42:29  claude-opus-5   $2.470000  req_LEAKED_KEY_7f3a
 
-  AUDIT FAILED  1 phantom call(s) worth $2.470000
+  AUDIT FAILED  1 phantom call worth $2.470000
 ```
 
 A phantom is spend the provider billed that the governor never authorized: a

@@ -8,6 +8,18 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-11-07
+
+Message wording only. No change to any ledger, receipt, verdict or exit code, and nothing to
+do to upgrade.
+
+### Changed
+
+- **No message writes `action(s)` any more.** Every count AgentGov reports takes the form its
+  number takes: `AUDIT FAILED  1 phantom action`, "2 settlement transactions", "3 cost
+  discrepancies", "1 hold of 5.00 is open ... but 2 authorizations name one". `http(s)` reads
+  "http or https". The tests and the demo runbook that quoted the old text are updated.
+
 ## [1.3.1] - 2026-11-06
 
 Documentation and package metadata only. No code changes, and nothing to do to upgrade.

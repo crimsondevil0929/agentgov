@@ -297,7 +297,7 @@ def test_reconcile_actions_from_the_terminal(tmp_path: Path) -> None:
         "refs=token",
     ]
     assert main(args, out=out) == 1
-    assert "1 phantom action(s)" in out.getvalue()
+    assert "1 phantom action" in out.getvalue()
     out = io.StringIO()
     assert main([*args[:3], "--field", "actor"], out=out) == 1
     assert "NAME=COLUMN" in out.getvalue()
@@ -600,4 +600,4 @@ def test_the_cli_reads_a_stripe_export(tmp_path: Path, capsys: pytest.CaptureFix
     ]
     assert main(argv) == 1
     out = capsys.readouterr().out
-    assert "AUDIT FAILED  1 phantom action(s)" in out and "refund.created" in out
+    assert "AUDIT FAILED  1 phantom action" in out and "refund.created" in out

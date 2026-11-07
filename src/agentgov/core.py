@@ -95,6 +95,7 @@ from decimal import (
 from enum import Enum, unique
 from typing import TYPE_CHECKING, Any, Concatenate, Final, NoReturn, ParamSpec, TypeVar
 
+from agentgov._text import noun, tally
 from agentgov.exceptions import (
     BudgetExceededError,
     CircuitOpenError,
@@ -3385,7 +3386,8 @@ def _compare_governance(replayed: _ChainState, live: _ChainState) -> None:
     unregistered = sorted(replayed.nodes.keys() - live.nodes.keys())
     if unregistered:
         raise LedgerIntegrityError(
-            f"the chain created scope(s) {', '.join(unregistered)} that are not registered"
+            f"the chain created {noun(len(unregistered), 'scope')} {', '.join(unregistered)} that "
+            f"{'is' if len(unregistered) == 1 else 'are'} not registered"
         )
     if set(live.tripped) != set(replayed.tripped):
         raise LedgerIntegrityError(
@@ -4614,8 +4616,10 @@ class BudgetManager:
             if len(candidates) != len(in_key):
                 scope_id, amount = key
                 problems.append(
-                    f"{len(in_key)} hold(s) of {amount} are open in {scope_id!r} but "
-                    f"{len(candidates)} authorization(s) name one"
+                    f"{tally(len(in_key), 'hold')} of {amount} "
+                    f"{'is' if len(in_key) == 1 else 'are'} open in {scope_id!r} but "
+                    f"{tally(len(candidates), 'authorization')} "
+                    f"{'names' if len(candidates) == 1 else 'name'} one"
                 )
             kept = candidates[: len(in_key)]
             claimed = {authorization.entry.entry_id for authorization in kept}

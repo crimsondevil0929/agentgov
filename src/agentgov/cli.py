@@ -75,6 +75,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, TextIO
 
+from agentgov._text import tally
 from agentgov.audit import Auditor
 from agentgov.core import (
     USD,
@@ -360,7 +361,8 @@ def _command_audit(args: argparse.Namespace, out: TextIO) -> int:
         out.write(
             f"PASS  {args.path}  (verified to {report.verified_to:,} from "
             f"{report.resumed_from:,}: {report.entries:,} entries replayed, "
-            f"{report.checkpoints} checkpoint snapshot(s) checked; head {report.head[:16]})\n"
+            f"{tally(report.checkpoints, 'checkpoint snapshot')} checked; "
+            f"head {report.head[:16]})\n"
         )
         return 0
     finally:
@@ -480,7 +482,7 @@ def _command_repair(args: argparse.Namespace, out: TextIO) -> int:
                 f"nothing to repair  {args.path}  (every cache table agrees with the chain)\n"
             )
             return 0
-        out.write(f"REPAIRED  {args.path}  ({len(manager.repairs)} cache disagreement(s))\n")
+        out.write(f"REPAIRED  {args.path}  ({tally(len(manager.repairs), 'cache disagreement')})\n")
         for problem in manager.repairs:
             out.write(f"  - {problem}\n")
         out.write(
