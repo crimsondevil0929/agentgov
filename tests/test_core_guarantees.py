@@ -1061,7 +1061,7 @@ def test_a_legacy_key_short_of_rows_is_repaired_one_authorization_per_open_hold(
 
     with pytest.raises(
         LedgerIntegrityError,
-        match=r"2 hold\(s\) of 0\.20000000 are open in 'root' but 1 authorization\(s\) name one",
+        match=r"2 holds of 0\.20000000 are open in 'root' but 1 authorization names one",
     ):
         BudgetManager.open_sqlite(path)
     with BudgetManager.open_sqlite(path, repair=True) as gov:
@@ -1089,7 +1089,9 @@ def test_a_legacy_key_with_a_row_too_many_keeps_the_row_naming_the_open_hold(
     rows = dict(conn.execute("SELECT entry_id, authorization_id FROM open_authorizations"))
     conn.close()
 
-    with pytest.raises(LedgerIntegrityError, match=r"1 hold\(s\) .* but 2 authorization\(s\)"):
+    with pytest.raises(
+        LedgerIntegrityError, match=r"1 hold .* is open .* but 2 authorizations name one"
+    ):
         BudgetManager.open_sqlite(path)
     with BudgetManager.open_sqlite(path, repair=True) as gov:
         (served,) = gov._open_auths.values()

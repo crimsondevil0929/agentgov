@@ -261,7 +261,7 @@ _NOW = datetime.now(UTC)
 DRIFTS = {
     "a scope the chain never created": "the chain never created it",
     "an allocation": "topology disagrees",
-    "a scope it forgot": "created scope.* that are not registered",
+    "a scope it forgot": "created scopes? .* that (is|are) not registered",
     "a breaker": "breaker state disagrees",
     "the Merkle frontier": "Merkle frontier disagrees",
     "a scope's lifetime spend": "lifetime spend or refunds disagree",

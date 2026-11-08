@@ -38,6 +38,7 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
+from agentgov._text import noun
 from agentgov.exceptions import MalformedReceiptError, ReceiptSignatureError
 from agentgov.receipts.canonical import (
     MAX_SAFE_INTEGER,
@@ -236,8 +237,8 @@ class _Fields:
             raise MalformedReceiptError(f"{path} is missing {', '.join(missing)}")
         if unknown:
             raise MalformedReceiptError(
-                f"{path} has unknown field(s) {', '.join(unknown)}; ARC1 verifiers refuse "
-                f"what they do not understand"
+                f"{path} has unknown {noun(len(unknown), 'field')} {', '.join(unknown)}; "
+                f"ARC1 verifiers refuse what they do not understand"
             )
         self._value: dict[str, Any] = value
         self._path = path

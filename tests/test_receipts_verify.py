@@ -641,7 +641,7 @@ def test_cli_passes_a_real_receipt_against_the_live_ledger(world: World) -> None
     assert code == 0, out
     lines = out.splitlines()
     assert [line.split()[0] for line in lines[:6]] == ["ok"] * 6
-    assert "agentgov ledger" in lines[4] and "2 settlement transaction(s)" in lines[4]
+    assert "agentgov ledger" in lines[4] and "2 settlement transactions" in lines[4]
     assert lines[-1] == f"PASS  {files.bundle}  (receipt {world.receipts[0].receipt_id})"
 
 

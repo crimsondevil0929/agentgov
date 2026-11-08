@@ -613,7 +613,9 @@ class HttpRemoteSigner(RemoteSigner):
     ) -> None:
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError(f"a signing service's url is http(s)://host[:port], not {url!r}")
+            raise ValueError(
+                f"a signing service's url is http://host[:port] or https://host[:port], not {url!r}"
+            )
         if not _KEY_NAME.fullmatch(key):
             raise ValueError(f"a key's name is letters, digits, '.', '_' and '-', not {key!r}")
         if not timeout > 0:

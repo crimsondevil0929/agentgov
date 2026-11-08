@@ -39,6 +39,7 @@ from decimal import Decimal
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
+from agentgov._text import tally
 from agentgov.exceptions import (
     AgentGovError,
     MalformedReceiptError,
@@ -257,7 +258,7 @@ def _keys(
     return _Keys(issuer_key, log_key, schedule), Check(
         name,
         "pass",
-        f"{len(transitions)} transition(s) of log {log_id!r} from key {first} to key "
+        f"{tally(len(transitions), 'transition')} of log {log_id!r} from key {first} to key "
         f"{schedule.current.key_id} (since size {schedule.boundary})",
     )
 
@@ -519,8 +520,9 @@ def _check_ledger(receipt: ActionReceipt, ledger: BudgetManager | None) -> Check
     return Check(
         name,
         "pass",
-        f"anchored at entry {anchor.seq}; {len(receipt.cost.ledger_txn_ids)} settlement "
-        f"transaction(s) totalling ${money_text(settled)}",
+        f"anchored at entry {anchor.seq}; "
+        f"{tally(len(receipt.cost.ledger_txn_ids), 'settlement transaction')} totalling "
+        f"${money_text(settled)}",
     )
 
 

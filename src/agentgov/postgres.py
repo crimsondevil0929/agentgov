@@ -85,6 +85,7 @@ from contextlib import contextmanager, suppress
 from decimal import Decimal
 from typing import Any, Final, LiteralString
 
+from agentgov._text import tally
 from agentgov.core import (
     _CHECKPOINT_MEMO,
     GENESIS_HASH,
@@ -900,7 +901,7 @@ class PostgresStore:
                 if cur.rowcount != len(batch.redeemed):
                     session.failed = True
                     raise LedgerIntegrityError(
-                        f"cannot book {len(batch.redeemed)} settlement claim(s): only "
+                        f"cannot book {tally(len(batch.redeemed), 'settlement claim')}: only "
                         f"{cur.rowcount} were still pending; a claim is booked once"
                     )
 
