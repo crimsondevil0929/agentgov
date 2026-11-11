@@ -27,6 +27,11 @@ to upgrade.
   plural, where the test took either.
 - **One mutant is recorded as equivalent**, with its reason: quantizing at the ledger's own
   quantum twice gives what quantizing once gives.
+- **CI's "Interlock's suite against this branch" job runs again.** It had failed on every
+  change since Interlock 1.5.0: `scripts/downstream_interlock.sh` installed a fixed list of
+  test packages, Interlock's pytest options began to name `pytest-timeout`, and the suite
+  stopped before its first test ("Unknown config option: timeout"). The script now installs
+  Interlock's own `dev` group, so it follows what Interlock's tests need.
 
 ## [1.3.2] - 2026-11-07
 

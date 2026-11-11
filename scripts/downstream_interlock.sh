@@ -47,8 +47,10 @@ else
   uv pip install --quiet --reinstall "$spec" "psycopg[binary]>=3.2" "cryptography>=42"
 fi
 uv pip install --quiet --no-deps -e "$work/interlock"
-uv pip install --quiet "pytest>=8.0.0" "hypothesis>=6.100" "psycopg[binary]>=3.2" \
-  "cryptography>=42"
+# What Interlock's tests need is what its own dev group lists (its pytest
+# options name plugins from there: a fixed list here went stale when 1.5.0
+# added pytest-timeout, and the suite stopped at "Unknown config option").
+uv pip install --quiet --group "$work/interlock/pyproject.toml:dev"
 
 "$work/venv/bin/python" -c 'import agentgov, platform, sys; print("agentgov", agentgov.__version__, "from", agentgov.__file__, "on Python", platform.python_version(), file=sys.stderr)'
 cd "$work/interlock"
