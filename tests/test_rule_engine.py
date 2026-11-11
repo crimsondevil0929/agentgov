@@ -261,7 +261,7 @@ _NOW = datetime.now(UTC)
 DRIFTS = {
     "a scope the chain never created": "the chain never created it",
     "an allocation": "topology disagrees",
-    "a scope it forgot": "created scopes? .* that (is|are) not registered",
+    "a scope it forgot": "the chain created scope child that is not registered",
     "a breaker": "breaker state disagrees",
     "the Merkle frontier": "Merkle frontier disagrees",
     "a scope's lifetime spend": "lifetime spend or refunds disagree",
@@ -279,6 +279,19 @@ def test_verify_chain_catches_memory_that_drifted_from_the_chain(drift: str, mes
     gov.verify_integrity()
     _drifted(gov, drift)
     with pytest.raises(LedgerIntegrityError, match=message):
+        gov.ledger.verify_chain()
+
+
+def test_scopes_the_registry_forgot_are_counted_in_words() -> None:
+    """One scope "is not registered", two "are": the message says how many, as it reads."""
+    gov = _tree()
+    gov.delegate("root", "other", money("0.2"))
+    gov.verify_integrity()
+    del gov.ledger._state.nodes["child"], gov.ledger._state.nodes["other"]
+    with pytest.raises(
+        LedgerIntegrityError,
+        match="the chain created scopes child, other that are not registered",
+    ):
         gov.ledger.verify_chain()
 
 
