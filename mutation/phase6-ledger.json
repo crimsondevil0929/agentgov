@@ -158,7 +158,8 @@
     "tests/test_runaway.py",
     "tests/test_async_offload.py",
     "tests/test_scale.py",
-    "tests/test_model.py"
+    "tests/test_model.py",
+    "tests/test_units.py"
   ],
   "env": {
     "AGENTGOV_MODEL_EXAMPLES": "120",

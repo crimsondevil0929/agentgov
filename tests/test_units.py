@@ -34,6 +34,7 @@ from agentgov.core import (
     USD,
     Direction,
     EntryType,
+    Ledger,
     LedgerEntry,
     _ChainState,
     _decode_snapshot,
@@ -43,6 +44,8 @@ from agentgov.core import (
     _replay,
 )
 from agentgov.exceptions import LedgerIntegrityError
+from agentgov.postgres import PostgresStore
+from agentgov.storage import SqliteStore
 
 SEATS = Unit("seats", 0)
 MME = Unit("mme")
@@ -278,3 +281,51 @@ def test_a_postgres_ledger_is_declared_its_unit_and_its_trigger_follows(pg_dsn: 
         assert source is not None and vcpu.genesis in source[0]
         unit = conn.execute("SELECT value FROM agentgov_vcpu.schema_meta WHERE key = 'unit'")
         assert unit.fetchone() == ("vcpu/0",)
+
+
+# -- a store's own view of its unit (1.3.3) ----------------------------------------------------
+#
+# The governor names the unit when it opens a ledger, and these read it back where no
+# governor is in the way: the store's head before the first entry, and a ledger built on a
+# store directly. The nightly mutation pass found each of them untested.
+
+
+def test_an_empty_sqlite_ledger_heads_at_its_units_genesis(tmp_path: Path) -> None:
+    path = str(tmp_path / "seats.db")
+    BudgetManager.open_sqlite(path, unit=SEATS).close()
+    with closing(SqliteStore(path, read_only=True)) as store:
+        assert store.head() == (0, SEATS.genesis)
+    with BudgetManager.open_sqlite(path) as gov:
+        gov.open_root("floor", Decimal(40))
+        head = (len(gov.ledger), gov.ledger.head_hash)
+    with closing(SqliteStore(path, read_only=True)) as store:
+        assert store.head() == head and head[0] == 1
+
+
+def test_a_ledger_built_on_a_store_conserves_the_stores_unit(tmp_path: Path) -> None:
+    path = str(tmp_path / "seats.db")
+    with BudgetManager.open_sqlite(path, unit=SEATS) as gov:
+        gov.open_root("floor", Decimal(40))
+    with closing(SqliteStore(path)) as store:
+        ledger = Ledger(store=store)  # no unit named: the store's, never the default
+        assert ledger.unit == SEATS and len(ledger) == 1
+        ledger.verify_chain()
+
+
+def test_a_postgres_store_reads_its_unit_as_it_opens(pg_dsn: str) -> None:
+    """Before it loads anything: the head of an empty ledger is its unit's genesis."""
+    vcpu = Unit("vcpu", 0)
+    BudgetManager.open_postgres(pg_dsn, schema="agentgov_open", unit=vcpu).close()
+    with closing(PostgresStore(pg_dsn, schema="agentgov_open")) as store:
+        assert store.head() == (0, vcpu.genesis)
+
+
+def test_a_postgres_store_takes_a_unit_declared_after_it_opened(pg_dsn: str) -> None:
+    """Another governor may declare the unit of a ledger this store already has open: the
+    next load reads it, and the empty ledger's head follows."""
+    vcpu = Unit("vcpu", 0)
+    with closing(PostgresStore(pg_dsn, schema="agentgov_late")) as first:
+        assert first.head() == (0, GENESIS_HASH)
+        BudgetManager.open_postgres(pg_dsn, schema="agentgov_late", unit=vcpu).close()
+        assert first.load().unit == vcpu
+        assert first.head() == (0, vcpu.genesis)

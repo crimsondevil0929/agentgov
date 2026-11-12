@@ -157,7 +157,8 @@
     "tests/test_runaway.py",
     "tests/test_reconciliation.py",
     "tests/test_scale.py",
-    "tests/test_model.py"
+    "tests/test_model.py",
+    "tests/test_units.py"
   ],
   "env": {
     "AGENTGOV_MODEL_EXAMPLES": "120",
@@ -211,7 +212,8 @@
     "src/agentgov/postgres.py::PostgresStore._open::constant::32 -> 33": "The join key table takes any key of at least 32 bytes: 33 random bytes authorize joined transactions as 32 do.",
     "src/agentgov/postgres.py::PostgresStore._open::constant::False -> True": "Preparing a statement run once changes how it is sent, not what it does: the install's DDL runs the same either way.",
     "src/agentgov/postgres.py::PostgresStore._open::constant::False -> True::2": "Preparing a statement run once changes how it is sent, not what it does: the upgrade's DDL runs the same either way.",
-    "src/agentgov/streaming.py::AsyncMeteredStream.__aexit__::if-true::`if self._inner is not None` -> always": "With no inner stream, getattr(None, '__aexit__', None) is None, which is not callable: nothing is called either way."
+    "src/agentgov/streaming.py::AsyncMeteredStream.__aexit__::if-true::`if self._inner is not None` -> always": "With no inner stream, getattr(None, '__aexit__', None) is None, which is not callable: nothing is called either way.",
+    "src/agentgov/core.py::_coerce::if-true::`if quantum != QUANTUM` -> always": "Quantizing at the ledger's own quantum twice gives what quantizing once gives: the test only skips a step that changes nothing."
   },
   "recheck": [
     "test_f1_a_governor_opening_does_not_stall_other_governors",

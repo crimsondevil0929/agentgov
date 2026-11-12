@@ -8,6 +8,31 @@ from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-11-11
+
+Tests only. No change to any ledger, receipt, verdict, message or exit code, and nothing to do
+to upgrade.
+
+### Fixed
+
+- **The nightly mutation pass is green again.** It had failed every night since 1.1.0 (31
+  October): 30 mutants survived, 10 in `phase2` and 21 in `phase6-ledger`, one of them in
+  both. Unit ledgers arrived in 1.1.0 with their own tests (`tests/test_units.py`), and that
+  file was never added to either mutation spec, so the unit branches of the functions those
+  specs mutate ran untested every night. It is in both specs now, which kills 25.
+- **Four tests for what was left.** A store's head before the first entry is its unit's
+  genesis, on SQLite and on PostgreSQL (as the store opens, and after another governor
+  declares the unit). A `Ledger` built directly on a store conserves the store's unit. And the
+  "not registered" message added in 1.3.2 is checked word for word in the singular and the
+  plural, where the test took either.
+- **One mutant is recorded as equivalent**, with its reason: quantizing at the ledger's own
+  quantum twice gives what quantizing once gives.
+- **CI's "Interlock's suite against this branch" job runs again.** It had failed on every
+  change since Interlock 1.5.0: `scripts/downstream_interlock.sh` installed a fixed list of
+  test packages, Interlock's pytest options began to name `pytest-timeout`, and the suite
+  stopped before its first test ("Unknown config option: timeout"). The script now installs
+  Interlock's own `dev` group, so it follows what Interlock's tests need.
+
 ## [1.3.2] - 2026-11-07
 
 Message wording only. No change to any ledger, receipt, verdict or exit code, and nothing to
