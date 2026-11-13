@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 32 32" role="img" aria-label="AgentGov">
+<title>AgentGov</title>
+<style>
+.i{fill:#121212}.o{fill:none;stroke:#121212}.f{fill:#121212;fill-opacity:.2}.a{fill:#b8740b}
+</style>
+<circle class="o" cx="16" cy="16" r="12" stroke-width="2"/><path class="f" d="M8.25 14A7.75 7.75 0 0 1 23.75 14Z"/><path class="o" d="M8.51 14A7.75 7.75 0 0 1 23.49 14" stroke-width="1.6" stroke-dasharray="2.2 1.9"/><path class="a" d="M7.68 17.75A8.5 8.5 0 0 0 24.32 17.75Z"/><path class="o" d="M1 16H31" stroke-width="2"/>
+</svg>

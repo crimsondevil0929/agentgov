@@ -1,4 +1,14 @@
-# AgentGov
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo.svg" width="72" height="72" alt="">
+  </picture>
+</p>
+
+<h1 align="center">AgentGov</h1>
+
+<p align="center">Spend and rate limits for a whole tree of agents, held before a call and settled after.<br>
+Part of the stack with <a href="https://github.com/crimsondevil0929/interlock">Interlock</a> and <a href="https://github.com/crimsondevil0929/fiduciary">Fiduciary</a>.</p>
 
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
@@ -32,9 +42,9 @@ Zero runtime dependencies. Pure standard library (`decimal`, `hashlib`, `threadi
 
 ## Start here
 
-**See the whole stack working:** <https://crimsondevil0929.github.io/fiduciary/>. Six
-industries run on one engine, a real model's recorded turns are replayed on the current
-release, and 16 audit bundles can be verified in your browser.
+**See the whole stack working:** <https://crimsondevil0929.github.io/fiduciary/>. Eight
+agent workflows on six kinds of system run on one engine, a real model's recorded turns are
+replayed on the current release, and 20 audit bundles can be verified in your browser.
 
 A gateway decides whether an agent may call a tool. This stack decides whether what the call
 changed may be kept, and produces evidence for someone who trusts neither the agent nor the
