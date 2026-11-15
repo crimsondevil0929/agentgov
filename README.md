@@ -8,7 +8,7 @@
 <h1 align="center">AgentGov</h1>
 
 <p align="center">Spend and rate limits for a whole tree of agents, held before a call and settled after.<br>
-Part of the stack with <a href="https://github.com/crimsondevil0929/interlock">Interlock</a> and <a href="https://github.com/crimsondevil0929/fiduciary">Fiduciary</a>.</p>
+The budget engine under <a href="https://github.com/crimsondevil0929/fiduciary">Fiduciary</a>, beside <a href="https://github.com/crimsondevil0929/interlock">Interlock</a>; it also works alone.</p>
 
 **The runtime spend governor and denial-of-wallet circuit breaker for autonomous agent fleets.**
 
@@ -32,11 +32,6 @@ ledger, with a circuit breaker that halts a runaway branch before settlement rat
 after. A second, *cognitive* breaker targets the most common cause of runaway spend. It
 detects an agent looping without making progress and halts it for a fraction of a cent,
 long before the envelope runs out.
-The ledger, topology, and any in-flight authorization survive a process crash, backed by
-SQLite via the standard library, or by PostgreSQL for a fleet of governors on many hosts.
-
-Zero runtime dependencies. Pure standard library (`decimal`, `hashlib`, `threading`,
-`sqlite3`, `asyncio`-compatible). `mypy --strict` clean.
 
 ---
 
@@ -46,9 +41,10 @@ Zero runtime dependencies. Pure standard library (`decimal`, `hashlib`, `threadi
 agent workflows on six kinds of system run on one engine, a real model's recorded turns are
 replayed on the current release, and 20 audit bundles can be verified in your browser.
 
-A gateway decides whether an agent may call a tool. This stack decides whether what the call
+A gateway decides whether an agent may call a tool. Fiduciary decides whether what the call
 changed may be kept, and produces evidence for someone who trusts neither the agent nor the
-operator. It is three packages:
+operator. AgentGov (this repository) is its budget engine and Interlock its staging engine;
+each also works alone:
 
 | Package | On PyPI | What it answers |
 |---|---|---|
@@ -140,6 +136,11 @@ it only ever moves between a parent and a child, or out to a vendor.
 | A single flat quota per API key | Says nothing about *which* sub-agent in a fan-out is responsible, and can't bound a tree that recurses | **A budget DAG.** A root agent's envelope is sub-delegated down a tree of scopes; no descendant can ever spend or re-delegate more than its ancestors granted it, at any depth. |
 
 ## Quickstart
+
+The ledger, the topology and any authorization in flight survive a process crash: they are
+kept in SQLite through the standard library, or in PostgreSQL for a fleet of governors on
+many hosts. There are no runtime dependencies: only the standard library (`decimal`,
+`hashlib`, `threading`, `sqlite3`), usable from `asyncio`, and `mypy --strict` clean.
 
 Wrap an existing model call and give a sub-agent tree its own budget in a handful
 of lines:
